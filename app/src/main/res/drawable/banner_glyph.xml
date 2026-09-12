@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 电视 + 传输箭头 组合图形，用作 banner 前景 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="160dp"
+    android:height="90dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- 电视轮廓 -->
+    <path
+        android:fillColor="#FF4FC3F7"
+        android:pathData="M60,52 h200 a10,10 0 0 1 10,10 v56 a10,10 0 0 1 -10,10 h-200 a10,10 0 0 1 -10,-10 v-56 a10,10 0 0 1 10,-10 z" />
+    <!-- 屏幕内的传输箭头 -->
+    <path
+        android:fillColor="#FF14213D"
+        android:pathData="M110,80 h52 v-14 l34,24 -34,24 v-14 h-52 z M224,80 h-20 v20 h20 z" />
+    <!-- 底座 -->
+    <path
+        android:fillColor="#FF4FC3F7"
+        android:pathData="M140,132 h40 v10 h-40 z M152,128 v6 h16 v-6 z M120,142 h80 v8 h-80 z" />
+</vector>

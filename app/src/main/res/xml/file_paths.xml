@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 覆盖 /storage/emulated/0 下的 Movies / Pictures / Download -->
+    <external-path name="external_storage" path="." />
+</paths>

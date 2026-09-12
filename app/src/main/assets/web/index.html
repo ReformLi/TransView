@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>上传到电视</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --surface: #161b22;
+    --surface2: #232d3a;
+    --primary: #4fc3f7;
+    --on: #e8edf2;
+    --dim: #9aa7b5;
+    --ok: #7bd88f;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: -apple-system, "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--on);
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+    min-height: 100vh;
+  }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 0 20px; }
+  header .tv {
+    width: 34px; height: 34px; border-radius: 8px;
+    background: var(--primary);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; color: #14213d; font-weight: bold;
+  }
+  header h1 { font-size: 20px; font-weight: 600; }
+  header .badge {
+    margin-left: auto; font-size: 12px; color: var(--ok);
+    border: 1px solid var(--ok); border-radius: 20px; padding: 3px 10px;
+  }
+  header .badge.off { color: var(--err); border-color: var(--err); }
+
+  .cats { display: flex; gap: 10px; margin-bottom: 10px; }
+  .cat {
+    flex: 1; padding: 12px 0; border-radius: 12px; border: 1px solid #2c3744;
+    background: var(--surface); color: var(--dim);
+    font-size: 15px; font-weight: 600; text-align: center;
+    transition: all .15s; user-select: none;
+  }
+  .cat.active { background: var(--primary); color: #14213d; border-color: var(--primary); }
+  .tip { font-size: 13px; color: var(--dim); margin-bottom: 16px; line-height: 1.6; }
+
+  #dropzone {
+    border: 2px dashed #37455a; border-radius: 16px;
+    padding: 34px 16px; text-align: center;
+    transition: all .15s;
+  }
+  #dropzone.drag { border-color: var(--primary); background: rgba(79,195,247,.08); }
+  #dropzone .icon { font-size: 40px; line-height: 1; margin-bottom: 12px; }
+  #dropzone p { color: var(--dim); font-size: 14px; margin-bottom: 18px; }
+  .btns { display: flex; gap: 12px; justify-content: center; }
+  .btn {
+    padding: 12px 22px; border-radius: 12px; border: none;
+    background: var(--surface2); color: var(--on);
+    font-size: 15px; font-weight: 600;
+  }
+  .btn.primary { background: var(--primary); color: #14213d; }
+  .btn:active { transform: scale(.96); }
+
+  #queue { list-style: none; margin-top: 18px; }
+  #queue li {
+    background: var(--surface); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .q-row { display: flex; align-items: center; gap: 10px; }
+  .q-name {
+    flex: 1; font-size: 14px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .q-size { font-size: 12px; color: var(--dim); flex-shrink: 0; }
+  .q-state { font-size: 13px; flex-shrink: 0; min-width: 40px; text-align: right; }
+  .q-state.wait { color: var(--dim); }
+  .q-state.run  { color: var(--primary); }
+  .q-state.ok   { color: var(--ok); }
+  .q-state.err  { color: var(--err); }
+  .bar { height: 4px; border-radius: 4px; background: #2c3744; margin-top: 10px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--primary); transition: width .15s; }
+  .bar.ok > i { background: var(--ok); }
+  .bar.err > i { background: var(--err); }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 60px; transform: translateX(-50%);
+    background: #2c3744; color: var(--on); font-size: 13px;
+    border-radius: 20px; padding: 9px 18px; max-width: 90vw;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  footer { text-align: center; font-size: 12px; color: var(--dim); margin-top: 22px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="tv">▶</div>
+  <h1>上传到电视</h1>
+  <div class="badge" id="badge">已连接</div>
+</header>
+
+<section class="cats" id="cats">
+  <div class="cat active" data-cat="video">视频</div>
+  <div class="cat" data-cat="image">图片</div>
+  <div class="cat" data-cat="other">其他</div>
+</section>
+<p class="tip" id="tip"></p>
+
+<div id="dropzone">
+  <div class="icon">📁</div>
+  <p>点击选择文件，或将文件 / 文件夹拖拽到此处</p>
+  <div class="btns">
+    <button class="btn primary" id="pick-files">选择文件</button>
+    <button class="btn" id="pick-folder">选择文件夹</button>
+  </div>
+  <input type="file" id="file-input" multiple hidden>
+  <input type="file" id="folder-input" webkitdirectory multiple hidden>
+</div>
+
+<ul id="queue"></ul>
+<footer>上传完成后，可在电视端对应分类页面查看</footer>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var EXT = {
+    video: ['mp4','mkv','avi','mov','flv','wmv','m4v','ts','webm','3gp','mpg','mpeg','rmvb','rm'],
+    image: ['jpg','jpeg','png','gif','bmp','webp','heic','heif','tiff']
+  };
+  var TIPS = {
+    video: '仅支持视频文件（mp4、mkv、avi、mov 等），将保存到电视「视频」分类',
+    image: '仅支持图片文件（jpg、png、gif、webp 等），将保存到电视「图片」分类',
+    other: '接受除视频、图片外的所有格式（apk、pdf、zip 等），将通过电视系统工具打开'
+  };
+
+  var category = 'video';
+  var queue = [];        // {file, name, size, relPath, status, progress}
+  var uploading = false;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var queueEl = $('queue');
+  var toastEl = $('toast');
+  var toastTimer = null;
+
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 2600);
+  }
+
+  function extOf(name) {
+    var i = name.lastIndexOf('.');
+    return i < 0 ? '' : name.slice(i + 1).toLowerCase();
+  }
+
+  function isAllowed(name) {
+    var ext = extOf(name);
+    if (category === 'video') return EXT.video.indexOf(ext) >= 0;
+    if (category === 'image') return EXT.image.indexOf(ext) >= 0;
+    // 其他：接受非视频、非图片格式
+    return EXT.video.indexOf(ext) < 0 && EXT.image.indexOf(ext) < 0;
+  }
+
+  // ——— 分类切换 ———
+  var cats = document.querySelectorAll('.cat');
+  cats.forEach(function (el) {
+    el.addEventListener('click', function () {
+      cats.forEach(function (c) { c.classList.remove('active'); });
+      el.classList.add('active');
+      category = el.dataset.cat;
+      $('tip').textContent = TIPS[category];
+    });
+  });
+  $('tip').textContent = TIPS[category];
+
+  // ——— 文件选择 ———
+  $('pick-files').addEventListener('click', function () { $('file-input').click(); });
+  $('pick-folder').addEventListener('click', function () {
+    if (!('webkitdirectory' in $('folder-input'))) {
+      toast('当前浏览器不支持选择文件夹，请使用拖拽或压缩包');
+      return;
+    }
+    $('folder-input').click();
+  });
+
+  $('file-input').addEventListener('change', function (e) {
+    addFiles(sliceFileList(e.target.files), '');
+    e.target.value = '';
+  });
+  $('folder-input').addEventListener('change', function (e) {
+    // webkitRelativePath 形如 "剧集名/第一季/01.mp4"，完整保留文件夹结构
+    var items = [];
+    for (var i = 0; i < e.target.files.length; i++) {
+      var f = e.target.files[i];
+      items.push({ file: f, relPath: f.webkitRelativePath || '' });
+    }
+    addFiles(items, null);
+    e.target.value = '';
+  });
+
+  function sliceFileList(list) {
+    var items = [];
+    for (var i = 0; i < list.length; i++) items.push({ file: list[i], relPath: '' });
+    return items;
+  }
+
+  /** items: [{file, relPath}]；relPath 为空表示顶层文件。目录为 null 时表示已带 relPath */
+  function addFiles(items, _unused) {
+    var skipped = 0;
+    items.forEach(function (it) {
+      if (!isAllowed(it.file.name)) { skipped++; return; }
+      queue.push({
+        file: it.file,
+        name: it.file.name,
+        size: it.file.size,
+        relPath: (it.relPath || '').replace(/\\/g, '/'),
+        status: 'wait',
+        progress: 0
+      });
+    });
+    if (skipped > 0) {
+      toast('已忽略 ' + skipped + ' 个不符合「' + (category === 'video' ? '视频' : category === 'image' ? '图片' : '其他') + '」分类的文件');
+    }
+    render();
+    uploadNext();
+  }
+
+  // ——— 拖拽上传 ———
+  var dz = $('dropzone');
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.add('drag'); });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.remove('drag'); });
+  });
+  dz.addEventListener('drop', function (e) {
+    e.preventDefault();
+    var items = e.dataTransfer.items;
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      var entries = [];
+      for (var i = 0; i < items.length; i++) {
+        var entry = items[i].webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+      collectEntries(entries, '').then(function (fileItems) {
+        addFiles(fileItems, null);
+      });
+    } else {
+      addFiles(sliceFileList(e.dataTransfer.files), '');
+    }
+  });
+
+  /** 递归展开拖拽的文件/文件夹 */
+  function collectEntries(entries, path) {
+    var promises = entries.map(function (entry) {
+      return new Promise(function (resolve) {
+        if (entry.isFile) {
+          entry.file(function (f) {
+            resolve([{ file: f, relPath: path }]);
+          }, function () { resolve([]); });
+        } else if (entry.isDirectory) {
+          var reader = entry.createReader();
+          var all = [];
+          var readBatch = function () {
+            reader.readEntries(function (batch) {
+              if (!batch.length) {
+                collectEntries(all, path ? path + '/' + entry.name : entry.name).then(resolve);
+              } else {
+                all = all.concat(sliceArr(batch));
+                readBatch(); // readEntries 每次最多返回 100 条
+              }
+            }, function () { resolve([]); });
+          };
+          readBatch();
+        } else {
+          resolve([]);
+        }
+      });
+    });
+    return Promise.all(promises).then(function (groups) {
+      var result = [];
+      groups.forEach(function (g) { result = result.concat(g); });
+      return result;
+    });
+  }
+
+  function sliceArr(arr) { return Array.prototype.slice.call(arr); }
+
+  // ——— 上传 ———
+  function fmtSize(bytes) {
+    if (bytes < 1024) return bytes + 'B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + 'KB';
+    if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + 'MB';
+    return (bytes / 1073741824).toFixed(2) + 'GB';
+  }
+
+  function render() {
+    queueEl.innerHTML = '';
+    queue.forEach(function (item, idx) {
+      var li = document.createElement('li');
+
+      var row = document.createElement('div');
+      row.className = 'q-row';
+
+      var name = document.createElement('span');
+      name.className = 'q-name';
+      name.textContent = item.relPath ? item.relPath + '/' + item.name : item.name;
+
+      var size = document.createElement('span');
+      size.className = 'q-size';
+      size.textContent = fmtSize(item.size);
+
+      var state = document.createElement('span');
+      state.className = 'q-state ' + item.status;
+      state.textContent =
+        item.status === 'wait' ? '等待' :
+        item.status === 'run' ? item.progress + '%' :
+        item.status === 'ok' ? '成功' : '失败';
+
+      row.appendChild(name);
+      row.appendChild(size);
+      row.appendChild(state);
+
+      var bar = document.createElement('div');
+      bar.className = 'bar ' + (item.status === 'ok' ? 'ok' : item.status === 'err' ? 'err' : '');
+      var inner = document.createElement('i');
+      inner.style.width = (item.status === 'ok' ? 100 : item.progress) + '%';
+      bar.appendChild(inner);
+
+      li.appendChild(row);
+      li.appendChild(bar);
+      queueEl.appendChild(li);
+    });
+  }
+
+  function uploadNext() {
+    if (uploading) return;
+    var item = null;
+    for (var i = 0; i < queue.length; i++) {
+      if (queue[i].status === 'wait') { item = queue[i]; break; }
+    }
+    if (!item) return;
+
+    uploading = true;
+    item.status = 'run';
+    item.progress = 0;
+    render();
+
+    var form = new FormData();
+    form.append('file', item.file, item.file.name);
+
+    var xhr = new XMLHttpRequest();
+    // 分类/文件名/相对路径放 URL query：服务端在接收请求体之前就能读到，
+    // 上传记录与进度条可立即建立（multipart 字段要接收完整个请求体才能解析）
+    xhr.open('POST',
+      '/upload?category=' + encodeURIComponent(category) +
+      '&filename=' + encodeURIComponent(item.file.name) +
+      '&relativepath=' + encodeURIComponent(item.relPath || ''),
+      true);
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) {
+        item.progress = Math.floor(e.loaded / e.total * 100);
+        render();
+      }
+    };
+    xhr.onload = function () {
+      item.status = (xhr.status >= 200 && xhr.status < 300) ? 'ok' : 'err';
+      if (item.status === 'err') {
+        try {
+          var resp = JSON.parse(xhr.responseText);
+          if (resp.message) toast('「' + item.name + '」上传失败：' + resp.message);
+        } catch (_) { toast('「' + item.name + '」上传失败'); }
+      }
+      finishOne();
+    };
+    xhr.onerror = function () {
+      item.status = 'err';
+      toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');
+      finishOne();
+    };
+    xhr.send(form);
+
+    function finishOne() {
+      uploading = false;
+      render();
+      uploadNext();
+    }
+  }
+
+  // ——— 服务器连通性 ———
+  fetch('/').then(function (res) {
+    $('badge').textContent = '已连接';
+  }).catch(function () {
+    $('badge').textContent = '未连接';
+    $('badge').classList.add('off');
+  });
+})();
+</script>
+</body>
+</html>
