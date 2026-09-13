@@ -113,7 +113,9 @@ com.hpu.transview
 - 按键处理 `.onPreviewKeyEvent` **必须放在 `focusRequester`/`clickable` 之前**（放后面会吞掉确定键，导致卡片打不开）。
 - 确定键（`clickable`）→ 直达动作（文件夹进入 / 视频播放 / 图片查看 / 其他系统打开）；菜单键 → 弹「进入/播放、删除、取消」三选项；删除键 → 直接弹二次确认。
 - 从文件夹返回上级：`pendingFocusPath` 记录即将离开的文件夹路径 → `gridState.scrollToItem` 滚动定位 → 卡片自身 `FocusRequester` 请求焦点，实现「返回后焦点还原到刚才进入的卡片」。
+- **从播放器/查看器返回定位到最后浏览项（v1.3）**：打开图片/视频改走 `rememberLauncherForActivityResult(StartActivityForResult)`；两个 Activity 在**切图/切集的瞬间**（`switchImage`/`selectImage`/`skipTo`）`setResult` 当前文件路径。**坑**：不能拖到 `onPause` 再 `setResult`——系统在 `finish()` 执行时就按当时的 result 封装返回值，`onPause` 里设置会拿到 null（实测踩过）。返回后媒体库把 `pendingFocusPath` 指向该路径，复用既有滚动+聚焦机制。覆盖图片查看器内切图、视频连播自动下一集两种场景。
 - 网格内按返回键先「返回上一级」（`BackHandler(enabled = !atRoot)`）；到分类根目录时不拦截，交由 MainScreen 回到顶部导航栏。
+- **确定键动过焦点就必须在 KeyUp 执行**（实测踩过）：`UpCard` 曾在 KeyDown 里执行 `onUp()`，而 `goUp()` 经「焦点安全港」把焦点**同步**移到工具条「排序」——同一按压的 KeyUp 是独立事件、派发给当时已聚焦的「排序」，Compose `clickable` 在 KeyUp 激活点击 → 莫名弹出排序弹框（视频/图片/其他三页同组件同现象）。改为 KeyUp 执行后，按压已结束、无后续事件，焦点移动安全。
 - 切换文件夹/上传完成时 `dirRefreshKey++` 驱动文件夹列表重列。
 
 **「上传」页职责（v1.1 重构，v1.3 改左右分栏）**
@@ -156,6 +158,10 @@ com.hpu.transview
 
 ### 3.5 图片查看器
 - 全屏 Coil 展示；中键 1x↔2x 缩放，菜单键循环 1→1.5→2→3x；缩放时方向键平移（边界约束），未缩放时左右切换同目录图片（自然排序）。
+- **同目录缩略图轮播（v1.3，固定取景框模式）**：非放大时 ↓ **一次**唤出底部横向缩略图条并直接进入选择模式（`Row + horizontalScroll(enabled=false)`，仅程序化滚动；当前图 3dp 白框标记）——**焦点固定在轮播条容器上，高亮取景框恒定居中不动**；左右键只增减 `cursorIndex`，`LaunchedEffect` 把目标缩略图滚动到屏幕正中（`animateScrollTo(index × 项宽)`，条首尾各留「半屏 − 半图」空白使任意一张都能居中；`coerceIn(0, maxValue)` + 下标钳制实现两端留白、到头划不动）；确定键切换主图且轮播与取景框保持；↑ 或返回键收起并把焦点交还根容器（`requestFocusNextFrame`）。↑ 在轮播未唤出时切换「全屏整洁模式」（隐藏/恢复顶部文件名栏）；返回键经 `BackHandler`（常驻拦截）**分层处理**：轮播可见先收轮播 → 图片放大态先复原 1x（`zoomTo(1f)`）→ 都不是才 `finish()` 退出。
+  - 设计取舍：曾做「↓ 唤出 / 再 ↓ 聚焦」两段式，实测用户会停在未聚焦段按左右——该段左右仍是切图（白框移动、缩略图条不动），与取景框心智冲突；合并为单段后左右语义唯一（滑动）。
+  - **初始居中两个坑（实测踩过）**：① 唤出首帧 `scrollState.maxValue` 尚未完成布局测量（=0），居中目标被钳制成 0 → 永远定位到第一张；用 `snapshotFlow { maxValue }.first { it > 0 }` 等滚动范围就绪后再滚。② `focusable()` 挂在滚动容器**内侧**时，`requestFocus()` 会触发 bring-into-view 把整条 Row 滚回起点，半路打断居中动画；必须把焦点节点放到滚动容器**外侧**。
+- 键处理分层：根容器 `onPreviewKeyEvent` 按状态机（`scale`/`carouselVisible`/`carouselFocused`）分发——轮播未聚焦时左右仍切图，聚焦后左右放行给缩略图焦点导航；缩放态（`scale > 1f`）下方向键一律平移，轮播相关按键仅在非放大态生效。
 
 ### 3.6 TV 焦点规范
 - 通用可点元素（按钮/对话框选项）带 `tvFocus()`：放大 1.03 + 主色描边 + 底色。
@@ -170,9 +176,13 @@ com.hpu.transview
   典型现象：视频页只有一个卡片时，焦点在卡片上按**右键**会直接跳回「上传」页（实测复现）。
   - 落地位置：`MediaCard`/`UpCard` 的 `stayOnLeftEdge`/`stayOnRightEdge`（行首左、行尾右）、媒体库工具条「排序」的左端与「刷新」的右端、上传页记录行的右键与「清空所有记录」的右键。
   - **反例（别用）**：不要试图在内容区容器上挂 `focusProperties { exit = { FocusRequester.Cancel } }` 当「焦点围墙」——实测它会让内容区内的**程序化 `requestFocus()`**（首行按上键跳到本页工具条）一并失效，属于副作用不可控的写法。
-- **内容切变前的「焦点安全港」（v1.3）**：凡是会**移走承载焦点的卡片**的操作（切换目录 / 返回上级 / 删除文件），都必须先把焦点停到**常驻**的本页工具条上（`parkFocusOnToolbar()` → `toolbarFocus.requestFocus()`），再由目标卡片在下一帧把焦点抢回网格。
-  - 根因：焦点所在卡片被移出组合后，Compose 无法把焦点交还给它，会回退到整棵树里**第一个可聚焦元素**——正是顶部导航栏的「上传」标签；标签是「聚焦即选中」，页面会被立刻切走。
-  - 典型现象：在图片页按确定键打开文件夹，直接跳回「上传」页（实测复现：`OK` 前焦点在 `windows` 文件夹卡片 `[42,236][280,447]`，`OK` 后焦点变成「上传」标签 `[184,24][308,88]`）。
+- **内容切变前的「焦点安全港」（v1.3）**：凡是会**移走承载焦点的卡片**的操作（切换目录 / 返回上级 / 删除文件），都必须先把焦点停到**常驻**元素上，再由目标卡片在下一帧把焦点抢回网格。
+  - 最终落地为**工具条停靠 + 抑制高亮**：`parkFocusSafe()` 仅在网格确实持有焦点（`gridHasFocus`）时把焦点停到工具条「排序」，同时置 `focusParking = true`；`LibraryTopBar` 依据 `suppressSortFocusVisual` 抑制「排序」按钮的焦点高亮与放大（`TvButton(showFocusVisual = false)`），过渡帧不再「排序闪一下再跳卡片」。目标卡片抢回焦点后经 `onAutoFocused()` 清掉 `focusParking`；另有 `LaunchedEffect(focusParking)` 800ms 超时兜底复位，防按钮永远不亮。
+  - 曾改用「隐形锚点」（1dp 透明 `Box` + `focusProperties { enter = Cancel }`）承接过渡，但实测 touch 点按路径下对锚点的 `requestFocus` 会静默失效（连试 8 次无焦点），已回退到工具条停靠方案；空目录兜底仍停真工具条（`parkFocusOnToolbarFallback`）。
+  - **`hadFocus` 先捕获规律（实测踩过）**：`parkFocusSafe()` 内的 `toolbarFocus.requestFocus()` 是**同步**移动焦点，网格的 `onFocusChanged` 会在其返回前立即把 `gridHasFocus` 改写为 `false`——之后同函数里再读 `gridHasFocus` 永远拿到 `false`，`pendingFocusPath` 不会被设置，UpCard 不抢焦点、焦点卡死在「排序」。必须在 park **之前** `val hadFocus = gridHasFocus` 捕获到局部变量再判断。`openEntry`（目录分支）与 `goUp()` 均按此落地。
+  - touch 点按路径：网格本无焦点（`gridHasFocus == false`），跳过停靠与焦点还原，行为与预期一致。
+  - 根因背景：焦点所在卡片被移出组合后，Compose 无法把焦点交还给它，会回退到整棵树里**第一个可聚焦元素**——正是顶部导航栏的「上传」标签；标签是「聚焦即选中」，页面会被立刻切走。
+  - 典型现象（修复前）：在图片页按确定键打开文件夹，直接跳回「上传」页（实测复现：`OK` 前焦点在 `windows` 文件夹卡片 `[42,236][280,447]`，`OK` 后焦点变成「上传」标签 `[184,24][308,88]`）。
   - 落地位置：`LibraryScreen` 的 `openEntry`（目录分支）、`goUp()`、`performDelete()`。
   - 附带收益：即使「抢回焦点」失败，焦点也仍留在本页工具条，不会跨页乱跑。
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。

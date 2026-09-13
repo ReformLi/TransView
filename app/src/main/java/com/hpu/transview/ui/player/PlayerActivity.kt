@@ -1,5 +1,6 @@
 package com.hpu.transview.ui.player
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
@@ -98,6 +99,8 @@ class PlayerActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_PATH = "path"
+        /** 返回给媒体库：最后播放的视频路径，用于焦点定位 */
+        const val EXTRA_RESULT_PATH = "last_viewed_path"
         private val SPEED_OPTIONS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
 
         /** 短按一次的快进/快退步长 */
@@ -233,6 +236,7 @@ class PlayerActivity : ComponentActivity() {
             ?.sortedWith { a, b -> naturalCompare(a.name, b.name) }
             ?: listOf(file)
         currentIndex = playlist.indexOfFirst { it.absolutePath == file.absolutePath }.takeIf { it >= 0 } ?: 0
+        postResult()
 
         player = ExoPlayer.Builder(this).build()
         player.addListener(playerListener)
@@ -263,6 +267,17 @@ class PlayerActivity : ComponentActivity() {
                 delay(2000)
                 saveProgress()
             }
+        }
+    }
+
+    /**
+     * 把当前播放的视频路径写入返回结果（连播/切集时调用）。
+     * 必须在 finish() 之前调用——系统在 finish 时就按当时的 result 封装返回值，
+     * 拖到 onPause 再 setResult 会来不及（实测拿到 null）。
+     */
+    private fun postResult() {
+        currentFile?.let {
+            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT_PATH, it.absolutePath))
         }
     }
 
@@ -325,6 +340,7 @@ class PlayerActivity : ComponentActivity() {
         if (index !in playlist.indices) return
         saveProgress()
         currentIndex = index
+        postResult()
         ended = false
         prepareItem(index)
         player.prepare()

@@ -75,11 +75,14 @@ fun TvButton(
     text: String,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    /** false 时即使持有焦点也按未聚焦渲染：用于焦点「过渡停靠」时隐藏高亮闪烁 */
+    showFocusVisual: Boolean = true,
     onClick: () -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
+    val showFocused = focused && showFocusVisual
     val scale by animateFloatAsState(
-        targetValue = if (focused) 1.06f else 1f,
+        targetValue = if (showFocused) 1.06f else 1f,
         animationSpec = tween(120),
         label = "btnScale"
     )
@@ -92,7 +95,7 @@ fun TvButton(
                 scaleX = scale
                 scaleY = scale
             },
-        colors = if (focused) {
+        colors = if (showFocused) {
             ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary

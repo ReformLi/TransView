@@ -1,4 +1,4 @@
-package com.hpu.transview.ui.library
+﻿package com.hpu.transview.ui.library
 
 import android.content.Intent
 import android.widget.Toast
@@ -37,6 +37,8 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -118,7 +120,8 @@ private val titleMarquee: Modifier = Modifier.basicMarquee(
  *   工具条按下键回网格由「网格顶部留白」保证（详见 LazyVerticalGrid 的 contentPadding）。
  * - 交互：确定键直达动作；菜单键弹出「进入/播放、删除、取消」；删除走二次确认，
  *   先物理删除再删 Room 索引，成功后焦点自动移到下一个卡片。
- * - **焦点安全港**：切换目录 / 返回上级 / 删除前，先 `parkFocusOnToolbar()` 把焦点停到本页工具条。
+ * - **焦点安全港**：切换目录 / 返回上级 / 删除前，先 `parkFocusSafe()` 把焦点停到工具条
+ *   「排序」上（停靠期间抑制其聚焦高亮，避免过渡闪烁；touch 点按路径无焦点可保护，直接跳过）；
  *   否则承载焦点的卡片被移出组合时，Compose 会把焦点回退到第一个可聚焦元素（顶部「上传」标签），
  *   标签的「聚焦即选中」会把页面直接切走。
  */
@@ -144,8 +147,22 @@ fun LibraryScreen(
     // 本页工具条（排序 / 刷新）的焦点入口：网格第一行按「上键」落到这里，
     // 再按一次上键才由工具条把焦点交给顶部导航栏的当前分类标签。
     val toolbarFocus = remember { FocusRequester() }
+    // 「焦点过渡停靠中」标记：目录切换 / 返回上级 / 删除时焦点先停靠在工具条「排序」上
+    // （1~2 帧后由目标卡片抢回）。停靠期间抑制排序按钮的聚焦高亮，否则用户会看到
+    // 「排序闪一下再跳到目标卡片」的感官跳动（用户实测反馈）。
+    var focusParking by remember { mutableStateOf(false) }
+    // 网格（含卡片）当前是否持有焦点，见网格 modifier 注释
+    var gridHasFocus by remember { mutableStateOf(false) }
     // 待聚焦目标路径（文件绝对路径 或 FOCUS_UP）；聚焦完成后置空
     var pendingFocusPath by remember(category) { mutableStateOf<String?>(null) }
+    // 打开图片查看器 / 视频播放器：返回时带回「最后浏览/播放的文件路径」，
+    // 让列表焦点定位到它（而不是打开时的那张）——图片查看器可切图、视频会连播下一集
+    val mediaLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        result.data?.getStringExtra(ImageViewerActivity.EXTRA_RESULT_PATH)
+            ?.let { pendingFocusPath = it }
+    }
     // 已消费的「标签按下键」票据。初始化为当前值：切分类标签进来时会重建本页组合，
     // 若从 0 开始会让 LaunchedEffect 立刻跑一次，把焦点从标签抢进网格，
     // 用户就没法继续按 → 切到下一个标签了。
@@ -227,12 +244,30 @@ fun LibraryScreen(
     }
 
     // ——— 内容切变时的「焦点安全港」———
-    // 承载焦点的卡片会随「切换目录 / 删除」被移出组合，Compose 此时无法把焦点交还给它，
-    // 会回退到整棵树里第一个可聚焦元素 —— 正是顶部导航栏的「上传」标签；
+    // 承载焦点的卡片会随「切换目录 / 返回上级 / 删除」被移出组合，Compose 此时无法把焦点
+    // 交还给它，会回退到整棵树里第一个可聚焦元素 —— 正是顶部导航栏的「上传」标签；
     // 而标签是「聚焦即选中」，页面会被立刻切走（现象：在图片页打开文件夹，直接跳回上传页）。
-    // 因此凡是会移走焦点卡片的操作，都先把焦点停到常驻的本页工具条上，
-    // 再由目标卡片在下一帧把焦点抢回网格；即使抢回失败，焦点也仍留在本页。
-    val parkFocusOnToolbar: () -> Unit = { runCatching { toolbarFocus.requestFocus() } }
+    // 过渡先把焦点停到工具条「排序」上，再由目标卡片在下一帧把焦点抢回网格；
+    // 即使抢回失败，焦点也仍留在本页。停靠期间用 focusParking 抑制「排序」的聚焦高亮
+    // （否则过渡帧里排序会高亮一闪再跳走，用户实测感官跳动）。
+    val parkFocusSafe: () -> Unit = {
+        // touch 点按路径网格没有焦点，无需停靠
+        if (gridHasFocus) {
+            focusParking = true
+            runCatching { toolbarFocus.requestFocus() }
+        }
+    }
+    // 空目录兜底：网格无卡片可聚焦，停到真正的工具条上（页面上唯一可交互处，
+    // 此时是真实聚焦而非过渡停靠，聚焦高亮正常显示）
+    val parkFocusOnToolbarFallback: () -> Unit = { runCatching { toolbarFocus.requestFocus() } }
+    // 停靠超时兜底：目标卡片正常会在 1~2 帧内抢回焦点并清除标记；
+    // 若抢回失败，800ms 后恢复排序按钮的聚焦高亮，避免按钮永远不亮
+    LaunchedEffect(focusParking) {
+        if (focusParking) {
+            kotlinx.coroutines.delay(800)
+            focusParking = false
+        }
+    }
 
     // ——— 顶部标签按「下键」→ 直接落到网格第一行 ———
     // 用户明确要求：本页工具条只能由「网格第一行按 ↑」上来聚焦，
@@ -247,22 +282,26 @@ fun LibraryScreen(
         val target = if (!atRoot && firstVisible == 0) FOCUS_UP
         else entries.getOrNull(firstVisible - offset)?.file?.absolutePath
         // 空目录时网格里没有卡片，退而聚焦本页工具条（页面上唯一可聚焦处）
-        if (target != null) pendingFocusPath = target else parkFocusOnToolbar()
+        if (target != null) pendingFocusPath = target else parkFocusOnToolbarFallback()
     }
 
     // ——— 进入下一级 / 返回上一级 ———
     val openEntry: (FileEntry) -> Unit = { entry ->
         when {
             entry.isDirectory -> {
-                parkFocusOnToolbar()
+                // 先捕获：parkFocusSafe 会同步移动焦点，网格的 onFocusChanged 随即把
+                // gridHasFocus 写成 false，之后再读就丢失了（实测踩过）
+                val hadFocus = gridHasFocus
+                parkFocusSafe()
                 currentDir = entry.file
-                pendingFocusPath = FOCUS_UP
+                // 仅遥控器路径做焦点还原；touch 点按路径焦点本来就空，无需还原
+                if (hadFocus) pendingFocusPath = FOCUS_UP
             }
-            entry.file.isVideoFile() -> context.startActivity(
+            entry.file.isVideoFile() -> mediaLauncher.launch(
                 Intent(context, PlayerActivity::class.java)
                     .putExtra(PlayerActivity.EXTRA_PATH, entry.file.absolutePath)
             )
-            entry.file.isImageFile() -> context.startActivity(
+            entry.file.isImageFile() -> mediaLauncher.launch(
                 Intent(context, ImageViewerActivity::class.java)
                     .putExtra(ImageViewerActivity.EXTRA_PATH, entry.file.absolutePath)
             )
@@ -272,11 +311,13 @@ fun LibraryScreen(
 
     val goUp: () -> Unit = {
         if (!atRoot) {
-            parkFocusOnToolbar()
+            // 先捕获（原因同 openEntry：park 会同步移动焦点使 gridHasFocus 变 false）
+            val hadFocus = gridHasFocus
+            parkFocusSafe()
             val leaving = currentDir
             currentDir = leaving.parentFile ?: root
-            // 焦点还原到刚才进入（即将离开）的那个文件夹卡片
-            pendingFocusPath = leaving.absolutePath
+            // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过
+            if (hadFocus) pendingFocusPath = leaving.absolutePath
         }
     }
 
@@ -298,9 +339,10 @@ fun LibraryScreen(
             }
             if (physicalOk) {
                 // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走
-                parkFocusOnToolbar()
+                parkFocusSafe()
                 mediaRepo.deleteByPath(entry.file.absolutePath)
-                pendingFocusPath = nextPath
+                // touch 路径跳过焦点还原（见 openEntry 注释）
+                if (gridHasFocus) pendingFocusPath = nextPath
                 dirRefreshKey++ // 父目录可能被连带清空
                 Toast.makeText(context, "已删除「${entry.name}」", Toast.LENGTH_SHORT).show()
             } else {
@@ -366,7 +408,8 @@ fun LibraryScreen(
                 else false
             },
             onSortClick = { showSortDialog = true },
-            onRefresh = refreshLibrary
+            onRefresh = refreshLibrary,
+            suppressSortFocusVisual = focusParking
         )
 
         when {
@@ -377,7 +420,14 @@ fun LibraryScreen(
             else -> LazyVerticalGrid(
                 columns = GridCells.Fixed(GRID_COLUMNS),
                 state = gridState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
+                // hasFocus = 网格自身或其中任一卡片持有焦点。目录切换 / 返回上级 /
+                // 删除前据此决定是否需要「焦点安全港」：遥控器（键盘焦点）路径必须先停靠，
+                // touch 点按路径焦点本来就是空的（没有可被「移走」的焦点），停靠反而会让
+                // 随后的目标卡片 requestFocus 静默失效、焦点卡死在隐形锚点上（实测踩过）。
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .onFocusChanged { gridHasFocus = it.hasFocus },
                 // 顶部留白：工具条按钮的触控热区会向下溢出，若与首行卡片在垂直方向重叠，
                 // 「下键」的方向搜索就找不到落点，焦点会卡死在工具条上。
                 contentPadding = PaddingValues(top = 24.dp, bottom = 32.dp),
@@ -391,7 +441,7 @@ fun LibraryScreen(
                     item(key = FOCUS_UP) {
                         UpCard(
                             autoFocus = pendingFocusPath == FOCUS_UP,
-                            onAutoFocused = { pendingFocusPath = null },
+                            onAutoFocused = { pendingFocusPath = null; focusParking = false },
                             onUp = goUp,
                             onNavigateUp = {
                                 if (gridState.firstVisibleItemIndex == 0) {
@@ -412,7 +462,7 @@ fun LibraryScreen(
                         childCount = if (entry.isDirectory) countInFolder(entry.file.absolutePath) else 0,
                         progress = progressMap[entry.file.absolutePath],
                         autoFocus = pendingFocusPath == entry.file.absolutePath,
-                        onAutoFocused = { pendingFocusPath = null },
+                        onAutoFocused = { pendingFocusPath = null; focusParking = false },
                         onOpen = { openEntry(entry) },
                         onMenu = { actionEntry = entry },
                         onDelete = { pendingDelete = entry },
@@ -518,7 +568,9 @@ private fun LibraryTopBar(
     sortFocusModifier: Modifier,
     refreshEdgeModifier: Modifier,
     onSortClick: () -> Unit,
-    onRefresh: () -> Unit
+    onRefresh: () -> Unit,
+    /** true = 焦点正处于「过渡停靠」在本按钮上，按未聚焦渲染以免高亮闪烁 */
+    suppressSortFocusVisual: Boolean
 ) {
     Row(
         Modifier
@@ -538,6 +590,7 @@ private fun LibraryTopBar(
         TvButton(
             text = "排序：${sortOrder.label}",
             modifier = sortFocusModifier.then(upToTabsModifier),
+            showFocusVisual = !suppressSortFocusVisual,
             onClick = onSortClick
         )
         Spacer(Modifier.width(12.dp))
@@ -595,8 +648,16 @@ private fun MediaCard(
 
     LaunchedEffect(autoFocus) {
         if (autoFocus) {
-            focusRequester.requestFocusNextFrame()
-            onAutoFocused()
+            // 帧门控重试：requestFocus 必须在帧回调内发起才生效（帧间隙调用会被静默
+            // 丢弃，实测踩过），所以用 requestFocusNextFrame（withFrameNanos 等下一帧）。
+            // 成功判定用 focused 状态；成功才清 pendingFocusPath，失败保留状态继续抢。
+            repeat(10) {
+                runCatching { focusRequester.requestFocusNextFrame() }
+                if (focused) {
+                    onAutoFocused()
+                    return@LaunchedEffect
+                }
+            }
         }
     }
 
@@ -718,8 +779,16 @@ private fun UpCard(
 
     LaunchedEffect(autoFocus) {
         if (autoFocus) {
-            focusRequester.requestFocusNextFrame()
-            onAutoFocused()
+            // 帧门控重试：requestFocus 必须在帧回调内发起才生效（帧间隙调用会被静默
+            // 丢弃，实测踩过），所以用 requestFocusNextFrame（withFrameNanos 等下一帧）。
+            // 成功判定用 focused 状态；成功才清 pendingFocusPath，失败保留状态继续抢。
+            repeat(10) {
+                runCatching { focusRequester.requestFocusNextFrame() }
+                if (focused) {
+                    onAutoFocused()
+                    return@LaunchedEffect
+                }
+            }
         }
     }
 
@@ -740,8 +809,11 @@ private fun UpCard(
             // 同 MediaCard：按键处理放在焦点目标之前，确定键显式执行
             .onPreviewKeyEvent { event ->
                 when (event.key) {
+                    // 确定键必须在 KeyUp 执行：goUp() 会经「焦点安全港」把焦点同步移到工具条
+                    // 「排序」按钮，若在 KeyDown 执行，同一按压的 KeyUp 会派发给已聚焦的
+                    // 「排序」（clickable 在 KeyUp 激活点击）→ 莫名弹出排序弹框（实测踩过）
                     Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
-                        if (event.type == KeyEventType.KeyDown) onUp()
+                        if (event.type == KeyEventType.KeyUp) onUp()
                         true
                     }
                     // 第一行按「上键」→ 本页工具条；非第一行返回 false，交回 Compose 做网格内上行
