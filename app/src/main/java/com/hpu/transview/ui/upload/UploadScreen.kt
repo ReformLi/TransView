@@ -20,7 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +31,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -38,6 +39,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -70,6 +73,7 @@ import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.TypeBadge
+import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.tvFocus
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
@@ -86,9 +90,17 @@ import kotlinx.coroutines.withContext
  * 上传页：宽屏左右分栏 —— 左侧固定区（二维码 + 地址 + 服务器状态，不滚动），
  * 右侧为数据库驱动的上传记录列表（可滚动）。
  * 切换标签不中断上传（上传在 HTTP 服务器线程进行），记录经 Room Flow 实时刷新。
+ *
+ * 上下键层级（与媒体库一致）：记录列表**第一行**按上键 → 列表头的「清空所有记录」（本页工具条），
+ * 再按上键 → 顶部导航栏的当前标签（上传页即「上传」）；标签按下键 → 直接回到记录第一行。
+ * 必须显式指定：记录区在屏幕右侧，其正上方就是导航栏右上角的「设置」，
+ * 交给 Compose 默认就近搜索会把焦点送进「设置」，而不是回到本页标签。
  */
 @Composable
-fun UploadScreen() {
+fun UploadScreen(
+    onFocusTabs: () -> Unit = {},
+    focusListTicket: Int = 0
+) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
@@ -103,6 +115,21 @@ fun UploadScreen() {
 
     var pendingDelete by remember { mutableStateOf<UploadRecordEntity?>(null) }
     var showClearAll by remember { mutableStateOf(false) }
+
+    // 本页「工具条」的焦点入口 = 列表头的「清空所有记录」按钮。
+    // 记录列表第一行按「上键」落到这里，再按一次「上键」才把焦点交给顶部导航栏的「上传」标签。
+    val clearAllFocus = remember { FocusRequester() }
+
+    // 顶部标签按「下键」→ 直接聚焦记录第一行（见 MainScreen.contentFocusTicket）。
+    // consumedFocusTicket 初始化为当前值：切标签进来会重建本页组合，
+    // 若从 0 开始会让 LaunchedEffect 立刻跑一次抢走焦点，用户就没法继续按 → 切下一个标签。
+    var consumedFocusTicket by remember { mutableIntStateOf(focusListTicket) }
+    var focusFirstRow by remember { mutableStateOf(false) }
+    LaunchedEffect(focusListTicket) {
+        if (focusListTicket == consumedFocusTicket) return@LaunchedEffect
+        consumedFocusTicket = focusListTicket
+        if (records.isNotEmpty()) focusFirstRow = true
+    }
 
     // 网络可能在后台变化（Wi-Fi 重连等），回到前台时刷新
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -167,7 +194,21 @@ fun UploadScreen() {
                 }
                 Spacer(Modifier.weight(1f))
                 if (records.isNotEmpty()) {
-                    TvButton("清空所有记录") { showClearAll = true }
+                    TvButton(
+                        "清空所有记录",
+                        modifier = Modifier
+                            .focusRequester(clearAllFocus)
+                            .onPreviewKeyEvent { event ->
+                                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                when (event.key) {
+                                    // 工具条再按「上键」→ 顶部导航栏的「上传」标签
+                                    Key.DirectionUp -> { onFocusTabs(); true }
+                                    // 最右端按「右」：焦点留在原地（否则会环绕到顶部导航栏的标签上误切页）
+                                    Key.DirectionRight -> true
+                                    else -> false
+                                }
+                            }
+                    ) { showClearAll = true }
                 }
             }
 
@@ -188,9 +229,19 @@ fun UploadScreen() {
                     Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(records, key = { it.id }) { record ->
+                    itemsIndexed(records, key = { _, record -> record.id }) { index, record ->
                         UploadRecordRow(
                             record = record,
+                            isFirstRow = index == 0,
+                            autoFocus = focusFirstRow && index == 0,
+                            onAutoFocused = { focusFirstRow = false },
+                            // 第一行按「上键」→ 列表头的「清空所有记录」；该按钮始终存在（有记录时），
+                            // 请求失败则直接回导航栏「上传」标签，避免掉进右上角的「设置」。
+                            onNavigateUp = {
+                                runCatching { clearAllFocus.requestFocus() }
+                                    .onFailure { onFocusTabs() }
+                                true
+                            },
                             onDelete = { pendingDelete = record }
                         )
                     }
@@ -390,21 +441,45 @@ private fun categoryLabel(category: Int): String = when (category) {
 }
 
 @Composable
-private fun UploadRecordRow(record: UploadRecordEntity, onDelete: () -> Unit) {
+private fun UploadRecordRow(
+    record: UploadRecordEntity,
+    isFirstRow: Boolean,
+    autoFocus: Boolean,
+    onAutoFocused: () -> Unit,
+    onNavigateUp: () -> Boolean,
+    onDelete: () -> Unit
+) {
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(autoFocus) {
+        if (autoFocus) {
+            focusRequester.requestFocusNextFrame()
+            onAutoFocused()
+        }
+    }
+
     Column(
         Modifier
             .fillMaxWidth()
             .tvFocus()
+            // focusRequester 必须在 focusable **之前**，否则关联不到本行的焦点目标，
+            // 程序化请求会落到行内的「删除」按钮上（实测）。
+            .focusRequester(focusRequester)
             .focusable()
-            // 菜单键 / 删除键 → 删除该条记录（焦点在本行时）
+            // 菜单键 / 删除键 → 删除该条记录；第一行按「上键」→ 本页工具条
+            // （preview 阶段从祖先到焦点，焦点落在行内「删除」按钮时同样生效）
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown &&
-                    (event.key == Key.Menu || event.key == Key.Delete)
-                ) {
-                    onDelete()
-                    true
-                } else {
-                    false
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when {
+                    event.key == Key.Menu || event.key == Key.Delete -> {
+                        onDelete()
+                        true
+                    }
+                    isFirstRow && event.key == Key.DirectionUp -> onNavigateUp()
+                    // 记录行已撑满记录区宽度，右侧没有可聚焦元素：吃掉右键让焦点留在原地。
+                    // 否则 Compose 的二维搜索失败后会环绕到顶部导航栏的标签，触发「聚焦即选中」把页面切走。
+                    event.key == Key.DirectionRight -> true
+                    else -> false
                 }
             }
             .clip(RoundedCornerShape(10.dp))

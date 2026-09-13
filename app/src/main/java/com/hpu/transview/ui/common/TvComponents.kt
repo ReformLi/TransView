@@ -17,16 +17,29 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
 
-/** 遥控器焦点效果：轻微放大 + 主色描边 + 底色变化，应用于任意可聚焦容器 */
-fun Modifier.tvFocus(
+/**
+ * 下一帧再请求焦点。
+ *
+ * Lazy 列表/网格的项在组合完成的同一帧里可能还没完成布局，此时 [FocusRequester.requestFocus]
+ * 会抛 IllegalStateException 被 `runCatching` 静默吞掉 —— 表现就是「焦点还原/焦点跳转没反应」。
+ * 让出一帧等布局稳定后再请求，即可稳定命中。媒体库与上传页共用。
+ */
+suspend fun FocusRequester.requestFocusNextFrame(): Boolean {
+    withFrameNanos { }
+    return runCatching { requestFocus() }.isSuccess
+}
+
+/** 遥控器焦点效果：轻微放大 + 主色描边 + 底色变化，应用于任意可聚焦容器 */fun Modifier.tvFocus(
     cornerRadius: Int = 10,
     focusedScale: Float = 1.03f
 ): Modifier = composed {

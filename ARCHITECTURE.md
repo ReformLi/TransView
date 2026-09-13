@@ -97,6 +97,10 @@ com.hpu.transview
 
 **布局：`LazyVerticalGrid(GridCells.Fixed(5))`，不提供单列列表**（`ViewMode` 枚举已删除）
 - 卡片统一 16:9 缩略图区 + 名称 + 副标题：文件夹=文件夹图标+「N 个文件」；视频=首帧+「时长·大小」；图片=首帧；其他=通用图标+大小。
+- 名称与副标题**居中对齐**：卡片 `Column` 用 `horizontalAlignment = CenterHorizontally`，两个 `Text` 再显式 `Modifier.fillMaxWidth() + textAlign = TextAlign.Center`（只设 `textAlign` 而不撑满宽度时，单行文本仍按自身宽度左贴，看不出居中效果）；「返回上级」卡片同款处理。
+- **长文件名跑马灯**：文件名的 `Text` 上挂 `Modifier.basicMarquee(...)`，但**仅在该卡片 `focused` 时挂载**（`Modifier.then(if (focused) titleMarquee else Modifier)`）。理由：未聚焦时保留 `TextOverflow.Ellipsis` 的省略号截断（marquee 自己裁剪会变成生硬切断、没有「…」），也让网格里只有一张卡在动。
+  `basicMarquee` 会先给子项一个**无界宽度约束**测出文本真实宽度、再与自身视口比较，因此短名自动不滚动；它也正好让上一行的 `fillMaxWidth()` 在无界约束下退化为「按内容宽度包裹」，从而正确测出溢出。
+  延迟调小（`initialDelayMillis = 400` / `repeatDelayMillis = 900`，默认各 1200ms）让焦点一到就开始滚。
 - 有播放记录的视频卡片在缩略图底部叠加细进度条（`PlaybackRepository.observeAllProgress()` 提供 position/duration 映射）。
 - 顶部工具条：路径面包屑（分类名 > 子文件夹…）+「排序：xxx」按钮 +「刷新」（触发 SyncManager 全量对账，同步中禁用并显示「对账中…」）。
 
@@ -156,8 +160,24 @@ com.hpu.transview
 ### 3.6 TV 焦点规范
 - 通用可点元素（按钮/对话框选项）带 `tvFocus()`：放大 1.03 + 主色描边 + 底色。
 - **媒体库网格卡片**（v1.3）：聚焦放大 1.1 + 2dp 主色边框 + `zIndex(1f)` 抬升（避免放大被相邻卡片裁切）；`onPreviewKeyEvent` 必须写在 `focusRequester`/`clickable` **之前**。
+- **上下键层级（v1.3，必须显式指定，不能交给就近搜索）**：内容区 → 本页工具条 → 顶部导航栏**当前分类标签**。
+  放任默认搜索会出错：内容区在屏幕右侧，其正上方恰是导航栏右上角的「设置」，方向搜索按像素就近就命中「设置」（即「按上键焦点跑到设置去」的根因）；媒体库左侧两列则会穿过不可聚焦的面包屑文字直接命中第一个标签「上传」。
+  - 媒体库：网格**第一行**按 ↑ → 本页工具条（排序 / 刷新）→ 再 ↑ → 本页分类标签（视频页 →「视频」）；中间行按 ↑ 仍是网格内上行（`onNavigateUp` 返回 false 交回 Compose）。
+  - 媒体库工具条 ↓ 回网格**不靠按键拦截**，而是给网格留 `contentPadding(top = 24.dp)`：按钮热区下沿与首行卡片上沿垂直重叠时，方向搜索会判定「下方无目标」而把焦点卡死在工具条上，用布局让开比用按键硬接可靠。
+  - 上传页：记录列表**第一行**按 ↑ → 列表头「清空所有记录」（本页工具条）→ 再 ↑ → 「上传」标签；「上传」↓ 回记录首行。
+- **左右边界（v1.3，同样必须显式吃掉按键）**：内容区每行 / 每栏的**最左端与最右端**要拦下左 / 右键（返回 true 消费事件），让焦点留在原地。
+  否则 Compose 的二维搜索在该方向找不到候选时会「环绕」到别处的可聚焦元素，而顶部导航栏的标签就在正上方且是「聚焦即选中」——被环绕命中就会直接切页。
+  典型现象：视频页只有一个卡片时，焦点在卡片上按**右键**会直接跳回「上传」页（实测复现）。
+  - 落地位置：`MediaCard`/`UpCard` 的 `stayOnLeftEdge`/`stayOnRightEdge`（行首左、行尾右）、媒体库工具条「排序」的左端与「刷新」的右端、上传页记录行的右键与「清空所有记录」的右键。
+  - **反例（别用）**：不要试图在内容区容器上挂 `focusProperties { exit = { FocusRequester.Cancel } }` 当「焦点围墙」——实测它会让内容区内的**程序化 `requestFocus()`**（首行按上键跳到本页工具条）一并失效，属于副作用不可控的写法。
+- **内容切变前的「焦点安全港」（v1.3）**：凡是会**移走承载焦点的卡片**的操作（切换目录 / 返回上级 / 删除文件），都必须先把焦点停到**常驻**的本页工具条上（`parkFocusOnToolbar()` → `toolbarFocus.requestFocus()`），再由目标卡片在下一帧把焦点抢回网格。
+  - 根因：焦点所在卡片被移出组合后，Compose 无法把焦点交还给它，会回退到整棵树里**第一个可聚焦元素**——正是顶部导航栏的「上传」标签；标签是「聚焦即选中」，页面会被立刻切走。
+  - 典型现象：在图片页按确定键打开文件夹，直接跳回「上传」页（实测复现：`OK` 前焦点在 `windows` 文件夹卡片 `[42,236][280,447]`，`OK` 后焦点变成「上传」标签 `[184,24][308,88]`）。
+  - 落地位置：`LibraryScreen` 的 `openEntry`（目录分支）、`goUp()`、`performDelete()`。
+  - 附带收益：即使「抢回焦点」失败，焦点也仍留在本页工具条，不会跨页乱跑。
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。
-- 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作。
+- 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；
+  请求焦点统一走 `requestFocusNextFrame()`（`withFrameNanos {}` 让出一帧再 `requestFocus()`）——LazyGrid 项刚组合、尚未完成布局时 `requestFocus()` 会抛 `IllegalStateException` 被 `runCatching` 静默吞掉，表现为「焦点还原没反应」。
 - 播放器/查看器根节点 `focusable()` 常驻焦点，浮层隐藏后 `FocusRequester` 归位（控制栏显示 → 落到播放/暂停按钮；隐藏 → 回根节点），遥控器永不失焦。
 
 ### 3.7 服务器智能保活（ServerController 状态机）

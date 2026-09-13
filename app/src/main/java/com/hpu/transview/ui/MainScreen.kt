@@ -22,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -37,6 +38,7 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.dp
 import com.hpu.transview.model.Category
@@ -58,18 +60,27 @@ fun MainScreen() {
     var showSettings by remember { mutableStateOf(false) }
     val tabFocusRequesters = remember { MainTab.entries.map { FocusRequester() } }
 
+    // 内容区「聚焦首行」请求票据：顶部标签每按一次 ↓ 自增，由内容区页面消费
+    // （媒体库 → 网格第一行）。必须显式指定，不能交给 Compose 方向搜索：
+    // 工具条按钮在空间上离标签更近，会把焦点吸到「排序」上（用户实测反馈）。
+    var contentFocusTicket by remember { mutableIntStateOf(0) }
+
     // 省电模式：仅上传页可见时允许服务器运行
     LaunchedEffect(selected) {
         ServerController.setUploadPageVisible(selected == MainTab.UPLOAD)
+    }
+
+    // 把焦点送回顶部导航栏「当前选中的标签」：返回键、以及内容区工具条按上键时都用它。
+    // 用 remember(selected) 捕获当前标签，避免闭包一直停在初始值。
+    val focusSelectedTab: () -> Unit = remember(selected) {
+        { runCatching { tabFocusRequesters[selected.ordinal].requestFocus() } }
     }
 
     // 返回键：先交给内容区（媒体库在子目录时返回上一级，它注册的 BackHandler 优先级更高），
     // 内容区不处理时回到顶部导航栏。
     // 必须用 BackHandler 而非 Modifier.onKeyEvent —— onKeyEvent 只在焦点路径上才收得到事件，
     // 从播放页返回后内容区焦点为空时会漏掉返回键，Activity 被系统直接 finish（表现为「返回键退出 App」）。
-    BackHandler {
-        runCatching { tabFocusRequesters[selected.ordinal].requestFocus() }
-    }
+    BackHandler { focusSelectedTab() }
 
     Column(
         Modifier
@@ -93,6 +104,7 @@ fun MainScreen() {
                 TabChip(
                     tab = tab,
                     selected = tab == selected,
+                    onNavigateDown = { contentFocusTicket++ },
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
                         .onFocusChanged { if (it.isFocused && tab != selected) selected = tab }
@@ -114,16 +126,22 @@ fun MainScreen() {
         }
 
         // 内容区（返回键见上面的 BackHandler）
+        // 注：不要在这里挂 `focusProperties { exit = { FocusRequester.Cancel } }` 当「焦点围墙」——
+        // 实测它会连带让内容区内的程序化 `requestFocus()`（如首行按上键跳到本页工具条）失效。
+        // 边界保护统一走各页面自己的 `onPreviewKeyEvent` 拦截。
         Box(
             Modifier
                 .weight(1f)
                 .fillMaxWidth()
         ) {
             when (selected) {
-                MainTab.UPLOAD -> UploadScreen()
-                MainTab.VIDEO -> LibraryScreen(Category.VIDEO)
-                MainTab.IMAGE -> LibraryScreen(Category.IMAGE)
-                MainTab.OTHER -> LibraryScreen(Category.OTHER)
+                MainTab.UPLOAD -> UploadScreen(
+                    onFocusTabs = focusSelectedTab,
+                    focusListTicket = contentFocusTicket
+                )
+                MainTab.VIDEO -> LibraryScreen(Category.VIDEO, onFocusTabs = focusSelectedTab, focusGridTicket = contentFocusTicket)
+                MainTab.IMAGE -> LibraryScreen(Category.IMAGE, onFocusTabs = focusSelectedTab, focusGridTicket = contentFocusTicket)
+                MainTab.OTHER -> LibraryScreen(Category.OTHER, onFocusTabs = focusSelectedTab, focusGridTicket = contentFocusTicket)
             }
         }
 
@@ -135,11 +153,25 @@ fun MainScreen() {
 
 /** 导航标签：聚焦即选中（遥控器左右切换） */
 @Composable
-private fun TabChip(tab: MainTab, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun TabChip(
+    tab: MainTab,
+    selected: Boolean,
+    onNavigateDown: () -> Unit,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
     var focused by remember { mutableStateOf(false) }
     Box(
         modifier
             .onFocusChanged { focused = it.isFocused }
+            // 标签按「下键」→ 显式交给内容区（见 MainScreen.contentFocusTicket 注释）。
+            // 放在 clickable 之前，与页面内卡片的按键处理保持一致。
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
+                    onNavigateDown()
+                    true
+                } else false
+            }
             .clip(RoundedCornerShape(50))
             .background(
                 when {

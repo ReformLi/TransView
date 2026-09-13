@@ -4,6 +4,7 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -21,7 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -70,6 +72,7 @@ import com.hpu.transview.model.UploadState
 import com.hpu.transview.server.UploadBus
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.TypeBadge
+import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.tvFocus
 import com.hpu.transview.ui.image.ImageViewerActivity
 import com.hpu.transview.ui.player.PlayerActivity
@@ -90,17 +93,41 @@ private const val GRID_COLUMNS = 5
 private const val FOCUS_UP = "__up__"
 
 /**
+ * 长文件名跑马灯（仅在卡片获得焦点时挂上，见 MediaCard）。
+ *
+ * `basicMarquee` 会先给子项一个无界宽度约束来测出文本的**真实宽度**，再与自身视口比较，
+ * 因此能正确判断「是否溢出」——文本没超宽时它什么也不做，超宽才循环滚动。
+ * 两个延迟都调小于默认值（默认各 1200ms），让焦点一到就尽快开始滚。
+ */
+private val titleMarquee: Modifier = Modifier.basicMarquee(
+    initialDelayMillis = 400,
+    repeatDelayMillis = 900
+)
+
+/**
  * 媒体库页（多列网格卡片）：视频 / 图片 / 其他三个分类共用。
  *
  * - 顶部工具条：路径面包屑（视频 > 甄嬛传）+ 排序 + 手动刷新（对账）
  * - 主体：LazyVerticalGrid 多列卡片。文件夹=图标+名称+文件数；视频=缩略图+名称+播放进度条；
  *   图片=缩略图+名称；其他=通用图标+名称。
  * - 焦点：卡片聚焦放大 1.1 倍 + 高亮边框；从文件夹返回上级时焦点还原到刚才进入的文件夹卡片。
+ * - 上下键层级：网格**第一行**按上键 → 本页工具条（排序 / 刷新）；工具条再按上键 → 顶部导航栏的
+ *   当前分类标签。中间行按上键仍是网格内上行（交回 Compose 默认焦点搜索）。
+ *   反向：标签按下键 → 直接回网格第一行（`focusGridTicket`），**不经过工具条**——
+ *   工具条按钮在空间上离标签更近，交给方向搜索会把它吸过去（用户实测「其他」页 ↓ 落在「排序」）。
+ *   工具条按下键回网格由「网格顶部留白」保证（详见 LazyVerticalGrid 的 contentPadding）。
  * - 交互：确定键直达动作；菜单键弹出「进入/播放、删除、取消」；删除走二次确认，
  *   先物理删除再删 Room 索引，成功后焦点自动移到下一个卡片。
+ * - **焦点安全港**：切换目录 / 返回上级 / 删除前，先 `parkFocusOnToolbar()` 把焦点停到本页工具条。
+ *   否则承载焦点的卡片被移出组合时，Compose 会把焦点回退到第一个可聚焦元素（顶部「上传」标签），
+ *   标签的「聚焦即选中」会把页面直接切走。
  */
 @Composable
-fun LibraryScreen(category: Category) {
+fun LibraryScreen(
+    category: Category,
+    onFocusTabs: () -> Unit = {},
+    focusGridTicket: Int = 0
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val root = remember(category) { FileLocations.root(category) }
@@ -114,8 +141,15 @@ fun LibraryScreen(category: Category) {
     var pendingDelete by remember { mutableStateOf<FileEntry?>(null) }
 
     val gridState = rememberLazyGridState()
+    // 本页工具条（排序 / 刷新）的焦点入口：网格第一行按「上键」落到这里，
+    // 再按一次上键才由工具条把焦点交给顶部导航栏的当前分类标签。
+    val toolbarFocus = remember { FocusRequester() }
     // 待聚焦目标路径（文件绝对路径 或 FOCUS_UP）；聚焦完成后置空
     var pendingFocusPath by remember(category) { mutableStateOf<String?>(null) }
+    // 已消费的「标签按下键」票据。初始化为当前值：切分类标签进来时会重建本页组合，
+    // 若从 0 开始会让 LaunchedEffect 立刻跑一次，把焦点从标签抢进网格，
+    // 用户就没法继续按 → 切到下一个标签了。
+    var consumedFocusTicket by remember(category) { mutableIntStateOf(focusGridTicket) }
 
     val atRoot = currentDir == root
 
@@ -192,10 +226,35 @@ fun LibraryScreen(category: Category) {
         }
     }
 
+    // ——— 内容切变时的「焦点安全港」———
+    // 承载焦点的卡片会随「切换目录 / 删除」被移出组合，Compose 此时无法把焦点交还给它，
+    // 会回退到整棵树里第一个可聚焦元素 —— 正是顶部导航栏的「上传」标签；
+    // 而标签是「聚焦即选中」，页面会被立刻切走（现象：在图片页打开文件夹，直接跳回上传页）。
+    // 因此凡是会移走焦点卡片的操作，都先把焦点停到常驻的本页工具条上，
+    // 再由目标卡片在下一帧把焦点抢回网格；即使抢回失败，焦点也仍留在本页。
+    val parkFocusOnToolbar: () -> Unit = { runCatching { toolbarFocus.requestFocus() } }
+
+    // ——— 顶部标签按「下键」→ 直接落到网格第一行 ———
+    // 用户明确要求：本页工具条只能由「网格第一行按 ↑」上来聚焦，
+    // 从标签按 ↓ 不该直接落到「排序」上。这件事交给 Compose 方向搜索做不到——
+    // 工具条按钮在空间上离标签更近，会被优先命中（实测「其他」页标签 ↓ 落在「排序」）。
+    // 这里取「当前视口的第一行首项」而不是列表首项，避免网格已滚动时去聚焦视口外的卡片。
+    LaunchedEffect(focusGridTicket) {
+        if (focusGridTicket == consumedFocusTicket) return@LaunchedEffect
+        consumedFocusTicket = focusGridTicket
+        val offset = if (atRoot) 0 else 1
+        val firstVisible = gridState.firstVisibleItemIndex
+        val target = if (!atRoot && firstVisible == 0) FOCUS_UP
+        else entries.getOrNull(firstVisible - offset)?.file?.absolutePath
+        // 空目录时网格里没有卡片，退而聚焦本页工具条（页面上唯一可聚焦处）
+        if (target != null) pendingFocusPath = target else parkFocusOnToolbar()
+    }
+
     // ——— 进入下一级 / 返回上一级 ———
     val openEntry: (FileEntry) -> Unit = { entry ->
         when {
             entry.isDirectory -> {
+                parkFocusOnToolbar()
                 currentDir = entry.file
                 pendingFocusPath = FOCUS_UP
             }
@@ -213,6 +272,7 @@ fun LibraryScreen(category: Category) {
 
     val goUp: () -> Unit = {
         if (!atRoot) {
+            parkFocusOnToolbar()
             val leaving = currentDir
             currentDir = leaving.parentFile ?: root
             // 焦点还原到刚才进入（即将离开）的那个文件夹卡片
@@ -237,6 +297,8 @@ fun LibraryScreen(category: Category) {
                 FileUtils.deletePhysicalFile(entry.file)
             }
             if (physicalOk) {
+                // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走
+                parkFocusOnToolbar()
                 mediaRepo.deleteByPath(entry.file.absolutePath)
                 pendingFocusPath = nextPath
                 dirRefreshKey++ // 父目录可能被连带清空
@@ -269,6 +331,8 @@ fun LibraryScreen(category: Category) {
     }
 
     // ——— 顶部工具条 + 网格 ———
+    // 网格项总数（子目录里前面多一张「返回上级」卡片）：用于判断「行尾」右侧是否还有卡片
+    val totalGridItems = entries.size + if (atRoot) 0 else 1
     // 网格内按返回键先「返回上一级」；到根目录时不启用，交由 MainScreen 回到顶部导航栏。
     // 用 BackHandler 而非 onPreviewKeyEvent：后者只在焦点路径上才收到事件，焦点为空时会漏掉返回键。
     BackHandler(enabled = !atRoot) { goUp() }
@@ -282,6 +346,25 @@ fun LibraryScreen(category: Category) {
             crumb = buildCrumb(category, root, currentDir),
             sortOrder = sortOrder,
             syncing = syncing,
+            // 工具条上按「上键」→ 顶部导航栏的当前分类标签（视频页 → 「视频」标签）
+            upToTabsModifier = Modifier.onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionUp) {
+                    onFocusTabs()
+                    true
+                } else false
+            },
+            sortFocusModifier = Modifier
+                .focusRequester(toolbarFocus)
+                // 工具条最左端按「左」：吃掉按键让焦点留在原地（原因同网格左右边界）
+                .onPreviewKeyEvent { event ->
+                    if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) true
+                    else false
+                },
+            // 工具条最右端按「右」：同上
+            refreshEdgeModifier = Modifier.onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionRight) true
+                else false
+            },
             onSortClick = { showSortDialog = true },
             onRefresh = refreshLibrary
         )
@@ -295,20 +378,35 @@ fun LibraryScreen(category: Category) {
                 columns = GridCells.Fixed(GRID_COLUMNS),
                 state = gridState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(bottom = 32.dp),
+                // 顶部留白：工具条按钮的触控热区会向下溢出，若与首行卡片在垂直方向重叠，
+                // 「下键」的方向搜索就找不到落点，焦点会卡死在工具条上。
+                contentPadding = PaddingValues(top = 24.dp, bottom = 32.dp),
                 horizontalArrangement = Arrangement.spacedBy(18.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp)
             ) {
+                // 网格左右边界必须显式「吃掉」按键：Compose 的二维焦点搜索在某方向找不到候选时，
+                // 会「环绕」到别处的可聚焦元素，而顶部导航栏的标签就在正上方——一旦被环绕命中，
+                // 标签的「聚焦即选中」会立刻把页面切走（现象：焦点在卡片上按右键，直接跳回「上传」页）。
                 if (!atRoot) {
                     item(key = FOCUS_UP) {
                         UpCard(
                             autoFocus = pendingFocusPath == FOCUS_UP,
                             onAutoFocused = { pendingFocusPath = null },
-                            onUp = goUp
+                            onUp = goUp,
+                            onNavigateUp = {
+                                if (gridState.firstVisibleItemIndex == 0) {
+                                    runCatching { toolbarFocus.requestFocus() }
+                                    true
+                                } else false
+                            },
+                            stayOnLeftEdge = true, // gridIndex 0，必是第一列
+                            stayOnRightEdge = totalGridItems <= 1
                         )
                     }
                 }
-                items(entries, key = { it.file.absolutePath }) { entry ->
+                itemsIndexed(entries, key = { _, it -> it.file.absolutePath }) { index, entry ->
+                    // 卡片在网格中的绝对位置（子目录里前面多一张「返回上级」卡片）
+                    val gridIndex = index + if (atRoot) 0 else 1
                     MediaCard(
                         entry = entry,
                         childCount = if (entry.isDirectory) countInFolder(entry.file.absolutePath) else 0,
@@ -317,7 +415,17 @@ fun LibraryScreen(category: Category) {
                         onAutoFocused = { pendingFocusPath = null },
                         onOpen = { openEntry(entry) },
                         onMenu = { actionEntry = entry },
-                        onDelete = { pendingDelete = entry }
+                        onDelete = { pendingDelete = entry },
+                        // 第一行按「上键」→ 本页工具条（网格已滚到顶才算是第一行，否则交回 Compose 做网格内上行）
+                        onNavigateUp = {
+                            if (gridIndex < GRID_COLUMNS && gridState.firstVisibleItemIndex == 0) {
+                                runCatching { toolbarFocus.requestFocus() }
+                                true
+                            } else false
+                        },
+                        stayOnLeftEdge = gridIndex % GRID_COLUMNS == 0,
+                        stayOnRightEdge = (gridIndex + 1) % GRID_COLUMNS == 0 ||
+                            gridIndex + 1 >= totalGridItems
                     )
                 }
             }
@@ -406,6 +514,9 @@ private fun LibraryTopBar(
     crumb: String,
     sortOrder: SortOrder,
     syncing: Boolean,
+    upToTabsModifier: Modifier,
+    sortFocusModifier: Modifier,
+    refreshEdgeModifier: Modifier,
     onSortClick: () -> Unit,
     onRefresh: () -> Unit
 ) {
@@ -424,10 +535,15 @@ private fun LibraryTopBar(
             modifier = Modifier.weight(1f)
         )
         Spacer(Modifier.width(16.dp))
-        TvButton(text = "排序：${sortOrder.label}", onClick = onSortClick)
+        TvButton(
+            text = "排序：${sortOrder.label}",
+            modifier = sortFocusModifier.then(upToTabsModifier),
+            onClick = onSortClick
+        )
         Spacer(Modifier.width(12.dp))
         TvButton(
             text = if (syncing) "对账中…" else "刷新",
+            modifier = upToTabsModifier.then(refreshEdgeModifier),
             enabled = !syncing,
             onClick = onRefresh
         )
@@ -468,7 +584,10 @@ private fun MediaCard(
     onAutoFocused: () -> Unit,
     onOpen: () -> Unit,
     onMenu: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onNavigateUp: () -> Boolean,
+    stayOnLeftEdge: Boolean,
+    stayOnRightEdge: Boolean
 ) {
     val focusRequester = remember { FocusRequester() }
     var focused by remember { mutableStateOf(false) }
@@ -476,7 +595,7 @@ private fun MediaCard(
 
     LaunchedEffect(autoFocus) {
         if (autoFocus) {
-            runCatching { focusRequester.requestFocus() }
+            focusRequester.requestFocusNextFrame()
             onAutoFocused()
         }
     }
@@ -501,12 +620,19 @@ private fun MediaCard(
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
+                    // 第一行按「上键」→ 本页工具条；非第一行返回 false，交回 Compose 做网格内上行
+                    Key.DirectionUp -> onNavigateUp()
+                    // 行首按左 / 行尾按右：吃掉按键让焦点留在原地（见 stayOn*Edge 注释）
+                    Key.DirectionLeft -> stayOnLeftEdge
+                    Key.DirectionRight -> stayOnRightEdge
                     Key.Menu -> { onMenu(); true }
                     Key.Delete -> { onDelete(); true }
                     else -> false
                 }
             }
-            .padding(8.dp)
+            .padding(8.dp),
+        // 标题/副标题居中对齐（用户 2026-09-13 要求：视频、图片、其他页的文件与文件夹名都要居中）
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // 缩略图 / 图标区
         Box(
@@ -557,27 +683,42 @@ private fun MediaCard(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                // 聚焦时才滚动：长文件名在本卡片获得焦点后循环跑马灯，能完整看全；
+                // 未聚焦保持 Ellipsis 截断（不挂 marquee，避免所有卡片同时滚动分散注意力）。
+                .then(if (focused) titleMarquee else Modifier)
         )
         Text(
             subtitleOf(entry, childCount),
             style = MaterialTheme.typography.bodySmall,
             color = OnDarkDim,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }
 
 @Composable
-private fun UpCard(autoFocus: Boolean, onAutoFocused: () -> Unit, onUp: () -> Unit) {
+private fun UpCard(
+    autoFocus: Boolean,
+    onAutoFocused: () -> Unit,
+    onUp: () -> Unit,
+    onNavigateUp: () -> Boolean,
+    stayOnLeftEdge: Boolean,
+    stayOnRightEdge: Boolean
+) {
     val focusRequester = remember { FocusRequester() }
     var focused by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(12.dp)
 
     LaunchedEffect(autoFocus) {
         if (autoFocus) {
-            runCatching { focusRequester.requestFocus() }
+            focusRequester.requestFocusNextFrame()
             onAutoFocused()
         }
     }
@@ -603,13 +744,22 @@ private fun UpCard(autoFocus: Boolean, onAutoFocused: () -> Unit, onUp: () -> Un
                         if (event.type == KeyEventType.KeyDown) onUp()
                         true
                     }
+                    // 第一行按「上键」→ 本页工具条；非第一行返回 false，交回 Compose 做网格内上行
+                    Key.DirectionUp ->
+                        if (event.type == KeyEventType.KeyDown) onNavigateUp() else false
+                    // 行首按左 / 行尾按右：吃掉按键让焦点留在原地（见 stayOn*Edge 注释）
+                    Key.DirectionLeft ->
+                        if (event.type == KeyEventType.KeyDown) stayOnLeftEdge else false
+                    Key.DirectionRight ->
+                        if (event.type == KeyEventType.KeyDown) stayOnRightEdge else false
                     else -> false
                 }
             }
             .focusRequester(focusRequester)
             .onFocusChanged { focused = it.isFocused }
             .clickable { onUp() }
-            .padding(8.dp)
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
             Modifier
@@ -630,7 +780,9 @@ private fun UpCard(autoFocus: Boolean, onAutoFocused: () -> Unit, onUp: () -> Un
             "返回上级",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1
+            maxLines = 1,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }
