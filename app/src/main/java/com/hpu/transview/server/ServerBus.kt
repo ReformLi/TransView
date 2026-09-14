@@ -1,6 +1,7 @@
 package com.hpu.transview.server
 
 import com.hpu.transview.model.ServerMode
+import com.hpu.transview.ui.settings.SettingsStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,6 +19,15 @@ object ServerBus {
     private val _mode = MutableStateFlow(ServerMode.SMART)
     val mode: StateFlow<ServerMode> = _mode.asStateFlow()
 
+    /**
+     * 当前监听端口（设置页改端口后立即更新）。
+     *
+     * 上传页的二维码与地址文本依赖它：改端口后若仍显示旧端口，手机会连到已关闭的端口，
+     * 表现为「上传页看着正常但扫码打不开」。
+     */
+    private val _port = MutableStateFlow(SettingsStore.serverPort)
+    val port: StateFlow<Int> = _port.asStateFlow()
+
     fun update(running: Boolean, hibernated: Boolean) {
         _running.value = running
         _hibernated.value = hibernated
@@ -25,5 +35,9 @@ object ServerBus {
 
     fun setMode(mode: ServerMode) {
         _mode.value = mode
+    }
+
+    fun setPort(port: Int) {
+        _port.value = port
     }
 }

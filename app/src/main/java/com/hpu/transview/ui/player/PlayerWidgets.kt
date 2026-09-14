@@ -143,7 +143,15 @@ private fun DrawScope.drawPlayerIcon(icon: PlayerIconType, tint: Color) {
     }
 }
 
-/** 图标按钮：46dp 方块（emphasized 用于播放/暂停，60dp），聚焦时放大 + 主色填充 */
+/**
+ * 图标按钮：46dp 方块（emphasized 用于播放/暂停，60dp），聚焦时放大 + 主色填充。
+ *
+ * **`enabled = false` 时按钮依然可聚焦**（只是不再响应确定键、按灰色禁用样式渲染、聚焦时
+ * 用灰色描边而不是主色填充）。理由与 `TvButton` 相同：Material3/`clickable` 在 `enabled = false`
+ * 时会把元素移出焦点候选，若它**正持有焦点**（典型：在「下一集」上按确定键切到最后一集，`hasNext`
+ * 立刻变 false），Compose 会丢弃焦点并回退到整棵树第一个可聚焦元素——播放器里就是根节点，
+ * 表现为控制栏上一个高亮都没有、之后左右键直接变成快进快退。详见 ARCHITECTURE §3.6。
+ */
 @Composable
 fun PlayerIconButton(
     icon: PlayerIconType,
@@ -162,7 +170,7 @@ fun PlayerIconButton(
     )
     val shape = RoundedCornerShape(if (emphasized) 14.dp else 10.dp)
     val tint = when {
-        !enabled -> Color.White.copy(alpha = 0.28f)
+        !enabled -> Color.White.copy(alpha = if (focused) 0.40f else 0.28f)
         focused -> MaterialTheme.colorScheme.onPrimary
         emphasized -> MaterialTheme.colorScheme.primary
         else -> Color.White
@@ -180,6 +188,9 @@ fun PlayerIconButton(
             .clip(shape)
             .background(
                 when {
+                    // 禁用态不给主色填充（暗图标压在亮蓝上会糊成一片），改用灰底
+                    !enabled && focused -> Color.White.copy(alpha = 0.14f)
+                    !enabled -> Color.White.copy(alpha = 0.06f)
                     focused -> MaterialTheme.colorScheme.primary
                     emphasized -> MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
                     else -> Color.White.copy(alpha = 0.10f)
@@ -187,6 +198,9 @@ fun PlayerIconButton(
             )
             .then(
                 when {
+                    // 禁用态的焦点提示：灰色描边（焦点位置依然看得见，但一眼可辨「不可用」）
+                    !enabled && focused -> Modifier.border(2.dp, Color.White.copy(alpha = 0.45f), shape)
+                    !enabled -> Modifier
                     focused -> Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape)
                     emphasized -> Modifier.border(
                         1.dp,
@@ -196,7 +210,9 @@ fun PlayerIconButton(
                     else -> Modifier
                 }
             )
-            .clickable(enabled = enabled) { onClick() },
+            // clickable 恒 enabled：禁用态必须**保留焦点候选资格**（见函数注释），
+            // 因此由自己吞掉点击，而不是交给 clickable(enabled = false)
+            .clickable(enabled = true) { if (enabled) onClick() },
         contentAlignment = Alignment.Center
     ) {
         PlayerIconGlyph(icon, tint, Modifier.size(size * 0.44f))

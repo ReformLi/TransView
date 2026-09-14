@@ -101,10 +101,12 @@ private data class ConfirmState(
 private data class InfoState(val title: String, val body: String)
 
 /** 常见可选端口（电视遥控器无键盘，用预设免输入） */
-private val PORT_OPTIONS = listOf("8080", "8081", "8089", "9000")
+private val PORT_OPTIONS = listOf("8080", "8081", "8088", "8089", "9000")
 
-/** 常见设备名候选 */
-private val DEVICE_NAMES = listOf("传视TV", "客厅电视", "卧室电视", "书房电视", "主卧电视")
+/** 常见设备名候选（遥控器无键盘，候选选择；首项为默认值） */
+private val DEVICE_NAMES = listOf(
+    "传视TV", "客厅电视", "卧室电视", "主卧电视", "次卧电视", "书房电视", "影音室", "投影仪"
+)
 
 /** 默认倍速候选项 */
 private val SPEED_OPTIONS = listOf("1.0x", "1.25x", "1.5x")
@@ -168,6 +170,20 @@ fun SettingsScreen(
     ServerController.init(context) // 确保保活策略持久化可用
 
     val mode by ServerBus.mode.collectAsState()
+
+    // ——— 「服务器与网络」三项（已接线）的界面显示值 ———
+    // 端口切换需要重启服务器（异步），自启/设备名写盘后本页也不会自动重组，
+    // 因此用本地状态承载显示值：先更新界面，副作用（重启/写盘）失败时再回滚。
+    var portValue by remember { mutableIntStateOf(SettingsStore.serverPort) }
+    var bootAutostartValue by remember { mutableStateOf(SettingsStore.bootAutostart) }
+    var deviceNameValue by remember { mutableStateOf(SettingsStore.deviceName) }
+
+    // ——— 「播放设置」四项（已接线）的界面显示值 ———
+    // 写 SharedPreferences 不会触发本页重组，用本地状态承载显示值，选完立刻刷新。
+    var autoResumeValue by remember { mutableStateOf(SettingsStore.autoResumePrompt) }
+    var autoPlayNextValue by remember { mutableStateOf(SettingsStore.autoPlayNext) }
+    var defaultSpeedValue by remember { mutableStateOf(SettingsStore.defaultSpeed) }
+    var defaultAspectValue by remember { mutableStateOf(SettingsStore.defaultAspect) }
 
     var selectedGroupIndex by remember { mutableIntStateOf(0) }
     val groupFocusers = remember { List(SettingGroup.entries.size) { FocusRequester() } }
@@ -422,83 +438,159 @@ fun SettingsScreen(
                             }
                             SettingRow(
                                 "${g.title}:1", "服务器端口",
-                                "${SettingsStore.serverPort}", pending = true
+                                "$portValue"
                             ) {
                                 openChoice("${g.title}:1", ChoiceState(
-                                    "服务器端口（待实现）",
+                                    "服务器端口",
                                     PORT_OPTIONS,
-                                    pickIndex(PORT_OPTIONS, SettingsStore.serverPort.toString()),
-                                    { i -> SettingsStore.serverPort = PORT_OPTIONS[i].toInt() }
-                                ))
+                                    pickIndex(PORT_OPTIONS, portValue.toString())
+                                ) { i ->
+                                    val target = PORT_OPTIONS[i].toInt()
+                                    if (target != portValue) {
+                                        // 切换端口 = 停旧端口、在新端口重建监听（NanoHTTPD 端口构造时固定）。
+                                        // 成功才落地显示值；失败（多为端口被占用）保持原端口并提示。
+                                        ServerController.setPort(target) { ok ->
+                                            if (ok) {
+                                                portValue = target
+                                                Toast.makeText(
+                                                    context,
+                                                    "端口已切换为 $target，手机端请用新地址访问",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    "端口 $target 启动失败（可能已被占用），仍使用 $portValue",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                })
                             }
                             SettingRow(
                                 "${g.title}:2", "开机自启",
-                                if (SettingsStore.bootAutostart) "开启" else "关闭", pending = true
+                                if (bootAutostartValue) "开启" else "关闭"
                             ) {
                                 openChoice("${g.title}:2", ChoiceState(
-                                    "开机自启（待实现）",
+                                    "开机自启",
                                     listOf("开启", "关闭"),
-                                    if (SettingsStore.bootAutostart) 0 else 1,
-                                    { i -> SettingsStore.bootAutostart = i == 0 }
-                                ))
+                                    if (bootAutostartValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    bootAutostartValue = on
+                                    SettingsStore.bootAutostart = on
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启：开机后自动启动文件服务器"
+                                        else "已关闭开机自启",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                })
                             }
                             SettingRow(
                                 "${g.title}:3", "设备名称",
-                                SettingsStore.deviceName, pending = true
+                                deviceNameValue
                             ) {
                                 openChoice("${g.title}:3", ChoiceState(
-                                    "设备名称（待实现）",
+                                    "设备名称",
                                     DEVICE_NAMES,
-                                    pickIndex(DEVICE_NAMES, SettingsStore.deviceName),
-                                    { i -> SettingsStore.deviceName = DEVICE_NAMES[i] }
-                                ))
+                                    pickIndex(DEVICE_NAMES, deviceNameValue)
+                                ) { i ->
+                                    val name = DEVICE_NAMES[i]
+                                    deviceNameValue = name
+                                    SettingsStore.deviceName = name
+                                    Toast.makeText(
+                                        context,
+                                        "设备名称已改为「$name」，手机端上传页将显示该名称",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                         }
 
                         SettingGroup.PLAY -> {
                             SettingRow(
                                 "${g.title}:0", "自动续播提示",
-                                if (SettingsStore.autoResumePrompt) "开启" else "关闭", pending = true
+                                if (autoResumeValue) "开启" else "关闭"
                             ) {
                                 openChoice("${g.title}:0", ChoiceState(
-                                    "自动续播提示（待实现）",
+                                    "自动续播提示",
                                     listOf("开启", "关闭"),
-                                    if (SettingsStore.autoResumePrompt) 0 else 1,
-                                    { i -> SettingsStore.autoResumePrompt = i == 0 }
-                                ))
+                                    if (autoResumeValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    autoResumeValue = on
+                                    SettingsStore.autoResumePrompt = on
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启：打开视频时弹窗询问是否继续播放"
+                                        else "已关闭：打开视频时直接从上次位置继续，不再询问",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                             SettingRow(
                                 "${g.title}:1", "自动连播",
-                                if (SettingsStore.autoPlayNext) "开启" else "关闭", pending = true
+                                if (autoPlayNextValue) "开启" else "关闭"
                             ) {
                                 openChoice("${g.title}:1", ChoiceState(
-                                    "自动连播（待实现）",
+                                    "自动连播",
                                     listOf("开启", "关闭"),
-                                    if (SettingsStore.autoPlayNext) 0 else 1,
-                                    { i -> SettingsStore.autoPlayNext = i == 0 }
-                                ))
+                                    if (autoPlayNextValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    autoPlayNextValue = on
+                                    SettingsStore.autoPlayNext = on
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启：一集播完自动播放同目录下一个视频"
+                                        else "已关闭：一集播完停在片尾，等您选择重播或返回",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                             SettingRow(
                                 "${g.title}:2", "默认倍速",
-                                speedLabel(SettingsStore.defaultSpeed), pending = true
+                                speedLabel(defaultSpeedValue)
                             ) {
                                 openChoice("${g.title}:2", ChoiceState(
-                                    "默认倍速（待实现）",
+                                    "默认倍速",
                                     SPEED_OPTIONS,
-                                    pickIndex(SPEED_OPTIONS, speedLabel(SettingsStore.defaultSpeed)),
-                                    { i -> SettingsStore.defaultSpeed = when (i) { 1 -> 1.25f; 2 -> 1.5f; else -> 1.0f } }
-                                ))
+                                    pickIndex(SPEED_OPTIONS, speedLabel(defaultSpeedValue))
+                                ) { i ->
+                                    val sp = when (i) {
+                                        1 -> 1.25f
+                                        2 -> 1.5f
+                                        else -> 1.0f
+                                    }
+                                    defaultSpeedValue = sp
+                                    SettingsStore.defaultSpeed = sp
+                                    Toast.makeText(
+                                        context,
+                                        "已设默认倍速 ${speedLabel(sp)}，下次打开视频生效",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                             SettingRow(
                                 "${g.title}:3", "默认画面比例",
-                                SettingsStore.defaultAspect.label, pending = true
+                                defaultAspectValue.label
                             ) {
                                 openChoice("${g.title}:3", ChoiceState(
-                                    "默认画面比例（待实现）",
+                                    "默认画面比例",
                                     AspectRatio.entries.map { it.label },
-                                    AspectRatio.entries.indexOf(SettingsStore.defaultAspect),
-                                    { i -> SettingsStore.defaultAspect = AspectRatio.entries[i] }
-                                ))
+                                    AspectRatio.entries.indexOf(defaultAspectValue)
+                                ) { i ->
+                                    val a = AspectRatio.entries[i]
+                                    defaultAspectValue = a
+                                    SettingsStore.defaultAspect = a
+                                    Toast.makeText(
+                                        context,
+                                        "已设默认画面比例「${a.label}」，下次打开视频生效",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                         }
 

@@ -34,16 +34,17 @@ com.hpu.transview
 │   ├── NetUtils.kt            本机 IP 探测、存储权限统一入口（StoragePermission，含写探针）
 │   ├── IntentUtils.kt         安全启动 Activity（隐式 Intent 显式化，规避 ROM hook NPE）
 │   ├── QrCode.kt              ZXing 二维码生成
-│   └── Constants.kt(并入NetUtils) 端口 8080
+│   └── Constants.kt(并入NetUtils) 默认端口 DEFAULT_PORT=8080、可选端口范围、上传路径
 ├── server/                    网络接收层（不依赖 UI）
 │   ├── TransHttpServer.kt     NanoHTTPD：上传页/上传接口；记录入 Room + 计数流回写进度
-│   │                          + 落盘后立即建媒体索引
+│   │                          + 落盘后立即建媒体索引；上传页每次请求注入设备名（__DEVICE_NAME__）
 │   ├── UploadStorage.kt       落盘规则：分类根目录/同名重命名/文件夹合并/路径消毒
 │   ├── UploadBus.kt           上传事件总线（媒体库刷新/空闲计时信号）
-│   ├── ServerBus.kt           服务器状态总线（running/hibernated/mode）
-│   └── ServerController.kt    智能保活策略引擎（模式+屏幕/播放/页面信号 → 启停状态机）
+│   ├── ServerBus.kt           服务器状态总线（running/hibernated/mode/port）
+│   └── ServerController.kt    智能保活策略引擎（模式+屏幕/播放/页面信号 → 启停状态机；setPort 停旧起新）
 ├── service/
-│   └── ServerService.kt       前台服务（dataSync 类型）+ 常驻通知
+│   ├── ServerService.kt       前台服务（API 34+ specialUse / API 29~33 dataSync）+ 常驻通知
+│   └── BootReceiver.kt        开机自启（BOOT_COMPLETED → 读设置决定是否拉起 ServerService）
 ├── data/                      数据层（Room 唯一通道 = 仓储）
 │   ├── db/Entities.kt         media_items（filePath 唯一索引）/ playback_history（外键 CASCADE）
 │   │                          / upload_records（纯历史日志）
@@ -61,11 +62,12 @@ com.hpu.transview
     ├── permission/             存储权限引导页
     ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码+地址+状态）+ 右侧可滚动上传记录列表
     ├── library/LibraryScreen.kt 多列网格卡片（5 列）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
-    ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；保活/存储/清空记录/对账/版本/许可/致谢已接通，
-    │                           其余项页面+持久化就绪待接线；三类弹框关闭后焦点回原行）
+    ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；保活/端口/自启/设备名/续播提示/连播/倍速/
+    │                           画面比例/存储/清空记录/对账/版本/许可/致谢已接通，界面设置两项页面+持久化就绪待接线；
+    │                           三类弹框关闭后焦点回原行）
     ├── settings/SettingsStore.kt 设置偏好持久化（SharedPreferences object；端口/自启/设备名/续播提示/
     │                           连播/倍速/画面比例/列数/默认排序，均含默认值）
-    ├── player/PlayerActivity.kt 播放器（图标化控制栏、时间节点快进反馈、续播/连播/倍速/音轨/字幕）
+    ├── player/PlayerActivity.kt 播放器（图标化控制栏、时间节点快进反馈、续播/连播/倍速/画面比例/音轨/字幕）
     ├── player/PlayerWidgets.kt 播放器组件（Canvas 手绘 8 图标、进度条、中央反馈徽标）
     └── image/ImageViewerActivity.kt 图片查看器（缩放/平移/切换）
 ```
@@ -106,7 +108,7 @@ com.hpu.transview
   `basicMarquee` 会先给子项一个**无界宽度约束**测出文本真实宽度、再与自身视口比较，因此短名自动不滚动；它也正好让上一行的 `fillMaxWidth()` 在无界约束下退化为「按内容宽度包裹」，从而正确测出溢出。
   延迟调小（`initialDelayMillis = 400` / `repeatDelayMillis = 900`，默认各 1200ms）让焦点一到就开始滚。
 - 有播放记录的视频卡片在缩略图底部叠加细进度条（`PlaybackRepository.observeAllProgress()` 提供 position/duration 映射）。
-- 顶部工具条：路径面包屑（分类名 > 子文件夹…）+「排序：xxx」按钮 +「刷新」（触发 SyncManager 全量对账，同步中禁用并显示「对账中…」）。
+- 顶部工具条：路径面包屑（分类名 > 子文件夹…）+「排序：xxx」按钮 +「刷新」（触发 SyncManager 全量对账；对账期间文案变「对账中…」并置灰——**用 `TvButton(enabled = false)` 的「可聚焦禁用态」**，不能真把它变不可聚焦，否则焦点回退会切页，见 §3.6）。
 
 **排序**：文件夹在前、文件在后，组内各自排序；名称 A-Z/Z-A、时间新→旧/旧→新。
 
@@ -135,13 +137,13 @@ com.hpu.transview
 **播放列表与进度**
 - 同目录视频按**自然排序**（EP2 < EP10）构成播放列表；播完 `STATE_ENDED` 自动下一集。
 - **末集（或被连续快进跨过片尾）**：停在末尾、置 `ended=true`、弹出控制栏并显示「播放结束」，等待用户「重播」或按返回离开 —— **不调用 `finish()`**，避免被误当成闪退。
-- 进度每 2 秒及 onStop/onDestroy 入库；距片尾 <5s 视为看完自动清历史；再次打开 >10s 且 <95% 时弹续播提示。
+- 进度每 2 秒及 onStop/onDestroy 入库；距片尾 <5s 视为看完自动清历史；再次打开 >10s 且 <95% 时弹续播提示（设置页「自动续播提示」关闭则静默续播，见 §3.11）。
 - 外挂字幕：同目录同主名 `.srt/.ass/.ssa/.vtt` 自动挂载为 `SubtitleConfiguration`。
-- 音轨/字幕选择基于 `player.currentTracks` + `TrackSelectionOverride`；倍速 0.5–2.0。
+- 音轨/字幕选择基于 `player.currentTracks` + `TrackSelectionOverride`；倍速 0.5–2.0；画面比例 FIT/FILL/ZOOM 三档（均见 §3.11）。
 
 **控制栏（`PlayerOverlay`，无文字主按钮）**
-- 全为 Canvas 手绘图标（`PlayerWidgets.kt`：`PlayerIconType { PREV, REWIND, PLAY, PAUSE, FORWARD, NEXT, AUDIO, SUBTITLE }`），仅倍速用文字按钮；进度条为自绘（缓冲段 + 已播段 + 圆点滑块）。
-- 按钮组：上一集 / 快退 / 播放暂停 / 快进 / 下一集 + 倍速 / 音轨 / 字幕。
+- 全为 Canvas 手绘图标（`PlayerWidgets.kt`：`PlayerIconType { PREV, REWIND, PLAY, PAUSE, FORWARD, NEXT, AUDIO, SUBTITLE }`），仅倍速与画面比例用文字按钮（`PlayerTextButton`）；进度条为自绘（缓冲段 + 已播段 + 圆点滑块）。
+- 按钮组：上一集 / 快退 / 播放暂停 / 快进 / 下一集 + 倍速 / 比例 / 音轨 / 字幕。
 
 **播放暂停图标统一为「动作式」语义（v1.3 关键决策）**
 - **图标表示按下去会发生什么**：`isPlaying && !ended` → 显示 `PAUSE`(‖)（按下会暂停）；否则显示 `PLAY`(▶)（按下会播放/重播）。
@@ -160,9 +162,10 @@ com.hpu.transview
 
 **遥控器映射**
 - 中键：控制栏隐藏时播放/暂停；控制栏显示时交给聚焦按钮。
-- 左右方向键：控制栏/对话框隐藏时才快退/快进（否则交给按钮做焦点导航）。
+- 左右方向键：控制栏/对话框隐藏时才快退/快进（否则交给按钮做焦点导航）；**两种情况下都会刷新 6s 自动隐藏计时**——否则按键导航不续命，用户还在按钮间移动时控制栏就消失了，之后的左右键突然变成快进/快退（见 §3.6）。
 - 媒体键：⏪/⏩ 快退/快进；⏯/⏭/⏮ 播放暂停 / 下一集 / 上一集。
 - 菜单键 / 上 / 下：显示或收起控制栏（6s 无操作自动隐藏）；返回键：先收控制栏，再退出。
+- 「上一集/下一集」无对应集数时置灰但**仍保留焦点**（`PlayerIconButton` 禁用态可聚焦，见 §3.6）。
 
 ### 3.5 图片查看器
 - 全屏 Coil 展示；中键 1x↔2x 缩放，菜单键循环 1→1.5→2→3x；缩放时方向键平移（边界约束），未缩放时左右切换同目录图片（自然排序）。
@@ -192,6 +195,13 @@ com.hpu.transview
   - 根因背景：焦点所在卡片被移出组合后，Compose 无法把焦点交还给它，会回退到整棵树里**第一个可聚焦元素**——正是顶部导航栏的「上传」标签；标签是「聚焦即选中」，页面会被立刻切走。
   - 典型现象（修复前）：在图片页按确定键打开文件夹，直接跳回「上传」页（实测复现：`OK` 前焦点在 `windows` 文件夹卡片 `[42,236][280,447]`，`OK` 后焦点变成「上传」标签 `[184,24][308,88]`）。
   - 落地位置：`LibraryScreen` 的 `openEntry`（目录分支）、`goUp()`、`performDelete()`。
+- **`enabled = false` 同样会丢焦点（v1.4 修复）**：同一根因的另一种触发方式——焦点持有者不是「被移出组合」，而是「被移出**焦点候选**」。
+  Material3 的 `Button` 在 `enabled = false` 时不再参与焦点搜索；若它**正持有焦点**，Compose 找不到落点，依旧回退到整棵树第一个可聚焦元素（顶部「上传」标签）→ 页面被切走。
+  - 现象（修复前）：媒体库工具条聚焦「刷新」按确定键，对账期间按钮 `enabled = !syncing` 变 false，页面立刻被切到「上传」页。
+  - 约定：项目里的 `TvButton` **内部恒为 `Button(enabled = true)`**，入参 `enabled` 只控制「是否响应点击 + 是否套禁用配色（`onSurface` 12% / 38%，因 Button 恒 enabled，Material3 不会自动给禁用色，需显式指定）」，所以禁用态仍可聚焦，也仍能挂 `focusRequester` / `onPreviewKeyEvent`。
+  - 推论：任何**会随状态变化进入「禁用」且可能持有焦点**的元素（按钮 / 行 / 卡片），要么按此「可聚焦的禁用态」处理，要么走上面的「焦点安全港」先把焦点转走。
+  - **播放器控制栏同样已按此处理**（v1.4）：`PlayerWidgets.PlayerIconButton` 的 `clickable` 恒为 `enabled = true`，禁用态自己吞掉确定键，并改用「灰底 + 灰色描边 + 更暗图标」渲染（不能用主色填充——暗图标压在亮蓝上糊成一片）。触发场景：「下一集」被聚焦时按确定键切到**最后一集**，`hasNext` 当场变 false，若按钮同时变不可聚焦，焦点会掉到播放器根节点、控制栏上一个高亮都不剩，后续左右键会直接变成快进/快退。
+  - 播放器另有两条与焦点相关的约定：①控制栏显示时**左右键是焦点导航**（隐藏时才是快进/快退）；②左右键**也要刷新自动隐藏计时**——否则用户还在按钮间移动时控制栏就消失，之后的左右键会突然变成快进/快退（实测：连按 5 次右，中途控制栏隐藏，后几次被当成快进而弹出「02:21 / 13:01」徽标）。注意**上/下键是切换控制栏**，不能当「续命」用。
   - 附带收益：即使「抢回焦点」失败，焦点也仍留在本页工具条，不会跨页乱跑。
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。
 - 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；
@@ -246,7 +256,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
-**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸，待接线项另显灰色「待实现」徽标）。居中布局，聚焦样式复用 `tvFocus()`。
+**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸，仍未接线的「界面设置」两项另显灰色「待实现」徽标）。居中布局，聚焦样式复用 `tvFocus()`。
 
 **焦点规范（v1.4 落地）**：
 - 进入默认焦点在左侧首个分组；分组 ↑↓ 切换、→ 进右侧详情（`detailTicket` 驱动）、首分组 ↑ 回「设置」标签。
@@ -255,9 +265,50 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - 进入详情的聚焦重试前需**等 `rowFocusMap` 填充**（右侧行在切换分组后才组合渲染，立即请求必然 miss；外层 `repeat(10) + delay(16ms)` 等键出现再走重试）。
 - 设置页打开期间媒体标签 `selected = !showSettings && …`——否则上一个媒体标签（如「其他」）残留选中高亮，与「设置」聚焦高亮叠加造成「两个都亮」的误导（实测踩过）。
 
-**已接通项**：保活策略（`ServerController.setMode`，立即生效）、存储空间占用（`FileLocations.sandboxRoot.walkTopDown()` IO 线程统计）、清空上传记录（`UploadRecordRepository.clearAll`）、清空播放历史（`PlaybackDao.clearAllHistory` + `PlaybackRepository` v1.4 新增）、手动触发对账（`SyncManager.sync()`）、版本信息（`BuildConfig.VERSION_NAME` + `BUILD_TIME`，`build.gradle.kts` 开启 `buildConfig = true` 并注入构建时间字段）、开源许可（MIT 全文常量）、致谢名单。
+**已接通项**：保活策略（`ServerController.setMode`，立即生效）、服务器端口（`ServerController.setPort` 停旧起新，见 §3.10）、开机自启（`SettingsStore.bootAutostart` → `BootReceiver`，见 §3.10）、设备名称（`SettingsStore.deviceName` → 上传页注入，见 §3.10）、自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例（见 §3.11）、存储空间占用（`FileLocations.sandboxRoot.walkTopDown()` IO 线程统计）、清空上传记录（`UploadRecordRepository.clearAll`）、清空播放历史（`PlaybackDao.clearAllHistory` + `PlaybackRepository` v1.4 新增）、手动触发对账（`SyncManager.sync()`）、版本信息（`BuildConfig.VERSION_NAME` + `BUILD_TIME`，`build.gradle.kts` 开启 `buildConfig = true` 并注入构建时间字段）、开源许可（MIT 全文常量）、致谢名单。
 
-**SettingsStore**（`ui/settings/SettingsStore.kt`）：SharedPreferences object（`transview_settings`），保存端口 / 开机自启 / 设备名 / 续播提示 / 连播 / 默认倍速 / 默认画面比例（`AspectRatio` 枚举）/ 网格列数 / 默认排序（`SortOrder`）。**这些值目前只持久化、尚未接入运行时**（端口仍固定 8080、列数仍固定 5 等），保存是为后续接线时能直接拿到用户选择；各字段注释均标注「待实现」。
+**SettingsStore**（`ui/settings/SettingsStore.kt`）：SharedPreferences object（`transview_settings`），保存端口 / 开机自启 / 设备名 / 续播提示 / 连播 / 默认倍速 / 默认画面比例（`AspectRatio` 枚举）/ 网格列数 / 默认排序（`SortOrder`）。**仅「界面设置」的网格列数（4/5/6）与默认排序两项仍只持久化未接线**（媒体库当前固定 5 列、默认名称 A-Z），其余七项均已接入运行时。
+
+**设置值 → 界面刷新**：写 SharedPreferences 不会触发 Compose 重组，因此设置页对「副作用不是本地状态」的项统一用本地 `remember` 状态承载显示值（端口/自启/设备名/续播提示/连播/倍速/画面比例），先更新界面再落盘；端口这类异步项失败时回滚显示值。
+
+### 3.10 服务器与网络设置接线（v1.4）
+
+**服务器端口**
+- 运行时端口唯一来源是 `SettingsStore.serverPort`；`Constants.DEFAULT_PORT = 8080` 仅作默认值与 `PORT_RANGE` 校验。
+- `ServerBus` 新增 `port: StateFlow<Int>`，端口变化即时广播；上传页的地址文本与二维码 `LaunchedEffect(ip, port)` 依赖它，改端口后自动重画。
+- **NanoHTTPD 端口在构造时固定**，故 `ServerController.setPort(newPort, onResult)` 走「停旧 → 在新端口重建监听」：成功则持久化 + 刷新总线 + 回调 `true`；失败（多为端口被占用）则**用旧端口回滚重建**并回调 `false`，避免「改端口把服务器改没了」。
+- 设置页在该回调里才更新显示值，并 Toast 告知成功/回滚。
+
+**开机自启**
+- `service/BootReceiver.kt` 接收 `BOOT_COMPLETED` → 读 `SettingsStore.bootAutostart` → 为真则启动 `ServerService`（是否真正监听仍由保活策略决定）。
+- Manifest 声明 `RECEIVE_BOOT_COMPLETED` 权限与 `exported="true"` 的 receiver。
+- **前台服务类型（关键，实测踩坑）**：Android 15（API 35）起，`dataSync` / camera / mediaPlayback / phoneCall / mediaProjection / microphone 六类前台服务**禁止**从 `BOOT_COMPLETED` 启动，否则抛 `ForegroundServiceStartNotAllowedException`。因此 service 声明为 `android:foregroundServiceType="dataSync|specialUse"` 并带 `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`，运行时按版本选：**API 34+ 用 `specialUse`**（不在受限清单内；顺带规避 dataSync 在 Android 15 上 6 小时/天的时长上限），API 29~33 回退 `dataSync`。
+- **异常兜底的位置很关键**：该异常是在**服务内部** `startForeground()` 时抛出的，不是 `startForegroundService()` 的调用点——所以 BootReceiver 里的 `runCatching` 兜不住它。真正的兜底在 `ServerService.onCreate`：`startForegroundCompat` 捕获异常返回 false → 主动 `stopSelf()` 优雅退出。否则进程在 onCreate 阶段 FATAL 崩溃，而 `START_STICKY` 会让 AMS 反复重启服务，形成**开机崩溃循环**（实测：一次开机连崩 3 次）。
+- `TransViewApp.onCreate` 全局初始化 `SettingsStore`（`SettingsStore.init`），保证无 Activity 的后台拉起路径也能读到配置。
+
+**设备名称**
+- `assets/web/index.html` 的 `<title>` 与 `<h1>` 用 `__DEVICE_NAME__` 占位；`TransHttpServer.serveIndexPage()` **每次请求现读现注入**（含 HTML 转义），改完设备名手机端刷新即生效，无需重启服务器。
+
+### 3.11 播放设置接线（v1.4）
+
+四项均由 `PlayerActivity.onCreate` 起始处读 `SettingsStore`（`SettingsStore.init(this)` 兜底初始化），**打开播放器即生效**，设置页与播放器之间没有跨页实时同步需求（改完下次打开视频即可见）。
+
+**自动续播提示（`autoResumePrompt`，默认开）**
+- 续播判断（历史进度 > 10 秒且未到 95%）命中时：开 → `showResumeDialog = true` 弹「继续播放 / 从头播放 / 取消」；关 → 静默 `startPlayback(history.position)` 直接续播。
+- 只影响**是否询问**，不影响进度记录本身（进度照旧每 2 秒入库）。
+
+**自动连播（`autoPlayNext`，默认开）**
+- `Player.onPlaybackStateChanged(STATE_ENDED)` 里把「有下一集」与开关做与运算：`hasNext && SettingsStore.autoPlayNext` 才 `skipTo(currentIndex + 1)`；关闭时走收尾分支（`ended = true` + 弹控制栏），徽标文案区分「播放结束（自动连播已关闭）」/「播放结束」，用户仍可用「下一集」按钮手动续播。
+
+**默认倍速（`defaultSpeed`）**
+- **只是初始值**：`speed = SettingsStore.defaultSpeed` + `player.setPlaybackSpeed(speed)`，本次会话内仍可用控制栏「倍速」随时改，不回写设置。
+- 播放器内部倍速选项（0.5~2.0x）比设置页默认值候选（1.0/1.25/1.5）更宽，两者是「默认值」与「运行时可调范围」的关系。
+
+**默认画面比例（`defaultAspect`）**
+- `AspectRatio` 三档映射到 `PlayerView` 缩放模式：`ORIGINAL` → `RESIZE_MODE_FIT`（保持比例留黑边）、`STRETCH` → `RESIZE_MODE_FILL`（铺满变形）、`CROP` → `RESIZE_MODE_ZOOM`（铺满裁边）。
+- 控制栏新增「比例」按钮（与「倍速」同为 `PlayerTextButton`，非原始值时直接显示当前档位），弹 `AspectDialog` 可在本次会话内临时切换，**不回写**默认值。
+- **实现注意**：比例是 `PlayerView.resizeMode`，而 `AndroidView(update = …)` 的 update 块不在组合作用域内读 Compose 状态不会建立订阅（状态变化不会触发它重跑），因此把 `PlayerView` 存进 Activity 字段（`playerView`），初始值在 `factory` 里设置、切档时命令式 `playerView?.resizeMode = …`。
+- 对话框显隐需同步加进 `anyDialogVisible`（控制栏自动隐藏与焦点归属的判断依据），否则开着比例弹框时控制栏会自己消失、按键焦点也会跑偏。
 
 ## 4. 构建与运行
 
@@ -273,7 +324,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 **v1.1 数据库一致性重构已全部完成（模块 1-5）。**
 
 **功能 TODO：**
-- [ ] 设置页待接线项（页面 + SettingsStore 持久化已就绪，见 §3.9）：服务器端口接入运行时（当前固定 8080）、开机自启（`RECEIVE_BOOT_COMPLETED`）、设备名称接入网页标题、自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例接入播放器、网格列数（4/5/6）/ 默认排序接入媒体库
+- [ ] 设置页待接线项（页面 + SettingsStore 持久化已就绪，见 §3.9）：**仅剩界面设置两项** —— 网格列数（4/5/6）与默认排序接入媒体库（服务器端口 / 开机自启 / 设备名称已于 v1.4 接通，见 §3.10；自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例已于 v1.4 接通播放器，见 §3.11）
 - [ ] zip 压缩包上传后服务端自动解压并按分类过滤（需求 3.3.5 备选方案）
 - [ ] 断点续传（需求 4.4 P2）
 - [ ] 上传页面 Token 验证（需求 4.5 可选项）

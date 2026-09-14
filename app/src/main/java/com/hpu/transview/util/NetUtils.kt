@@ -9,7 +9,13 @@ import java.net.NetworkInterface
 
 /** 网络与服务器常量 */
 object Constants {
-    const val PORT = 8080
+    /** 服务器默认端口。用户可在「设置 → 服务器与网络 → 服务器端口」修改，
+     *  运行时的真实端口统一取自 SettingsStore.serverPort（经 ServerController 生效）。 */
+    const val DEFAULT_PORT = 8080
+
+    /** 可选端口范围：1024 以下为特权端口，普通应用无 root 无法绑定 */
+    val PORT_RANGE = 1024..65535
+
     const val URL_PATH = "/upload"
 }
 

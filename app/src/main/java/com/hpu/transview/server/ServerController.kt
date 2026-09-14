@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.UploadState
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.util.Constants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +43,9 @@ object ServerController {
     private var httpServer: TransHttpServer? = null
     private var initialized = false
 
+    /** 当前监听端口：初始值来自设置项，运行中可经 setPort 切换 */
+    private var port = SettingsStore.serverPort
+
     // —— 策略信号 ——
     private var mode = ServerMode.SMART
     private var screenOn = true
@@ -74,6 +78,11 @@ object ServerController {
             if (initialized) return
             initialized = true
             appContext = context.applicationContext
+            // 端口/设备名等服务器配置统一由 SettingsStore 持久化（设置页写入），
+            // 这里主动 init 一次，保证后台拉起（如开机自启）时也能读到用户配置
+            SettingsStore.init(appContext!!)
+            port = SettingsStore.serverPort
+            ServerBus.setPort(port)
             prefs = appContext!!.getSharedPreferences("server_policy", Context.MODE_PRIVATE)
             mode = prefs!!.getString("mode", null)
                 ?.let { runCatching { ServerMode.valueOf(it) }.getOrNull() }
@@ -150,12 +159,66 @@ object ServerController {
         initialized = false
     }
 
-    private fun evaluate() {
-        val shouldRun = when (mode) {
-            ServerMode.TURBO -> true
-            ServerMode.SMART -> !hibernated && screenOn && !playing
-            ServerMode.POWER_SAVER -> uploadPageVisible && manualWake
+    /**
+     * 切换监听端口（设置页），立即生效并持久化。
+     *
+     * NanoHTTPD 的端口在构造时固定，必须**停旧起新**。整个过程在串行执行器里跑，
+     * 结果经 [onResult]（主线程）回调：
+     * - 成功：更新端口 + 写回设置项 + 刷新 [ServerBus]，上传页二维码/地址随即跟着变；
+     * - 失败（几乎只有端口被占用）：用旧端口重新拉起，设置项保持不变，由 UI 提示用户。
+     * 切换会打断正在进行的上传连接，属预期行为。
+     */
+    fun setPort(newPort: Int, onResult: (Boolean) -> Unit) {
+        if (newPort !in Constants.PORT_RANGE) {
+            mainHandler.post { onResult(false) }
+            return
         }
+        if (newPort == port) {
+            mainHandler.post { onResult(true) }
+            return
+        }
+        val previous = port
+        // 与 evaluate() 一致：策略信号在主线程读取后传入执行器，避免跨线程读成员
+        val wantRun = shouldRunNow()
+        serverExecutor.execute {
+            val context = appContext
+            if (context == null) {
+                mainHandler.post { onResult(false) }
+                return@execute
+            }
+            // 停掉旧端口上的监听（存在的话）
+            runCatching { httpServer?.stop() }
+            httpServer = null
+
+            var ok = true
+            if (wantRun) {
+                val started = startOn(context, newPort)
+                if (started != null) {
+                    httpServer = started
+                } else {
+                    // 新端口起不来：尽力用旧端口恢复监听，避免「改端口把服务器改没了」
+                    ok = false
+                    httpServer = startOn(context, previous)
+                }
+            }
+            if (ok) {
+                port = newPort
+                SettingsStore.serverPort = newPort
+                ServerBus.setPort(newPort)
+            }
+            publishState()
+            mainHandler.post { onResult(ok) }
+        }
+    }
+
+    private fun shouldRunNow(): Boolean = when (mode) {
+        ServerMode.TURBO -> true
+        ServerMode.SMART -> !hibernated && screenOn && !playing
+        ServerMode.POWER_SAVER -> uploadPageVisible && manualWake
+    }
+
+    private fun evaluate() {
+        val shouldRun = shouldRunNow()
         serverExecutor.execute { apply(shouldRun) }
     }
 
@@ -164,14 +227,21 @@ object ServerController {
         val context = appContext ?: return
         if (run) {
             if (httpServer == null) {
-                httpServer = runCatching {
-                    TransHttpServer(context, Constants.PORT).also { it.start() }
-                }.getOrNull()
+                httpServer = startOn(context, port)
             }
         } else if (httpServer != null) {
             runCatching { httpServer?.stop() }
             httpServer = null
         }
+        publishState()
+    }
+
+    /** 在指定端口上启动监听；端口被占用等失败情况返回 null（调用方决定回滚或保持停止） */
+    private fun startOn(context: Context, targetPort: Int): TransHttpServer? =
+        runCatching { TransHttpServer(context, targetPort).also { it.start() } }.getOrNull()
+
+    /** 把当前启停状态同步到总线，并重排空闲休眠计时 */
+    private fun publishState() {
         val running = httpServer != null
         ServerBus.update(running, hibernated)
         mainHandler.post {

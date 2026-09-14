@@ -69,7 +69,18 @@ suspend fun FocusRequester.requestFocusNextFrame(): Boolean {
         )
 }
 
-/** 遥控器友好的文本按钮 */
+/**
+ * 遥控器友好的文本按钮。
+ *
+ * **`enabled = false` 时按钮依然可聚焦**（只是不再响应点击、按灰色禁用样式渲染）。
+ *
+ * 为什么不能把 `enabled` 直接交给 Material3 的 `Button`：它会把按钮移出焦点候选，
+ * 而「正持有焦点的元素突然不可聚焦」会让 Compose 重新做一次焦点搜索，回退到整棵树里
+ * 第一个可聚焦元素 —— 顶部导航栏的「上传」标签，而标签是「聚焦即选中」，页面会被立刻
+ * 切走（实测：媒体库点「刷新」→ 直接跳到上传页）。
+ * 因此这里始终 `enabled = true`，用参数 `enabled` 自己控制「是否响应点击 + 禁用配色」，
+ * 既保住焦点，也保住 `focusRequester` / `onPreviewKeyEvent` 的挂载。
+ */
 @Composable
 fun TvButton(
     text: String,
@@ -87,21 +98,26 @@ fun TvButton(
         label = "btnScale"
     )
     Button(
-        onClick = onClick,
-        enabled = enabled,
+        // 禁用态也不能把按键放行给 onClick（Button 本身始终 enabled，见函数注释）
+        onClick = { if (enabled) onClick() },
+        enabled = true,
         modifier = modifier
             .onFocusChanged { focused = it.isFocused }
             .graphicsLayer {
                 scaleX = scale
                 scaleY = scale
             },
-        colors = if (showFocused) {
-            ButtonDefaults.buttonColors(
+        colors = when {
+            showFocused -> ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary
             )
-        } else {
-            ButtonDefaults.buttonColors(
+            // 禁用配色：Button 始终 enabled，Material3 不会自动套禁用色，这里显式给出
+            !enabled -> ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+            )
+            else -> ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant,
                 contentColor = MaterialTheme.colorScheme.onSurface
             )

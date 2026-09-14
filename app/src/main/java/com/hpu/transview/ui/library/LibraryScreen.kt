@@ -132,6 +132,8 @@ private val titleMarquee: Modifier = Modifier.basicMarquee(
  *   「排序」上（停靠期间抑制其聚焦高亮，避免过渡闪烁；touch 点按路径无焦点可保护，直接跳过）；
  *   否则承载焦点的卡片被移出组合时，Compose 会把焦点回退到第一个可聚焦元素（顶部「上传」标签），
  *   标签的「聚焦即选中」会把页面直接切走。
+ *   同源问题还有工具条「刷新」按钮：对账期间**不能**把它置为不可聚焦（TvButton 的 `enabled`
+ *   已改成「置灰但仍可聚焦」，见其注释），否则按一下刷新就会被切到上传页。
  * - **进入子目录焦点直接落第一个条目**（`FOCUS_FIRST`，用户反馈）：不再落「返回上级」——
  *   UpCard 抢焦点会形成「第一个文件闪一下再跳回上级」的可见两段跳；直接聚焦第一个条目
  *   只有一次落点。空目录网格里只剩 UpCard 时改聚焦它。
@@ -636,6 +638,9 @@ private fun LibraryTopBar(
         TvButton(
             text = if (syncing) "对账中…" else "刷新",
             modifier = upToTabsModifier.then(refreshEdgeModifier),
+            // 对账期间置灰 + 忽略点击，但**保持可聚焦**（TvButton 内部实现，见其注释）：
+            // 若真的把按钮变不可聚焦，Compose 会丢弃这个焦点落点并回退到整棵树第一个可聚焦
+            // 元素 —— 顶部「上传」标签，而标签「聚焦即选中」，页面会被立刻切走（既有 Bug）。
             enabled = !syncing,
             onClick = onRefresh
         )

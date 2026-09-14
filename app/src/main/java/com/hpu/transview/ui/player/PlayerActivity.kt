@@ -61,12 +61,15 @@ import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.hpu.transview.data.PlaybackRepository
 import com.hpu.transview.data.sync.SyncManager
+import com.hpu.transview.model.AspectRatio
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.OptionRow
 import com.hpu.transview.ui.common.TvButton
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.isVideoFile
@@ -83,6 +86,12 @@ import java.io.File
  * - 播放进度自动入库（Room），再次打开弹出续播提示
  * - 播完自动连播同目录下一个视频（自然排序，EP2 < EP10）
  *
+ * 设置页「播放设置」四项在此生效（`SettingsStore`，2026-09-14 接线）：
+ * - 自动续播提示：开（默认）→ 有历史进度时弹「续播/从头/取消」；关 → 静默从上次位置继续。
+ * - 自动连播：开（默认）→ 播完自动跳下一集；关 → 播完停在片尾（显示「播放结束」，等用户重播/返回）。
+ * - 默认倍速：打开播放器时的初始倍速（本次会话内仍可用倍速按钮随时改）。
+ * - 默认画面比例：打开播放器时的初始画面比例（控制栏「比例」按钮可随时改，二者同一状态）。
+ *
  * 遥控器适配：
  * - 左/右方向键、遥控器 ⏪/⏩ 媒体键：快退/快进。短按 ±10 秒，连续快按累加步长（上限 60 秒），
  *   按住 400ms 后进入变速扫描（2x→4x→8x→16x），松开停止。反馈显示在屏幕中央（方向图标 +
@@ -94,6 +103,11 @@ import java.io.File
  * - 菜单键 / 上 / 下：切换控制栏
  * - 遥控器 ⏯ / ⏭ / ⏮ 媒体键：播放暂停 / 下一集 / 上一集
  * - 返回键：先收控制栏，再退出
+ * - 控制栏显示时的左右键是**焦点导航**（不是快进快退），且会刷新自动隐藏计时——
+ *   否则用户还在按钮间移动时控制栏就消失了，之后的左右键会突然变成快进/快退。
+ * - 「上一集/下一集」无对应集数时置灰，但**仍保留焦点**（`PlayerIconButton` 恒 `clickable(enabled = true)`，
+ *   禁用态自己吞掉确定键 + 用灰色描边表示焦点）——否则在「下一集」上按确定键切到最后一集时，
+ *   按钮当场变不可聚焦，焦点会掉到根节点、控制栏上一个高亮都不剩。详见 ARCHITECTURE §3.6。
  */
 class PlayerActivity : ComponentActivity() {
 
@@ -124,6 +138,16 @@ class PlayerActivity : ComponentActivity() {
 
         /** 控制栏无操作自动隐藏时长 */
         private const val OVERLAY_AUTO_HIDE_MS = 6_000L
+
+        /**
+         * 默认画面比例 → PlayerView 缩放模式（常量定义在 `AspectRatioFrameLayout`，PlayerView 自身没有）：
+         * 原始 = FIT（保持比例，留黑边）／拉伸 = FILL（铺满，变形）／裁剪 = ZOOM（铺满，裁边）。
+         */
+        private fun resizeModeOf(aspect: AspectRatio): Int = when (aspect) {
+            AspectRatio.ORIGINAL -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+            AspectRatio.STRETCH -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+            AspectRatio.CROP -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+        }
     }
 
     lateinit var player: ExoPlayer
@@ -136,6 +160,7 @@ class PlayerActivity : ComponentActivity() {
     var overlayVisible by mutableStateOf(true)
     var showResumeDialog by mutableStateOf(false)
     var showSpeedDialog by mutableStateOf(false)
+    var showAspectDialog by mutableStateOf(false)
     var showAudioDialog by mutableStateOf(false)
     var showSubtitleDialog by mutableStateOf(false)
     var isPlaying by mutableStateOf(false)
@@ -143,6 +168,8 @@ class PlayerActivity : ComponentActivity() {
     var durationMs by mutableStateOf(0L)
     var bufferedMs by mutableStateOf(0L)
     var speed by mutableStateOf(1.0f)
+    /** 当前画面比例（打开播放器时取设置页「默认画面比例」，控制栏「比例」可临时改） */
+    var aspect by mutableStateOf(AspectRatio.ORIGINAL)
     var currentTitle by mutableStateOf("")
     var lastInteractionTick by mutableStateOf(0)
 
@@ -157,6 +184,12 @@ class PlayerActivity : ComponentActivity() {
 
     private var pendingResumePosition = 0L
 
+    /**
+     * PlayerView 实例。画面比例要直接改它的 `resizeMode`，而 `AndroidView(update=…)` 里读 Compose
+     * 状态不会建立订阅（update 非组合作用域，状态变化不会触发重绘），因此保存引用后命令式设置。
+     */
+    private var playerView: PlayerView? = null
+
     // —— 快进/快退状态 ——
     private var seekJob: Job? = null
     private var scrubStarted = false
@@ -167,7 +200,8 @@ class PlayerActivity : ComponentActivity() {
     private val hasNext: Boolean get() = currentIndex + 1 < playlist.size
     private val hasPrev: Boolean get() = currentIndex > 0
     private val anyDialogVisible: Boolean
-        get() = showResumeDialog || showSpeedDialog || showAudioDialog || showSubtitleDialog
+        get() = showResumeDialog || showSpeedDialog || showAspectDialog ||
+            showAudioDialog || showSubtitleDialog
 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(playing: Boolean) {
@@ -180,7 +214,9 @@ class PlayerActivity : ComponentActivity() {
             if (playbackState == Player.STATE_ENDED) {
                 val file = currentFile
                 if (file != null) lifecycleScope.launch { repository.clear(file.absolutePath) }
-                if (hasNext) {
+                // 自动连播开启（默认）且还有下一集 → 直接续播；关闭时即使有下一集也停在片尾，
+                // 由用户决定「重播」还是按返回离开（与最后一集的收尾表现一致）。
+                if (hasNext && SettingsStore.autoPlayNext) {
                     skipTo(currentIndex + 1)
                 } else {
                     // 最后一集播到（或被连续快进跨过）片尾：停在末尾并弹出控制栏，
@@ -188,7 +224,10 @@ class PlayerActivity : ComponentActivity() {
                     ended = true
                     overlayVisible = true
                     lastInteractionTick++
-                    showBadge(null, "播放结束")
+                    showBadge(
+                        null,
+                        if (hasNext) "播放结束（自动连播已关闭）" else "播放结束"
+                    )
                 }
             } else if (ended) {
                 // seek / 重播后重新进入准备状态，退出结束态
@@ -214,6 +253,7 @@ class PlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        SettingsStore.init(this) // 读取设置页「播放设置」四项（App 启动时已 init，这里兜底）
 
         val path = intent.getStringExtra(EXTRA_PATH)
         val file = if (path != null) File(path) else null
@@ -239,6 +279,13 @@ class PlayerActivity : ComponentActivity() {
         postResult()
 
         player = ExoPlayer.Builder(this).build()
+
+        // 设置页「默认倍速」「默认画面比例」：打开播放器时即生效。
+        // 只是「默认值」——本次会话内仍可用控制栏的倍速 / 比例按钮随时改，互不写回设置。
+        speed = SettingsStore.defaultSpeed
+        player.setPlaybackSpeed(speed)
+        aspect = SettingsStore.defaultAspect
+
         player.addListener(playerListener)
         prepareItem(currentIndex)
 
@@ -255,7 +302,9 @@ class PlayerActivity : ComponentActivity() {
                 (history.duration <= 0 || history.position < history.duration * 95 / 100)
             ) {
                 pendingResumePosition = history.position
-                showResumeDialog = true
+                // 「自动续播提示」开启（默认）→ 弹窗询问；关闭 → 静默从上次位置继续播。
+                if (SettingsStore.autoResumePrompt) showResumeDialog = true
+                else startPlayback(history.position)
             } else {
                 startPlayback(0L)
             }
@@ -495,6 +544,11 @@ class PlayerActivity : ComponentActivity() {
         // 方向左右键：控制栏显示时交给按钮做焦点导航；隐藏时才是快退/快进。
         // 快进只弹中央徽标、不弹控制栏，因此连续快进不会被打断。
         if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
+            // 左右键**也要续命**自动隐藏计时：否则按键导航不刷新计时，用户还在按钮之间移动时
+            // 控制栏会突然消失，接下来的左右键变成快进/快退（实测踩过：连按 5 次右，中途控制栏
+            // 隐藏，后几次直接被当成快进而弹出「02:21 / 13:01」徽标）。控制栏隐藏时自增无副作用，
+            // 因为自动隐藏的 LaunchedEffect 只在 overlayVisible 时生效。
+            if (down) lastInteractionTick++
             if (overlayVisible || anyDialogVisible) return false
             val dir = if (event.key == Key.DirectionRight) 1 else -1
             if (down) onSeekDown(dir) else onSeekUp(dir)
@@ -572,7 +626,7 @@ class PlayerActivity : ComponentActivity() {
         // 控制栏无操作自动隐藏（对话框打开期间不隐藏）
         LaunchedEffect(
             overlayVisible, lastInteractionTick,
-            showResumeDialog, showSpeedDialog, showAudioDialog, showSubtitleDialog
+            showResumeDialog, showSpeedDialog, showAspectDialog, showAudioDialog, showSubtitleDialog
         ) {
             if (overlayVisible && !anyDialogVisible) {
                 delay(OVERLAY_AUTO_HIDE_MS)
@@ -592,7 +646,7 @@ class PlayerActivity : ComponentActivity() {
         // 焦点归属：对话框自己管焦点 → 控制栏显示则落到播放/暂停 → 否则回到根节点收键
         LaunchedEffect(
             overlayVisible,
-            showResumeDialog, showSpeedDialog, showAudioDialog, showSubtitleDialog
+            showResumeDialog, showSpeedDialog, showAspectDialog, showAudioDialog, showSubtitleDialog
         ) {
             when {
                 anyDialogVisible -> Unit
@@ -621,7 +675,9 @@ class PlayerActivity : ComponentActivity() {
                     PlayerView(ctx).apply {
                         useController = false
                         this.player = this@PlayerActivity.player
-                    }
+                        // 初始比例来自设置页「默认画面比例」；运行中由控制栏「比例」按钮命令式改
+                        resizeMode = resizeModeOf(aspect)
+                    }.also { playerView = it }
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -671,6 +727,7 @@ class PlayerActivity : ComponentActivity() {
 
             if (showResumeDialog) ResumeDialog()
             if (showSpeedDialog) SpeedDialog()
+            if (showAspectDialog) AspectDialog()
             if (showAudioDialog) TrackDialog(C.TRACK_TYPE_AUDIO)
             if (showSubtitleDialog) TrackDialog(C.TRACK_TYPE_TEXT)
         }
@@ -818,6 +875,16 @@ class PlayerActivity : ComponentActivity() {
 
                 Spacer(Modifier.width(10.dp))
 
+                PlayerTextButton(
+                    // 与倍速同一套约定：非默认值时直接显示当前值（原始/拉伸/裁剪）
+                    text = if (aspect == AspectRatio.ORIGINAL) "比例" else aspect.label
+                ) {
+                    showAspectDialog = true
+                    lastInteractionTick++
+                }
+
+                Spacer(Modifier.width(10.dp))
+
                 PlayerIconButton(PlayerIconType.AUDIO, "音轨") {
                     showAudioDialog = true
                     lastInteractionTick++
@@ -870,6 +937,27 @@ class PlayerActivity : ComponentActivity() {
                     player.setPlaybackSpeed(s)
                     showSpeedDialog = false
                     showBadge(null, "${s}x")
+                }
+            }
+        }
+    }
+
+    /** 画面比例：本次播放会话内临时切换，不回写设置页的「默认画面比例」 */
+    @Composable
+    private fun AspectDialog() {
+        TvDialog(onDismiss = { showAspectDialog = false }) {
+            Text(
+                "画面比例",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.height(10.dp))
+            AspectRatio.entries.forEach { a ->
+                OptionRow(text = a.label, selected = a == aspect) {
+                    aspect = a
+                    playerView?.resizeMode = resizeModeOf(a)
+                    showAspectDialog = false
+                    showBadge(null, a.label)
                 }
             }
         }

@@ -6,6 +6,7 @@ import com.hpu.transview.data.MediaType
 import com.hpu.transview.data.UploadRecordRepository
 import com.hpu.transview.data.UploadStateCode
 import com.hpu.transview.model.Category
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.util.FileUtils
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
@@ -24,10 +25,15 @@ import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicLong
 
+/** 上传网页模板里的设备名占位符（assets/web/index.html） */
+private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
+
 /**
  * 内嵌 HTTP 服务器（NanoHTTPD）：
- * - GET  /        → 手机上传网页（assets/web/index.html）
+ * - GET  /        → 手机上传网页（assets/web/index.html，渲染时注入设备名称）
  * - POST /upload  → multipart 上传，字段：category / relativePath / file
+ *
+ * 端口由 ServerController 决定（设置页可改，NanoHTTPD 端口构造时固定 → 改端口需停旧起新）。
  *
  * 上传链路（数据库驱动）：
  * - 每个上传请求在 upload_records 表建立记录（上传中），经计数流实时回写百分比进度；
@@ -73,10 +79,31 @@ class TransHttpServer(
         }
     }
 
+    /**
+     * 手机上传页。每次请求都重新渲染：把 assets 里的模板占位符替换为当前设备名称
+     * （设置 → 服务器与网络 → 设备名称），用户改完设备名刷新手机页面即生效，无需重启服务器。
+     */
     private fun serveIndexPage(): Response {
-        val input = appContext.assets.open("web/index.html")
-        return newChunkedResponse(Response.Status.OK, "text/html; charset=utf-8", input)
+        val deviceName = SettingsStore.deviceName.ifBlank { SettingsStore.DEFAULT_DEVICE_NAME }
+        val html = runCatching {
+            appContext.assets.open("web/index.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }.getOrNull()
+        if (html == null) {
+            return newFixedLengthResponse(
+                Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "upload page missing"
+            )
+        }
+        val rendered = html.replace(DEVICE_NAME_PLACEHOLDER, escapeHtml(deviceName))
+        return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", rendered)
     }
+
+    /** 占位符替换的值来自用户设置，必须转义，避免设备名里的 `<` `&` 破坏页面结构 */
+    private fun escapeHtml(raw: String): String = raw
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
 
     private fun handleUpload(session: IHTTPSession): Response {
         // 手机网页把分类/文件名/相对路径放 URL query（请求头阶段即可用——multipart 字段

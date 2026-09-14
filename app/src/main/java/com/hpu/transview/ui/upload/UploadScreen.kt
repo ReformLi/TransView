@@ -75,10 +75,10 @@ import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.TypeBadge
 import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.tvFocus
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
-import com.hpu.transview.util.Constants
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.NetUtils
 import com.hpu.transview.util.QrCode
@@ -103,12 +103,16 @@ fun UploadScreen(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    SettingsStore.init(context)
 
     var ip by remember { mutableStateOf(NetUtils.getLocalIpAddress()) }
     var qr by remember { mutableStateOf<Bitmap?>(null) }
     val running by ServerBus.running.collectAsState()
     val hibernated by ServerBus.hibernated.collectAsState()
     val mode by ServerBus.mode.collectAsState()
+    // 监听端口来自设置（设置页改端口后经总线即时同步）；二维码与地址必须跟着变，
+    // 否则会显示一个已经没人监听的旧端口
+    val port by ServerBus.port.collectAsState()
 
     val recordsRepo = remember { UploadRecordRepository(context) }
     val records by recordsRepo.observeRecent().collectAsState(initial = emptyList())
@@ -141,10 +145,10 @@ fun UploadScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(ip) {
+    LaunchedEffect(ip, port) {
         qr = if (ip != null) {
             withContext(Dispatchers.Default) {
-                QrCode.generate("http://$ip:${Constants.PORT}", 480)
+                QrCode.generate("http://$ip:$port", 480)
             }
         } else null
     }
@@ -165,7 +169,8 @@ fun UploadScreen(
             hibernated = hibernated,
             mode = mode,
             qr = qr,
-            ip = ip
+            ip = ip,
+            port = port
         )
 
         // ——— 右侧：上传记录（可滚动） ———
@@ -296,7 +301,8 @@ private fun ServerPanel(
     hibernated: Boolean,
     mode: ServerMode,
     qr: Bitmap?,
-    ip: String?
+    ip: String?,
+    port: Int
 ) {
     Surface(
         modifier = modifier,
@@ -338,7 +344,7 @@ private fun ServerPanel(
 
                 Spacer(Modifier.height(20.dp))
 
-                val address = if (ip != null) "http://$ip:${Constants.PORT}" else null
+                val address = if (ip != null) "http://$ip:$port" else null
                 if (address != null) {
                     Text(
                         address,
@@ -368,6 +374,9 @@ private fun ServerPanel(
                     textAlign = TextAlign.Center
                 )
                 Spacer(Modifier.height(8.dp))
+                // 注意：本行在 720p 电视上会被面板高度裁掉（二维码 180dp 撑满，属既有问题，
+                // 与设备名/端口无关）。端口信息在上方地址里已可见，设备名在手机端网页展示，
+                // 因此这里不新增行（新增行只会更容易被裁）。
                 Text(
                     "当前模式：${mode.label}（右上角「设置」可切换）",
                     style = MaterialTheme.typography.bodySmall,

@@ -10,7 +10,11 @@
     <!-- 前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 开机自启（设置页可开关；仅用于拉起文件服务器前台服务） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- 存储：API 30+ 用「所有文件访问」授权；API 21-29 用传统读写权限 + legacy 标记 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -71,10 +75,30 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:theme="@style/Theme.TransView.Fullscreen" />
 
+        <!-- 前台服务类型：
+             · specialUse —— API 34+ 运行时实际使用。Android 15 起禁止 dataSync 类型前台服务
+               从 BOOT_COMPLETED 启动（ForegroundServiceStartNotAllowedException），specialUse
+               不受该限制；且 dataSync 在 Android 15 上有 6 小时/天的时长上限，不适合常驻服务器。
+             · dataSync —— 仅作 API 29~33 的回退（那些版本没有 specialUse，也没有 BOOT 限制）。 -->
         <service
             android:name=".service.ServerService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lan_http_file_server" />
+        </service>
+
+        <!-- 开机自启：BOOT_COMPLETED 由系统发送，需 exported=true；
+             是否真正启动服务器由设置项 bootAutostart 决定 -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"
