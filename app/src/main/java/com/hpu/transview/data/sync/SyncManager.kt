@@ -3,6 +3,10 @@ package com.hpu.transview.data.sync
 import android.content.Context
 import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.MediaType
+import com.hpu.transview.data.UploadRecordRepository
+import com.hpu.transview.model.UploadState
+import com.hpu.transview.server.ServerBus
+import com.hpu.transview.server.UploadBus
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +53,7 @@ class SyncManager private constructor(context: Context) {
 
     private val appContext = context.applicationContext
     private val mediaRepository = MediaRepository(appContext)
+    private val uploadRecordRepository = UploadRecordRepository(appContext)
 
     private val _syncState = MutableStateFlow<SyncState>(SyncState.Idle)
     val syncState: StateFlow<SyncState> = _syncState.asStateFlow()
@@ -66,9 +71,22 @@ class SyncManager private constructor(context: Context) {
         val startAt = System.currentTimeMillis()
         _syncState.value = SyncState.Running("正在清理临时文件")
 
-        // 0. 清理解压工作区残留（断电 / 强杀后可能留下半个工作目录）
+        // 0. 清理解压工作区残留（断电 / 强杀后可能留下半个工作目录）。
+        //    跳过最近仍在写入的工作区：手动对账可能撞上正在进行的解压（或多台手机并发），
+        //    一刀清掉会把在途压缩包连同已解出的文件一起误删；这些工作区在空闲 10 分钟后
+        //    会被下一轮对账兜底清掉。
         withContext(Dispatchers.IO) {
-            FileUtils.purgeDirectory(FileLocations.tempUnzipDir)
+            FileUtils.purgeDirectory(FileLocations.tempUnzipDir, skipActiveWithinMs = ACTIVE_WORKSPACE_GRACE_MS)
+        }
+
+        // 0.5 清扫僵尸「上传中」记录：进程被杀 / 断电时请求线程的兜底收尾没机会执行，
+        //     DB 会残留永远停在「上传中 xx%」的死记录。仅在「服务器未运行 或 本进程无在途
+        //     上传」时执行——手动对账可能撞上活的上传（UploadBus 有 RUNNING），那是活数据不能动。
+        //     App 启动对账（Application.onCreate）时服务器必然尚未启动，僵尸必被清扫。
+        val hasLiveUpload = ServerBus.running.value &&
+            UploadBus.records.value.any { it.state == UploadState.RUNNING }
+        if (!hasLiveUpload) {
+            uploadRecordRepository.reapZombieRunning()
         }
 
         // 1. 清理空文件夹
@@ -153,6 +171,9 @@ class SyncManager private constructor(context: Context) {
     }
 
     companion object {
+        /** 在途解压工作区的保护窗口：最近该时长内仍有写入的工作目录不对账清理 */
+        private const val ACTIVE_WORKSPACE_GRACE_MS = 10 * 60 * 1000L
+
         @Volatile
         private var instance: SyncManager? = null
 

@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object UploadBus {
 
+    /** 已结束记录的保留条数（RUNNING 一律保留，不受此限） */
     private const val MAX_RECORDS = 8
     private val idGen = AtomicLong(0)
 
@@ -24,8 +25,16 @@ object UploadBus {
     fun start(name: String, size: Long): Long {
         val id = idGen.incrementAndGet()
         _records.update { current ->
-            (listOf(UploadRecord(id, name, size, UploadState.RUNNING, System.currentTimeMillis())) + current)
-                .take(MAX_RECORDS)
+            val next = listOf(
+                UploadRecord(id, name, size, UploadState.RUNNING, System.currentTimeMillis())
+            ) + current
+            // 只裁剪已结束的记录：ServerController 的空闲休眠判定靠 RUNNING 记录识别
+            // 「仍有上传在途」，多台手机并发时把最老的 RUNNING 挤出去会让大文件传输
+            // 被 15 分钟休眠误伤（浏览器单标签页串行上传不受影响，多端并发会踩中）
+            var keptFinished = 0
+            next.filter { record ->
+                record.state == UploadState.RUNNING || ++keptFinished <= MAX_RECORDS
+            }
         }
         return id
     }

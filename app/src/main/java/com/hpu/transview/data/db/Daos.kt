@@ -13,9 +13,6 @@ interface MediaItemDao {
     @Query("SELECT * FROM media_items WHERE filePath = :path LIMIT 1")
     suspend fun getByPath(path: String): MediaItemEntity?
 
-    @Query("SELECT * FROM media_items WHERE id = :id LIMIT 1")
-    suspend fun getById(id: Long): MediaItemEntity?
-
     @Query("SELECT * FROM media_items")
     suspend fun getAll(): List<MediaItemEntity>
 
@@ -24,9 +21,6 @@ interface MediaItemDao {
 
     @Query("SELECT * FROM media_items WHERE mediaType = :type")
     fun observeByType(type: Int): Flow<List<MediaItemEntity>>
-
-    @Query("SELECT COUNT(*) FROM media_items")
-    suspend fun count(): Int
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(item: MediaItemEntity): Long
@@ -62,13 +56,6 @@ interface PlaybackHistoryDao {
     )
     suspend fun getByPath(path: String): PlaybackHistoryEntity?
 
-    @Query(
-        "SELECT position FROM playback_history " +
-            "JOIN media_items ON media_items.id = playback_history.mediaItemId " +
-            "WHERE media_items.filePath = :path LIMIT 1"
-    )
-    suspend fun getPositionByPath(path: String): Long?
-
     /** 全部播放进度（含时长），供媒体库网格画进度条；进度变化自动推送 */
     @Query(
         "SELECT media_items.filePath AS filePath, playback_history.position AS position, " +
@@ -97,14 +84,32 @@ interface UploadRecordDao {
     @Query("SELECT * FROM upload_records ORDER BY time DESC LIMIT :limit")
     fun observeRecent(limit: Int = 200): Flow<List<UploadRecordEntity>>
 
-    @Query("SELECT * FROM upload_records WHERE id = :id LIMIT 1")
-    suspend fun getById(id: Long): UploadRecordEntity?
-
     @Insert
     suspend fun insert(record: UploadRecordEntity): Long
 
-    @Update
-    suspend fun update(record: UploadRecordEntity)
+    /** 直接落状态与进度（不经读-改-写，避免并发覆盖整条记录） */
+    @Query("UPDATE upload_records SET state = :state, progress = :progress WHERE id = :id")
+    suspend fun updateState(id: Long, state: Int, progress: Int)
+
+    /** 仅在记录仍处「上传中」时回写进度：迟到的进度监视不得覆盖已写入的最终状态（成功/失败） */
+    @Query("UPDATE upload_records SET progress = :progress WHERE id = :id AND state = :runningState")
+    suspend fun updateProgressIfRunning(id: Long, progress: Int, runningState: Int)
+
+    /**
+     * 把所有「上传中」记录批量改为指定状态（失败）。进程被杀 / 断电后，上一生命周期
+     * 的在途上传记录会永久卡在「上传中 xx%」（请求线程的兜底收尾没机会跑）；
+     * 新进程启动后不可能还有上个生命周期的请求活着，对账时统一标失败。
+     * @return 影响行数
+     */
+    @Query("UPDATE upload_records SET state = :toState WHERE state = :fromState")
+    suspend fun updateStateByState(fromState: Int, toState: Int): Int
+
+    /** 只保留最近 [keep] 条（time 同秒时以 id 稳定排序），其余删除——历史日志防无限增长 */
+    @Query(
+        "DELETE FROM upload_records WHERE id NOT IN " +
+            "(SELECT id FROM upload_records ORDER BY time DESC, id DESC LIMIT :keep)"
+    )
+    suspend fun trimTo(keep: Int)
 
     /** 仅删除历史日志，物理文件保留 */
     @Query("DELETE FROM upload_records WHERE id = :id")

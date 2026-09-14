@@ -37,8 +37,9 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
  * - GET  /verify   → 访问码校验（`?token=xxxxxx`），供「手动输入 IP」的网页在提交前先验一次
  * - POST /upload   → multipart 上传，字段：category / relativePath / file；需带 `X-Upload-Token` 头
  *
- * 端口与**访问码**由 ServerController 决定（端口可在设置页改；改端口 / 重启都会轮换访问码，
- * NanoHTTPD 端口构造时固定 → 改端口需停旧起新），两者都在构造时注入。
+ * 端口与**访问码**由 ServerController 决定（端口可在设置页改，NanoHTTPD 端口构造时固定
+ * → 改端口需停旧起新；访问码**会话内固定**：进程内停启/改端口沿用同一码，进程重启才轮换），
+ * 两者都在构造时注入。
  *
  * 上传链路（数据库驱动）：
  * - 每个上传请求在 upload_records 表建立记录（上传中），经计数流实时回写百分比进度；
@@ -48,8 +49,8 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
  *   改由 [ZipExtractor] 处理（暂存 → 空间校验 → 流式解压 → 按分类归位），解压结果经 JSON
  *   `message` 回给网页端并同时 Toast 到电视端；「其他」分类的 `.zip` 仍原样存入 Downloads。
  *
- * @param token 本次监听周期内的访问码（6 位，已是大写）。服务器实例持有的是构造时的那一份，
- *   ServerController 每次启动都新建实例并轮换，因此不存在「运行中换码」。
+ * @param token 会话内固定的访问码（6 位，已是大写）。服务器实例持有的是构造时的那一份；
+ *   ServerController 在进程内停启 / 改端口均沿用同一码，因此不存在「运行中换码」。
  *   详见 [checkToken]。
  */
 class TransHttpServer(
@@ -354,7 +355,9 @@ class TransHttpServer(
         UploadBus.finish(busId, state == UploadStateCode.SUCCESS)
     }
 
-    /** 轮询当前请求计数流的已写字节数，换算百分比回写 DB（600ms 节流，仅百分比变化时写） */
+    /** 轮询当前请求计数流的已写字节数，换算百分比回写 DB（600ms 节流，仅百分比变化时写）。
+     *  用 updateProgressIfRunning：与收尾的 updateState 走不同协程，落库顺序不保证，
+     *  无条件写会把已写入的「成功 100%」覆盖回「上传中 99%」，该记录将永远卡在上传中 */
     private fun startProgressMonitor(recordId: Long, contentLength: Long): Job {
         if (contentLength <= 0) return Job().also { it.complete() }
         val manager = ExternalTempFileManager.current.get() ?: return Job().also { it.complete() }
@@ -366,7 +369,7 @@ class TransHttpServer(
                 val pct = ((written * 100) / contentLength).toInt().coerceIn(0, 99)
                 if (pct != lastPct) {
                     lastPct = pct
-                    runCatching { uploadRecords.updateState(recordId, UploadStateCode.RUNNING, pct) }
+                    runCatching { uploadRecords.updateProgressIfRunning(recordId, pct) }
                 }
             }
         }

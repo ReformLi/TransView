@@ -1,7 +1,10 @@
 # TransView 传视TV — 架构与实现说明
 
-> 版本：v1.7.1　日期：2026-09-14
+> 版本：v1.8.1　日期：2026-09-14
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.8.1 变更：**死数据治理**——① 僵尸「上传中」记录：进程被杀后 DB 残留的 RUNNING 记录永久卡在「上传中 xx%」，对账新增 0.5 步 `reapZombieRunning()` 统一标失败（仅在服务器未运行或本进程无在途上传时执行，防误伤活记录，§3.8）；② upload_records 表无限增长：insert 后自动裁剪只留最近 500 条（UI 最多显示 200，200 名之外为纯死数据，§3.8）；③ 删除无调用方的死 DAO 方法（MediaItemDao.getById/count、PlaybackHistoryDao.getPositionByPath）；④ 盘点报告：`addedTime`/`updatedTime` 为无读取方的预留字段（保留，成本可忽略）、`UploadStateCode.WAITING` 为无写入方的防御状态（保留 UI 映射）、`fallbackToDestructiveMigration` 发布 v3 起必须换正式迁移。
+> v1.8 变更：**需求级修正（按主流习惯）**——① 访问码**会话内固定**：`tryStart` 首次生成、进程内停启/改端口沿用、进程重启才轮换（原「每次启停轮换」会让熄屏/播放/休眠恢复反复把手机端打回输码界面）（§3.15）；② **传输不中断覆盖全部停服路径**：`apply(false)` 遇在途上传跳过停服，`UploadBus.records` 收集器在最后一个上传结束时补评估归位（原仅空闲休眠顺延）（§3.7）；③ 性能指标限定为增量对账 ≤5 秒、首扫视频时长提取为一次性成本（README §4.1）。
+> v1.7.2 变更：**健壮性修复**——上传落盘 `Files.move`（API 26+）改 `renameTo`/`copyTo`（minSdk 21 兼容，§3.1 第 4 步）；对账清理解压工作区跳过最近 10 分钟仍在写入的目录（防误删在途解压，§3.6 第 0 步）；上传进度回写改 `updateProgressIfRunning` 条件更新（迟到进度不覆盖最终状态）；播放器播完清史后挂 `finishedPaths` 守卫拦截 100% 进度复活；UploadBus 只裁剪已结束记录（RUNNING 全保留，防并发上传被休眠误伤）；网页端队列入队时快照分类。
 > v1.7.1 变更：**上传页左面板视觉重做**——访问码由裸文字行改为**色块横条**（主色 14% 底 + 同行居中的标签/码值），
 > 标题降为 `labelLarge`、底部提示压成一行、复制按钮收紧，省下的竖向空间全部给二维码
 > （720p 实测 220×220 → 283×283 px，占面板宽 80%）（§3.15）。
@@ -41,12 +44,12 @@ com.hpu.transview
 ├── server/                    网络接收层（不依赖 UI）
 │   ├── TransHttpServer.kt     NanoHTTPD：上传页/访问码校验/上传接口；记录入 Room + 计数流回写进度
 │   │                          + 落盘后立即建媒体索引；上传页每次请求注入设备名（__DEVICE_NAME__）；
-│   │                          Token 构造时注入（每次启动新实例 = 新码），/upload 前置校验 X-Upload-Token
+│   │                          Token 构造时注入（会话内固定：进程停启沿用同一码），/upload 前置校验 X-Upload-Token
 │   ├── UploadStorage.kt       落盘规则：分类根目录/同名重命名/文件夹合并/路径消毒
 │   ├── UploadBus.kt           上传事件总线（媒体库刷新/空闲计时信号）
 │   ├── ServerBus.kt           服务器状态总线（running/hibernated/mode/port/token）
 │   └── ServerController.kt    智能保活策略引擎（模式+屏幕/播放/页面信号 → 启停状态机；setPort 停旧起新；
-│                              访问码内存权威值：tryStart 轮换 / stopServer 销毁）
+│                              访问码内存权威值：会话内固定，进程首次启动生成、停启沿用、重启才轮换）
 ├── service/
 │   ├── ServerService.kt       前台服务（API 34+ specialUse / API 29~33 dataSync）+ 常驻通知
 │   └── BootReceiver.kt        开机自启（BOOT_COMPLETED → 读设置决定是否拉起 ServerService）
@@ -57,8 +60,8 @@ com.hpu.transview
 │   ├── db/AppDatabase.kt      Room v2（fallbackToDestructiveMigration）
 │   ├── MediaRepository.kt     媒体索引仓储（upsert / observeByCategory / 级联删除）
 │   ├── PlaybackRepository.kt  播放历史仓储（path 键桥接外键，含自动补建索引）
-│   ├── UploadRecordRepository.kt 上传记录仓储（insert/updateState/deleteById/clearAll）
-│   └── sync/SyncManager.kt    数据库-物理文件对账引擎（三步，IO 线程，StateFlow 通知）
+│   ├── UploadRecordRepository.kt 上传记录仓储（insert/updateState/updateProgressIfRunning/deleteById/clearAll/reapZombieRunning；insert 后自动裁剪至 500 条）
+│   └── sync/SyncManager.kt    数据库-物理文件对账引擎（五步，IO 线程，StateFlow 通知）
 └── ui/                         Compose 界面层
     ├── theme/                  恒定深色 TV 主题
     ├── common/                 tvFocus 焦点修饰符、TvButton、OptionRow、
@@ -68,7 +71,8 @@ com.hpu.transview
     ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码带访问码 + 访问码色块 + 地址 + 状态）
     │                           + 右侧可滚动上传记录列表；二维码尺寸随可用空间自适应
     ├── library/LibraryScreen.kt 多列网格卡片（列数由设置决定，4/5/6）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
-    ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；**九项全部已接通**；
+    ├── settings/SettingsScreen.kt 设置子页面（v1.4：六分组左组右详情——服务器与网络 / 上传与解压 /
+    │                           播放设置 / 界面设置 / 存储与数据 / 关于，**全部已接通**；
     │                           三类弹框关闭后焦点回原行）
     ├── settings/SettingsStore.kt 设置偏好持久化（SharedPreferences object；端口/自启/设备名/续播提示/
     │                           连播/倍速/画面比例/列数/默认排序，均含默认值）
@@ -89,7 +93,7 @@ com.hpu.transview
 1. 手机 `POST /upload`（每文件一个请求，XHR `upload.onprogress` 显示百分比）。
 2. NanoHTTPD 流式解析 multipart，临时文件写入**外部存储** `Android/data/…/files/upload_tmp`（避免占用内部空间，且与目标目录同卷）。解析前给请求 Content-Type 强制补 `charset=UTF-8`——NanoHTTPD 对不带 charset 的 multipart 头按 US-ASCII 解码，会损坏中文文件名（浏览器 FormData 从不带 charset）。
 3. **上传记录先入 Room**（upload_records，状态=上传中）；`CountingOutputStream` 累计写入字节，后台协程 600ms 节流换算百分比（已写字节/Content-Length）回写 DB——TV 端上传页经 Room Flow 实时看到进度条，切换标签页不中断（上传在 HTTP 服务器工作线程进行）。
-4. `UploadStorage.save()`：消毒文件名/相对路径 → 逐级建目录（同名文件夹自动合并）→ 同名冲突加 `(n)` 后缀 → `Files.move` 同卷秒移，返回目标 File。
+4. `UploadStorage.save()`：消毒文件名/相对路径 → 逐级建目录（同名文件夹自动合并）→ 同名冲突加 `(n)` 后缀 → `renameTo` 同卷秒移（跨卷退化为 copy + delete；**刻意不用 `java.nio.file.Files`**——该 API 要求 API 26+，本工程 minSdk 21，低版本会抛 `NoClassDefFoundError` 导致全部上传「保存失败」），返回目标 File。
 5. 落盘成功后更新记录状态（成功/失败 + 100%），并在后台协程**立即写入 media_items 索引**（视频经 MediaMetadataRetriever 提时长），`UploadBus` 同时发事件驱动媒体库自动刷新与保活空闲计时；`MediaScannerConnection.scanFile` 通知系统媒体库。
 
 ### 3.2 存储策略与权限
@@ -241,9 +245,9 @@ com.hpu.transview
 
 - 模式经 SharedPreferences 持久化，设置入口在「设置」子页面 →「服务器与网络」→「保活策略」（§3.9），修改立即生效。
 - 启停在单一后台执行器串行执行，UI 线程零阻塞；`ServerBus`（StateFlow）同时驱动 UI 与前台服务通知文案（运行中/已暂停/已休眠/已停止）。
-- 空闲计时带保护：仍有上传在途（如单个大文件传输超 15 分钟）时顺延，绝不中断传输。
+- **传输不中断（统一规则）**：任何原因的停服（熄屏 / 播放 / 离开上传页 / 空闲休眠）遇到在途上传都顺延，传完最后一个文件才停。实现：`apply(false)` 检查 `UploadBus` 仍有 RUNNING 记录即跳过停服；init 里对 `UploadBus.records` 的收集在最后一个上传结束、且当前策略仍要求停止时补一次 `evaluate()` 归位。空闲计时同规则顺延（单个大文件传输超 15 分钟不断流）。
 - 上传页在服务器未运行时顶部固定区显示状态面板：省电模式「启动服务器」按钮、智能休眠「唤醒服务器」按钮（<1 秒恢复）、播放/熄屏暂停提示（自动恢复，无需操作）。
-- **访问码同生命周期**：启停在 `tryStart` / `stopServer` 两个口子上同时维护「监听 + 访问码」，因此**从休眠/暂停/熄屏恢复也视为一次启动 → 访问码轮换**（用户需重新扫码或重新输入）。见 §3.15。
+- **访问码会话内固定**：进程首次启动服务器时在 `tryStart()` 生成一次，此后停启（熄屏/播放暂停/休眠恢复）与改端口均沿用同一码，进程重启才轮换（用户「边看视频边让家人传文件」不会被反复打回输入访问码界面；旧码随进程死亡失效）。见 §3.15。
 - 与 README 3.6.1「待机仍可接收」的差异：默认智能模式改为待机暂停接收；需要旧行为请选择极速模式。
 
 ### 3.8 数据库与物理文件一致性（SyncManager 对账引擎）
@@ -252,14 +256,17 @@ com.hpu.transview
 
 | 表 | 关键列 | 约束 |
 |:--|:--|:--|
-| media_items | filePath / mediaType(0视频/1图片/2其他) / parentFolder / fileSize / lastModified / duration / addedTime | filePath **唯一索引** |
-| playback_history | mediaItemId / position / updatedTime | **外键 → media_items，ON DELETE CASCADE** |
-| upload_records | fileName / fileSize / progress / state(0等待/1上传中/2成功/3失败) / category / time | 纯历史日志，删除不触碰物理文件 |
+| media_items | filePath / mediaType(0视频/1图片/2其他) / parentFolder / fileSize / lastModified / duration / addedTime* | filePath **唯一索引** |
+| playback_history | mediaItemId / position / updatedTime* | **外键 → media_items，ON DELETE CASCADE** |
+| upload_records | fileName / fileSize / progress / state(0等待/1上传中/2成功/3失败) / category / time | 纯历史日志，删除不触碰物理文件；**自动防死数据**：insert 后裁剪只留最近 500 条（UI 最多显示 200） |
+
+\* `addedTime`/`updatedTime` 目前无业务读取方（排序用文件系统 mtime），作为审计/预留字段保留，成本可忽略。
 
 DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访问 Room 的唯一通道；`PlaybackRepository` 对外保持 path 键调用面，内部桥接外键并在保存进度时自动补建缺失索引。
 
-**四步对账**（`SyncManager.sync()`，全程 Dispatchers.IO，Mutex 串行，严禁阻塞主线程）：
-0. **清理解压工作区**：物理清空 `/sdcard/TransView/.temp_unzip/`（`FileUtils.purgeDirectory`）——压缩包解压途中断电 / 进程被杀会留下半个工作目录，不清理会一直占着空间（见 §3.14）。
+**五步对账**（`SyncManager.sync()`，全程 Dispatchers.IO，Mutex 串行，严禁阻塞主线程）：
+0. **清理解压工作区**：物理清空 `/sdcard/TransView/.temp_unzip/`（`FileUtils.purgeDirectory`）——压缩包解压途中断电 / 进程被杀会留下半个工作目录，不清理会一直占着空间（见 §3.14）。清理前先按「目录树内最新修改时间」跳过**最近 10 分钟仍在写入**的工作区：手动对账可能撞上正在进行的解压（或多台手机并发），一刀清掉会把在途压缩包连同已解出的文件一起误删；被跳过的工作区由 10 分钟后的下一轮对账兜底清掉。
+0.5. **清扫僵尸「上传中」记录**（`UploadRecordRepository.reapZombieRunning`）：进程被杀 / 断电时请求线程的兜底收尾没机会执行，DB 会残留永远停在「上传中 xx%」的死记录，统一标失败。**仅在服务器未运行或本进程无在途上传时执行**（`ServerBus.running` + `UploadBus` RUNNING 判定）——手动对账可能撞上活的上传记录，那是活数据不能动；App 启动对账时服务器必然尚未启动，僵尸必被清扫。
 1. **清理空文件夹**：沙盒内三个分类根目录递归扫描，物理删除空文件夹——子删父空继续向上递归（分类根受 `FileLocations.isRoot` 保护永不删除；入口处 `isInsideSandbox` 断言，越界直接拒绝）。
 2. **同步外部删除**（防"有索引无文件"）：遍历 DB 全部 filePath，物理不存在 → 删记录（播放历史经 CASCADE 级联删除）。
 3. **同步新增/变更**（防"有文件无索引"）：递归收集**沙盒内**物理文件（用户 U 盘拷入的文件同样入库，属预期行为）→ 无记录的入库（视频时长 MediaMetadataRetriever 提取 + 进程内 ConcurrentHashMap 缓存）；有记录但 fileSize/lastModified 变化的更新。
@@ -426,13 +433,16 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 
 | 时机 | 行为 |
 |:--|:--|
-| 服务器启动（首次 / 休眠唤醒 / 熄屏・播放暂停后恢复 / 改端口重启） | `tryStart()` 生成新码 |
-| 服务器停止（休眠 / 暂停 / 改端口 / 服务销毁） | `stopServer()` 销毁（置 null） |
+| 进程首次启动服务器 | `tryStart()` 生成新码（此后进程内停启 / 改端口均沿用） |
+| 服务器停止（休眠 / 暂停 / 改端口 / 服务销毁） | 仅停监听；`ServerBus` 置 null（UI 隐藏码与二维码），**码本身保留** |
+| 进程重启（含开机自启重新拉起） | 重新生成（旧码随进程死亡失效） |
 
 - 6 位，字符集 `A-Z` + `0-9`，`SecureRandom` 生成（不做易混字符剔除，按需求固定字符集）。
-- **先建码、再起服务，起成功才提交**：码在构造时注入 `TransHttpServer`，所以不存在「运行中换码」的竞态；
-  启动失败（端口占用）不动已有状态，回滚到旧端口也能拿到一份与实例匹配的新码。
-- 由于是「停旧起新」，**改端口也会轮换访问码**，与「每次启动轮换」的约定一致。
+- **先取码、再起服务，起成功才提交**：码在构造时注入 `TransHttpServer`，所以不存在「运行中换码」的竞态；
+  启动失败（端口占用）不动已有状态，回滚到旧端口注入的也是同一份码。
+- **会话内固定**（v1.8，替代 v1.7 的「每次启停轮换」）：熄屏 / 播放暂停 / 休眠恢复 / 改端口都不换码，
+  「边看视频边让家人传文件」不会被反复打回输入访问码界面——与主流投屏/传输工具「会话内记住配对」
+  的惯例一致；码与 App 进程同生命周期，安全性不打折。手机端仅在电视 App 重启后才需重新输入。
 
 **服务端接口**（`TransHttpServer`）
 

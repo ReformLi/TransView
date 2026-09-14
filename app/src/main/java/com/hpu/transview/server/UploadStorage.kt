@@ -6,8 +6,6 @@ import com.hpu.transview.model.Category
 import com.hpu.transview.util.FileLocations
 import java.io.File
 import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 
 /**
  * 上传文件的落盘规则：
@@ -29,11 +27,16 @@ class UploadStorage(private val context: Context) {
             }
             var target = File(dir, name)
             if (target.exists()) target = uniqueTarget(dir, name)
-            try {
-                Files.move(tempFile.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } catch (e: IOException) {
-                // 跨文件系统时 move 退化为 copy+delete
-                Files.copy(tempFile.toPath(), target.toPath())
+            // 落盘搬运用 renameTo（临时目录与沙盒同在 /sdcard 卷上，即零拷贝改名）；
+            // 跨文件系统失败时退化为 copy + delete。
+            // 刻意不用 java.nio.file.Files.move/copy：那套 API 要求 API 26+，而本工程
+            // minSdk 是 21（低版本会抛 NoClassDefFoundError，全部上传表现为「保存失败」），
+            // 与 ZipExtractor.moveInto 同一标准。
+            if (!tempFile.renameTo(target)) {
+                // renameTo 失败的另一可能是目标极小概率已被并发上传占用（检查与搬运之间存在窗口）：
+                // copyTo(overwrite = false) 撞名会抛异常而不是覆盖，这里先换一个不重名的落点再试
+                if (target.exists()) target = uniqueTarget(dir, name)
+                tempFile.copyTo(target, overwrite = false)
                 tempFile.delete()
             }
             scanToMediaStore(target)

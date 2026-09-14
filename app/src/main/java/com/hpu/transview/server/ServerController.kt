@@ -21,7 +21,7 @@ import java.util.concurrent.Executors
  *
  * 信号源：
  * - 屏幕开关（SCREEN_OFF/ON 广播，由 ServerService 转发）
- * - 播放状态（PlayerActivity 上报，播放中暂停服务器防"边播边传卡顿"）
+ * - 播放状态（PlayerActivity 上报，播放中暂停服务器防"边播边传卡顿"；在途上传顺延至传完才停）
  * - 上传页可见性（MainScreen 上报，省电模式离开页面即停）
  * - 上传活动（UploadBus 事件，重置空闲计时）
  * - 手动唤醒（上传页按钮）
@@ -34,7 +34,8 @@ import java.util.concurrent.Executors
  * 对外唯一输出口是 ServerBus（running / hibernated / mode / port / token StateFlow），
  * UI 与前台服务通知只依赖总线，不持有引擎引用。
  *
- * **访问码（Token）**：见 [tryStart] —— 与监听同生命周期，起则轮换、停则销毁，
+ * **访问码（Token）**：见 [tryStart] —— **会话内固定**：进程首次启动服务器时生成一次，
+ * 此后停启（熄屏/播放暂停/休眠恢复）与改端口均沿用同一码，进程重启才轮换；
  * 生成后注入 [TransHttpServer] 实例，服务器据此拦截未授权的上传请求。
  */
 object ServerController {
@@ -59,8 +60,14 @@ object ServerController {
     /**
      * 当前访问码（内存状态，不持久化）。
      *
-     * 每次 [tryStart] 成功都轮换；[stopServer] 置 null。服务器实例持有的是**构造时注入的那一份**，
-     * 因此本字段始终与实际在跑的监听一致（不会出现「显示的是新码、服务器认的是旧码」）。
+     * **会话内固定**：进程首次启动服务器时生成一次，此后停启与改端口均沿用同一码，
+     * 进程重启（含开机自启重新拉起）才轮换。不随每次启停轮换的理由：熄屏/播放/休眠
+     * 恢复都会走一轮 stop→start，若每次换码，「边看视频边让家人传文件」这类场景会把
+     * 手机端反复打回输入访问码界面，体验远差于主流投屏/传输工具的「会话内记住配对」
+     * 惯例；而码与 App 进程同生命周期，旧码仍会随进程死亡失效，安全性不打折。
+     *
+     * 服务器实例持有的是**构造时注入的那一份**，与本字段恒一致（不存在「显示的是新码、
+     * 服务器认的是旧码」——沿用期间两者本就是同一个值）。
      */
     private var token: String? = null
 
@@ -104,7 +111,7 @@ object ServerController {
             SettingsStore.init(appContext!!)
             port = SettingsStore.serverPort
             ServerBus.setPort(port)
-            // 服务器尚未启动，此时不应存在有效访问码
+            // 服务器尚未启动，UI 不应展示访问码（码本身会话内固定，起服时重新发布）
             ServerBus.setToken(null)
             prefs = appContext!!.getSharedPreferences("server_policy", Context.MODE_PRIVATE)
             mode = prefs!!.getString("mode", null)
@@ -112,9 +119,21 @@ object ServerController {
                 ?: ServerMode.SMART
             ServerBus.setMode(mode)
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-            // 任何上传事件（开始/结束）都视为活动，重置空闲计时
+            // 任何上传事件（开始/结束）都视为活动，重置空闲计时；
+            // 最后一个在途上传结束时补一次评估：把因「传输不中断」保护而暂缓的停服归位
+            // （见 [apply]）。策略信号统一在主线程读取（与 setPort 同规），post 到主线程再判断。
             scope.launch {
-                UploadBus.records.collect { resetIdleTimer() }
+                UploadBus.records.collect {
+                    resetIdleTimer()
+                    mainHandler.post {
+                        if (ServerBus.running.value &&
+                            UploadBus.records.value.none { it.state == UploadState.RUNNING } &&
+                            !shouldRunNow()
+                        ) {
+                            evaluate()
+                        }
+                    }
+                }
             }
         }
         evaluate()
@@ -188,8 +207,8 @@ object ServerController {
      * 结果经 [onResult]（主线程）回调：
      * - 成功：更新端口 + 写回设置项 + 刷新 [ServerBus]，上传页二维码/地址随即跟着变；
      * - 失败（几乎只有端口被占用）：用旧端口重新拉起，设置项保持不变，由 UI 提示用户。
-     * 切换会打断正在进行的上传连接，属预期行为；由于是「停旧起新」，**访问码也会随之轮换**
-     * （用户需重新扫码或重新输入），与「服务器每次启动轮换」的约定一致。
+     * 切换会打断正在进行的上传连接，属预期行为；访问码**会话内固定、不随之轮换**，
+     * 手机端在电视恢复监听后刷新即可继续（无需重新输入访问码）。
      */
     fun setPort(newPort: Int, onResult: (Boolean) -> Unit) {
         if (newPort !in Constants.PORT_RANGE) {
@@ -209,7 +228,7 @@ object ServerController {
                 mainHandler.post { onResult(false) }
                 return@execute
             }
-            // 停掉旧端口上的监听（存在的话），并销毁旧访问码
+            // 停掉旧端口上的监听（存在的话）；访问码会话内固定，不受停启影响
             stopServer()
 
             var ok = true
@@ -219,7 +238,7 @@ object ServerController {
                     httpServer = started
                 } else {
                     // 新端口起不来：尽力用旧端口恢复监听，避免「改端口把服务器改没了」
-                    // （此时访问码由 tryStart 重新生成一次，与服务实例一一对应）
+                    // （访问码会话内固定，恢复监听注入的仍是当前这枚码）
                     ok = false
                     httpServer = tryStart(context, previous)
                 }
@@ -249,38 +268,41 @@ object ServerController {
     private fun apply(run: Boolean) {
         val context = appContext ?: return
         if (run) {
-            // 从休眠 / 暂停 / 熄屏中恢复也走这里 → 视为「一次启动」，访问码随之轮换
             if (httpServer == null) {
                 httpServer = tryStart(context, port)
             }
         } else if (httpServer != null) {
+            // 传输不中断保护（与空闲休眠的豁免同一条规则）：任何原因的停服
+            // （熄屏/播放中/离开上传页）遇到在途上传都顺延，传完最后一个文件才停。
+            // 暂缓的停服由 init 里对 UploadBus 的收集在最后一个上传结束时补评估归位。
+            if (UploadBus.records.value.any { it.state == UploadState.RUNNING }) return
             stopServer()
         }
         publishState()
     }
 
     /**
-     * 启动监听 + 轮换访问码；端口被占用等失败情况返回 null。
+     * 启动监听；端口被占用等失败情况返回 null。
      *
-     * 生成顺序很关键：**先建码、再起服务，起成功才提交**。这样：
-     * ① 服务器实例拿到的是构造时注入的那一份，后续 `httpServer` 不会再变，不存在「运行中换码」的竞态；
-     * ② 启动失败（端口占用）时不动已有状态，回滚到旧端口也能拿到一份与实例匹配的新码。
+     * 访问码**会话内固定**（见 [token] 注释）：进程内首次启动生成一次，此后（含改端口
+     * 停旧起新）沿用同一码；进程重启才轮换。生成顺序依旧关键：**先取码、再起服务，
+     * 起成功才提交**——服务器实例拿到的是构造时注入的那一份，启动失败（端口占用）时
+     * 不动已有状态，回滚到旧端口时注入的也是同一份码，不存在失配。
      */
     private fun tryStart(context: Context, targetPort: Int): TransHttpServer? {
-        val fresh = generateToken()
+        val code = token ?: generateToken()
         val started = runCatching {
-            TransHttpServer(context, targetPort, fresh).also { it.start() }
+            TransHttpServer(context, targetPort, code).also { it.start() }
         }.getOrNull() ?: return null
-        token = fresh
-        ServerBus.setToken(fresh)
+        token = code
+        ServerBus.setToken(code)
         return started
     }
 
-    /** 停止监听并销毁访问码（码与监听同生命周期：停则失效，下次启动重新生成） */
+    /** 停止监听。访问码保留（会话内固定），下次启动沿用，手机端免重复输入；UI 侧置 null 隐藏码与二维码 */
     private fun stopServer() {
         runCatching { httpServer?.stop() }
         httpServer = null
-        token = null
         ServerBus.setToken(null)
     }
 

@@ -212,7 +212,8 @@
 
   var category = 'video';
   // status: wait（排队）/ run（上传中）/ ok / err（失败）/ cancel（已取消，可重试）
-  var queue = [];        // {file, name, size, relPath, status, progress, xhr}
+  // item.category 在入队时快照：用户排队后切换分类，不影响已入队文件按原分类上传
+  var queue = [];        // {file, name, size, relPath, category, status, progress, xhr}
   var uploading = false;
 
   var $ = function (id) { return document.getElementById(id); };
@@ -228,8 +229,9 @@
   }
 
   // ————————————————— 访问码（Token） —————————————————
-  // 电视端每次启动服务器都会轮换访问码。手机侧只存 sessionStorage：同标签页刷新可复用，
-  // 新开标签页（书签 / 直接输 IP）一律重新过门槛 —— 不做「记住访问码」。
+  // 电视端访问码在 App 进程存活期内固定（熄屏/播放视频/休眠恢复都不换码，重启电视 App 才换新码）。
+  // 手机侧只存 sessionStorage：同标签页刷新可复用，新开标签页（书签 / 直接输 IP）一律重新过门槛
+  // —— 不做「记住访问码」。
   var TOKEN_KEY = 'uploadToken';
   var token = '';
 
@@ -404,6 +406,7 @@
         name: it.file.name,
         size: it.file.size,
         relPath: (it.relPath || '').replace(/\\/g, '/'),
+        category: category,   // 入队时的分类快照，上传时以此为准
         status: 'wait',
         progress: 0
       });
@@ -612,9 +615,10 @@
     }
 
     // 分类/文件名/相对路径放 URL query：服务端在接收请求体之前就能读到，
-    // 上传记录与进度条可立即建立（multipart 字段要接收完整个请求体才能解析）
+    // 上传记录与进度条可立即建立（multipart 字段要接收完整个请求体才能解析）。
+    // 分类取入队时的快照（item.category），而非当前全局分类——排队后切换分类不应影响已入队文件
     xhr.open('POST',
-      '/upload?category=' + encodeURIComponent(category) +
+      '/upload?category=' + encodeURIComponent(item.category) +
       '&filename=' + encodeURIComponent(item.file.name) +
       '&relativepath=' + encodeURIComponent(item.relPath || ''),
       true);
@@ -629,7 +633,7 @@
     };
     xhr.onload = function () {
       if (item.xhr !== xhr) return;
-      // 403 = 访问码失效（电视端服务器重启/休眠恢复后轮换了新码）
+      // 403 = 访问码失效（电视端 App 重启后轮换了新码；熄屏/播放/休眠恢复不换码）
       if (xhr.status === 403) {
         item.status = 'err';
         authLost();
@@ -653,7 +657,7 @@
       item.status = 'err';
       // 服务端在读完请求体之前就回了 403 并关掉连接时，浏览器报的是网络错误而不是 403
       // （大文件尤其明显）。用一次 /verify 探针把「访问码失效」和「真连不上」分开，
-      // 否则服务器重启后用户只会看到「服务器可能已休眠」，永远不知道该重新输入访问码。
+      // 否则电视 App 重启换码后用户只会看到「服务器可能已休眠」，永远不知道该重新输入访问码。
       if (token) probeAuth(item, finishOne);
       else {
         toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');

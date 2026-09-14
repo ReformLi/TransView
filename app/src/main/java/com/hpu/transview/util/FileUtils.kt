@@ -159,19 +159,36 @@ object FileUtils {
      * 用于压缩包解压工作区（`/sdcard/TransView/.temp_unzip`）的残留清理：
      * 解压中途断电 / 进程被杀会留下半个工作目录，SyncManager 每次对账兜底清掉。
      * 越界保护：目标必须在 /sdcard/TransView 沙盒内，否则拒绝执行。
+     * @param skipActiveWithinMs 大于 0 时，目录树内最近该毫秒数内仍有写入的子目录视为
+     *   「可能正在使用」（如仍在进行的解压工作区），跳过不删——手动对账可能恰好撞上
+     *   在途解压，现在清掉会把整包文件连同原压缩包一起误删。
      * @return 实际删除的顶层条目数
      */
-    fun purgeDirectory(dir: File): Int {
+    fun purgeDirectory(dir: File, skipActiveWithinMs: Long = 0L): Int {
         if (!FileLocations.isInsideSandbox(dir)) return 0
         val children = dir.listFiles() ?: return 0
+        val activeCutoff = System.currentTimeMillis() - skipActiveWithinMs
         var removed = 0
         for (child in children) {
+            if (skipActiveWithinMs > 0 && newestModifiedUnder(child) >= activeCutoff) continue
             runCatching {
                 if (child.isDirectory) child.deleteRecursively() else child.delete()
             }
             if (!child.exists()) removed++
         }
         return removed
+    }
+
+    /** 目录树内最新的修改时间（含自身；普通文件即自身 mtime），供在途工作区判定 */
+    private fun newestModifiedUnder(file: File): Long {
+        var newest = file.lastModified()
+        if (file.isDirectory) {
+            file.listFiles()?.forEach { child ->
+                val t = newestModifiedUnder(child)
+                if (t > newest) newest = t
+            }
+        }
+        return newest
     }
 
     /**

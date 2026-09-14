@@ -185,6 +185,15 @@ class PlayerActivity : ComponentActivity() {
     private var pendingResumePosition = 0L
 
     /**
+     * 已看完、待清除播放历史的文件路径。
+     * STATE_ENDED 时异步 clear 历史后，周期性 saveProgress（此刻 position=duration）
+     * 与 skipTo 前的 saveProgress 都可能把「100% 进度」记录重新写回库里（两次异步写
+     * 顺序不保证），导致「看完自动清除历史」失效、卡片残留满格进度条——这里统一拦掉。
+     * 重播同一文件时移出集合，恢复正常记录。
+     */
+    private val finishedPaths = mutableSetOf<String>()
+
+    /**
      * PlayerView 实例。画面比例要直接改它的 `resizeMode`，而 `AndroidView(update=…)` 里读 Compose
      * 状态不会建立订阅（update 非组合作用域，状态变化不会触发重绘），因此保存引用后命令式设置。
      */
@@ -213,7 +222,12 @@ class PlayerActivity : ComponentActivity() {
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_ENDED) {
                 val file = currentFile
-                if (file != null) lifecycleScope.launch { repository.clear(file.absolutePath) }
+                if (file != null) {
+                    // 先挂「已看完」守卫再异步清库：clear 与周期性 saveProgress 是两次
+                    // 顺序不保证的异步写，不拦的话 100% 进度记录可能被重新写回
+                    finishedPaths += file.absolutePath
+                    lifecycleScope.launch { repository.clear(file.absolutePath) }
+                }
                 // 自动连播开启（默认）且还有下一集 → 直接续播；关闭时即使有下一集也停在片尾，
                 // 由用户决定「重播」还是按返回离开（与最后一集的收尾表现一致）。
                 if (hasNext && SettingsStore.autoPlayNext) {
@@ -230,8 +244,10 @@ class PlayerActivity : ComponentActivity() {
                     )
                 }
             } else if (ended) {
-                // seek / 重播后重新进入准备状态，退出结束态
+                // seek / 重播后重新进入准备状态，退出结束态；
+                // 同时解除「已看完」守卫——用户回看（如快退到中部）时进度要恢复正常记录
                 ended = false
+                currentFile?.let { finishedPaths.remove(it.absolutePath) }
             }
         }
 
@@ -337,7 +353,8 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        saveProgress()
+        // 进度保存只在 onStop 做：这里 lifecycleScope 随 DESTROYED 即将取消，
+        // launch 出去的保存可能被中途取消，属不可靠冗余（onStop 必然先于 onDestroy 执行）
         ServerController.setPlaying(false)
         player.removeListener(playerListener)
         player.release()
@@ -401,6 +418,8 @@ class PlayerActivity : ComponentActivity() {
 
     private fun saveProgress() {
         val file = currentFile ?: return
+        // 已看完待清历史的文件不再回写进度（见 finishedPaths 注释）
+        if (file.absolutePath in finishedPaths) return
         val pos = player.currentPosition
         val dur = player.duration
         if (dur > 0 && pos > 1000) {
@@ -428,7 +447,8 @@ class PlayerActivity : ComponentActivity() {
      */
     private fun togglePlayPause() {
         if (ended) {
-            // 播完状态下按播放键 = 重播
+            // 播完状态下按播放键 = 重播：解除「已看完」守卫，此后正常记录新进度
+            currentFile?.let { finishedPaths.remove(it.absolutePath) }
             ended = false
             player.seekTo(0)
             player.play()
