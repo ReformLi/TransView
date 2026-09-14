@@ -47,6 +47,13 @@ data class UploadRecord(
     val time: Long
 )
 
+/** 播放默认画面比例 */
+enum class AspectRatio(val label: String) {
+    ORIGINAL("原始"),
+    STRETCH("拉伸"),
+    CROP("裁剪")
+}
+
 /** 服务器保活策略模式 */
 enum class ServerMode(val label: String, val desc: String) {
     /** 极速：恒运行，无视屏幕休眠/播放/超时 */

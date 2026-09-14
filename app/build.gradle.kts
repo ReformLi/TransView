@@ -16,6 +16,13 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
+        // 构建时间（设置页「版本信息」展示用）
+        buildConfigField(
+            "String",
+            "BUILD_TIME",
+            "\"2026-09-13\""
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -39,6 +46,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

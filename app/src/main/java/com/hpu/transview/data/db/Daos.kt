@@ -85,6 +85,10 @@ interface PlaybackHistoryDao {
 
     @Query("DELETE FROM playback_history WHERE mediaItemId = :mediaItemId")
     suspend fun deleteByMediaItemId(mediaItemId: Long)
+
+    /** 清空全部播放历史（媒体索引保留） */
+    @Query("DELETE FROM playback_history")
+    suspend fun clearAll()
 }
 
 @Dao

@@ -66,6 +66,9 @@ class PlaybackRepository(context: Context) {
     /** 清除续播历史（媒体索引保留） */
     suspend fun clear(path: String) = withContext(Dispatchers.IO) { deleteInternal(path) }
 
+    /** 清空全部播放历史（媒体索引保留） */
+    suspend fun clearAllHistory() = withContext(Dispatchers.IO) { historyDao.clearAll() }
+
     private suspend fun deleteInternal(path: String) {
         val item = mediaDao.getByPath(path) ?: return
         historyDao.deleteByMediaItemId(item.id)

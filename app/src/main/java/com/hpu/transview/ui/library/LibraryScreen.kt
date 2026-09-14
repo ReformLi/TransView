@@ -1,12 +1,16 @@
-﻿package com.hpu.transview.ui.library
+package com.hpu.transview.ui.library
 
 import android.content.Intent
+import android.os.SystemClock
+import android.view.ViewConfiguration
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -84,6 +88,8 @@ import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.isImageFile
 import com.hpu.transview.util.isVideoFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -93,6 +99,8 @@ private const val GRID_COLUMNS = 5
 
 /** 焦点还原「返回上级」卡片的哨兵路径 */
 private const val FOCUS_UP = "__up__"
+/** 进入子目录后聚焦第一个条目（用户反馈：先闪 UpCard 再跳会有可见的两段跳，直接一次落点） */
+private const val FOCUS_FIRST = "__first__"
 
 /**
  * 长文件名跑马灯（仅在卡片获得焦点时挂上，见 MediaCard）。
@@ -124,6 +132,9 @@ private val titleMarquee: Modifier = Modifier.basicMarquee(
  *   「排序」上（停靠期间抑制其聚焦高亮，避免过渡闪烁；touch 点按路径无焦点可保护，直接跳过）；
  *   否则承载焦点的卡片被移出组合时，Compose 会把焦点回退到第一个可聚焦元素（顶部「上传」标签），
  *   标签的「聚焦即选中」会把页面直接切走。
+ * - **进入子目录焦点直接落第一个条目**（`FOCUS_FIRST`，用户反馈）：不再落「返回上级」——
+ *   UpCard 抢焦点会形成「第一个文件闪一下再跳回上级」的可见两段跳；直接聚焦第一个条目
+ *   只有一次落点。空目录网格里只剩 UpCard 时改聚焦它。
  */
 @Composable
 fun LibraryScreen(
@@ -173,6 +184,9 @@ fun LibraryScreen(
     // ——— 文件夹列表来自文件系统（DB 不索引文件夹） ———
     var dirRefreshKey by remember { mutableStateOf(0) }
     var dirEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    // 目录列表的「归属戳」：记录 dirEntries 是为哪个目录加载的。切目录后的第一帧里
+    // dirEntries 还是旧目录的数据，据此判断加载是否完成（避免 FOCUS_FIRST 误判空目录）。
+    var dirEntriesStamp by remember { mutableStateOf<File?>(null) }
     LaunchedEffect(currentDir, dirRefreshKey) {
         dirEntries = withContext(Dispatchers.IO) {
             currentDir.listFiles()
@@ -180,6 +194,7 @@ fun LibraryScreen(
                 ?.map { FileEntry(it, it.name, true, 0L, it.lastModified()) }
                 ?: emptyList()
         }
+        dirEntriesStamp = currentDir
     }
 
     // ——— 文件列表来自数据库（Room Flow 实时刷新） ———
@@ -220,8 +235,12 @@ fun LibraryScreen(
         SortOrder.TIME_DESC -> compareByDescending { it.lastModified }
         SortOrder.TIME_ASC -> compareBy { it.lastModified }
     }
-    val entries = remember(dirEntries, fileEntries, sortOrder) {
-        dirEntries.sortedWith(cmp) + fileEntries.sortedWith(cmp)
+    // dirEntries 是异步加载的：切目录后的第一帧里它还是旧目录的子文件夹列表，
+    // 必须按 parent 同步过滤掉，否则网格会先闪一帧旧目录内容，且 FOCUS_FIRST
+    // 会错误命中旧卡片（该卡片下一帧即被移出组合，焦点会失控回退）。
+    val entries = remember(dirEntries, fileEntries, sortOrder, currentDir) {
+        dirEntries.filter { it.file.parentFile == currentDir }.sortedWith(cmp) +
+            fileEntries.sortedWith(cmp)
     }
 
     // ——— 文件夹内文件总数（含子层级） ———
@@ -230,10 +249,24 @@ fun LibraryScreen(
     }
 
     // ——— 焦点定位：先滚动到目标项，再由卡片自身请求焦点 ———
-    LaunchedEffect(pendingFocusPath, entries) {
+    // 键含 dirEntriesStamp：entries 结构相等时 LaunchedEffect 不会重跑（List.equals 是
+    // 结构比较），目录列表异步加载完成必须靠 stamp 变化触发重跑，否则 FOCUS_FIRST 会卡住。
+    LaunchedEffect(pendingFocusPath, entries, dirEntriesStamp) {
         val target = pendingFocusPath ?: return@LaunchedEffect
         if (target == FOCUS_UP) {
             if (!atRoot) runCatching { gridState.scrollToItem(0) }
+            return@LaunchedEffect
+        }
+        if (target == FOCUS_FIRST) {
+            // 目录列表还没加载完（异步 IO）：等 stamp 变化触发本 effect 重跑再判断
+            if (dirEntriesStamp != currentDir) return@LaunchedEffect
+            // 空目录（无子文件夹也无文件）网格里只剩「返回上级」，改聚焦它
+            if (entries.isEmpty()) {
+                pendingFocusPath = FOCUS_UP
+            } else {
+                // 子目录里 UpCard 占网格位 0，第一个条目在位 1
+                runCatching { gridState.scrollToItem(if (atRoot) 0 else 1) }
+            }
             return@LaunchedEffect
         }
         val index = entries.indexOfFirst { it.file.absolutePath == target }
@@ -294,8 +327,10 @@ fun LibraryScreen(
                 val hadFocus = gridHasFocus
                 parkFocusSafe()
                 currentDir = entry.file
-                // 仅遥控器路径做焦点还原；touch 点按路径焦点本来就空，无需还原
-                if (hadFocus) pendingFocusPath = FOCUS_UP
+                // 仅遥控器路径做焦点还原；touch 点按路径焦点本来就空，无需还原。
+                // 进入子目录后焦点直接落第一个条目（FOCUS_FIRST），不再落「返回上级」：
+                // 用户反馈 UpCard 抢焦点会形成「第一个文件闪一下再跳回上级」的可见两段跳。
+                if (hadFocus) pendingFocusPath = FOCUS_FIRST
             }
             entry.file.isVideoFile() -> mediaLauncher.launch(
                 Intent(context, PlayerActivity::class.java)
@@ -338,11 +373,13 @@ fun LibraryScreen(
                 FileUtils.deletePhysicalFile(entry.file)
             }
             if (physicalOk) {
-                // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走
+                // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走。
+                // hadFocus 先捕获（原因同 openEntry：park 会同步移动焦点使 gridHasFocus 变 false）
+                val hadFocus = gridHasFocus
                 parkFocusSafe()
                 mediaRepo.deleteByPath(entry.file.absolutePath)
                 // touch 路径跳过焦点还原（见 openEntry 注释）
-                if (gridHasFocus) pendingFocusPath = nextPath
+                if (hadFocus) pendingFocusPath = nextPath
                 dirRefreshKey++ // 父目录可能被连带清空
                 Toast.makeText(context, "已删除「${entry.name}」", Toast.LENGTH_SHORT).show()
             } else {
@@ -461,7 +498,9 @@ fun LibraryScreen(
                         entry = entry,
                         childCount = if (entry.isDirectory) countInFolder(entry.file.absolutePath) else 0,
                         progress = progressMap[entry.file.absolutePath],
-                        autoFocus = pendingFocusPath == entry.file.absolutePath,
+                        // FOCUS_FIRST 只命中第一个条目（进入子目录后焦点一次落点，不经过 UpCard）
+                        autoFocus = pendingFocusPath == entry.file.absolutePath ||
+                            (pendingFocusPath == FOCUS_FIRST && index == 0),
                         onAutoFocused = { pendingFocusPath = null; focusParking = false },
                         onOpen = { openEntry(entry) },
                         onMenu = { actionEntry = entry },
@@ -628,6 +667,14 @@ private fun primaryActionLabel(entry: FileEntry): String = when {
 
 // ————————————————— 卡片 —————————————————
 
+/**
+ * 确定键短按的确认窗口（ms）。键盘/模拟器按住确定键时，auto-repeat 常被输入
+ * 通路拆成一串完整的「按下+抬起」对（每对时间戳独立，间隔通常 30~60ms），必须
+ * 等窗口内无后续按下才能判定用户真的松开了；真机遥控短按因此多出这点延迟，无感。
+ */
+private const val CONFIRM_GRACE_MS = 200L
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaCard(
     entry: FileEntry,
@@ -644,6 +691,12 @@ private fun MediaCard(
 ) {
     val focusRequester = remember { FocusRequester() }
     var focused by remember { mutableStateOf(false) }
+    // —— 确定键按压状态：自己记录按下时间（键盘/模拟器 auto-repeat 的 downTime
+    //    不可信，见下方按键处理确定键分支的注释）——
+    var pressing by remember { mutableStateOf(false) }
+    var pressStartMs by remember { mutableStateOf(0L) }
+    var confirmJob by remember { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
     val shape = RoundedCornerShape(12.dp)
 
     LaunchedEffect(autoFocus) {
@@ -676,21 +729,76 @@ private fun MediaCard(
                 shape = shape
             )
             .focusRequester(focusRequester)
-            .onFocusChanged { focused = it.isFocused }
-            .clickable { onOpen() }
+            .onFocusChanged {
+                focused = it.isFocused
+                // 焦点离开（打开菜单/播放器、网格刷新等）：终止未完成的按压，避免悬挂状态
+                if (!it.isFocused) {
+                    pressing = false
+                    confirmJob?.cancel()
+                }
+            }
             .onPreviewKeyEvent { event ->
-                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
                     // 第一行按「上键」→ 本页工具条；非第一行返回 false，交回 Compose 做网格内上行
-                    Key.DirectionUp -> onNavigateUp()
+                    Key.DirectionUp ->
+                        if (event.type == KeyEventType.KeyDown) onNavigateUp() else false
                     // 行首按左 / 行尾按右：吃掉按键让焦点留在原地（见 stayOn*Edge 注释）
-                    Key.DirectionLeft -> stayOnLeftEdge
-                    Key.DirectionRight -> stayOnRightEdge
-                    Key.Menu -> { onMenu(); true }
-                    Key.Delete -> { onDelete(); true }
+                    Key.DirectionLeft ->
+                        event.type == KeyEventType.KeyDown && stayOnLeftEdge
+                    Key.DirectionRight ->
+                        event.type == KeyEventType.KeyDown && stayOnRightEdge
+                    Key.Menu ->
+                        if (event.type == KeyEventType.KeyDown) { onMenu(); true } else false
+                    Key.Delete ->
+                        if (event.type == KeyEventType.KeyDown) { onDelete(); true } else false
+                    // 确定键：短按=打开，长按=菜单（与菜单键等效）。真机遥控按住 OK 键时
+                    // 只会送来一串重复 KeyDown + 最后一个 KeyUp，downTime 保持首次按下时间；
+                    // 而键盘（经模拟器）的 auto-repeat 常被拆成一串完整「按下+抬起」对，
+                    // 每对时间戳独立，eventTime-downTime 恒 ≈0 → 长按被误判为短按，且
+                    // 每次抬起都触发一次点击（=「长按变多次确定」）。因此不信任事件时间戳：
+                    // - DOWN：全部吃掉（阻止 combinedClickable 逐对触发点击），自己记录按下
+                    //   起点；后续（auto-repeat 的）DOWN 只取消待触发的短按，起点不重置
+                    // - UP：按压 ≥ 长按阈值 → 弹菜单（必须在松开时弹：按住期间弹会抢焦点，
+                    //   松开的 UP 落到菜单按钮上直接误触，真机实测踩过）；短按要等
+                    //   CONFIRM_GRACE_MS 内无后续按下（排除 auto-repeat 中间抬起）才触发打开
+                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter, Key.Spacebar -> {
+                        val now = SystemClock.uptimeMillis()
+                        when (event.type) {
+                            KeyEventType.KeyDown -> {
+                                confirmJob?.cancel()
+                                if (!pressing) {
+                                    pressing = true
+                                    pressStartMs = now
+                                }
+                                true
+                            }
+                            KeyEventType.KeyUp -> {
+                                if (!pressing) {
+                                    true // 无对应按下的孤立抬起：吃掉防误触
+                                } else {
+                                    val heldMs = now - pressStartMs
+                                    if (heldMs >= ViewConfiguration.getLongPressTimeout()) {
+                                        pressing = false
+                                        onMenu()
+                                    } else {
+                                        // 可能只是 auto-repeat 的中间抬起：过确认窗口再真正触发
+                                        confirmJob = scope.launch {
+                                            delay(CONFIRM_GRACE_MS)
+                                            pressing = false
+                                            onOpen()
+                                        }
+                                    }
+                                    true
+                                }
+                            }
+                            else -> false
+                        }
+                    }
                     else -> false
                 }
             }
+            // 触摸点击/长按：处理触摸事件（键盘事件已被上面的 onPreviewKeyEvent 拦截）
+            .combinedClickable(onClick = { onOpen() }, onLongClick = onMenu)
             .padding(8.dp),
         // 标题/副标题居中对齐（用户 2026-09-13 要求：视频、图片、其他页的文件与文件夹名都要居中）
         horizontalAlignment = Alignment.CenterHorizontally
@@ -775,6 +883,11 @@ private fun UpCard(
 ) {
     val focusRequester = remember { FocusRequester() }
     var focused by remember { mutableStateOf(false) }
+    // —— 同 MediaCard：确定键按压状态（键盘 auto-repeat 时间戳不可信）——
+    var pressing by remember { mutableStateOf(false) }
+    var pressStartMs by remember { mutableStateOf(0L) }
+    var confirmJob by remember { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
     val shape = RoundedCornerShape(12.dp)
 
     LaunchedEffect(autoFocus) {
@@ -811,10 +924,34 @@ private fun UpCard(
                 when (event.key) {
                     // 确定键必须在 KeyUp 执行：goUp() 会经「焦点安全港」把焦点同步移到工具条
                     // 「排序」按钮，若在 KeyDown 执行，同一按压的 KeyUp 会派发给已聚焦的
-                    // 「排序」（clickable 在 KeyUp 激活点击）→ 莫名弹出排序弹框（实测踩过）
-                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
-                        if (event.type == KeyEventType.KeyUp) onUp()
-                        true
+                    // 「排序」（clickable 在 KeyUp 激活点击）→ 莫名弹出排序弹框（实测踩过）。
+                    // 且键盘 auto-repeat 会被拆成多个「按下+抬起」对 → DOWN 全吃掉，短按过
+                    // 确认窗口才触发 goUp，防止按住时连跳多级目录
+                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter, Key.Spacebar -> {
+                        val now = SystemClock.uptimeMillis()
+                        when (event.type) {
+                            KeyEventType.KeyDown -> {
+                                confirmJob?.cancel()
+                                if (!pressing) {
+                                    pressing = true
+                                    pressStartMs = now
+                                }
+                                true
+                            }
+                            KeyEventType.KeyUp -> {
+                                if (!pressing) {
+                                    true
+                                } else {
+                                    pressing = false
+                                    confirmJob = scope.launch {
+                                        delay(CONFIRM_GRACE_MS)
+                                        onUp()
+                                    }
+                                }
+                                true
+                            }
+                            else -> false
+                        }
                     }
                     // 第一行按「上键」→ 本页工具条；非第一行返回 false，交回 Compose 做网格内上行
                     Key.DirectionUp ->
@@ -828,7 +965,14 @@ private fun UpCard(
                 }
             }
             .focusRequester(focusRequester)
-            .onFocusChanged { focused = it.isFocused }
+            .onFocusChanged {
+                focused = it.isFocused
+                // 焦点离开：终止未完成的按压，避免迟到的短按误触发
+                if (!it.isFocused) {
+                    pressing = false
+                    confirmJob?.cancel()
+                }
+            }
             .clickable { onUp() }
             .padding(8.dp),
         horizontalAlignment = Alignment.CenterHorizontally

@@ -46,8 +46,7 @@ import com.hpu.transview.model.MainTab
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.library.LibraryScreen
-import com.hpu.transview.ui.settings.ServerModeDialog
-import com.hpu.transview.ui.common.tvFocus
+import com.hpu.transview.ui.settings.SettingsScreen
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
 import com.hpu.transview.ui.theme.DangerRed
@@ -59,11 +58,15 @@ fun MainScreen() {
     var selected by rememberSaveable { mutableStateOf(MainTab.UPLOAD) }
     var showSettings by remember { mutableStateOf(false) }
     val tabFocusRequesters = remember { MainTab.entries.map { FocusRequester() } }
+    // 「设置」标签独立的焦点请求器（从设置内容区按上键回到它）
+    val settingsFocusRequester = remember { FocusRequester() }
 
     // 内容区「聚焦首行」请求票据：顶部标签每按一次 ↓ 自增，由内容区页面消费
     // （媒体库 → 网格第一行）。必须显式指定，不能交给 Compose 方向搜索：
     // 工具条按钮在空间上离标签更近，会把焦点吸到「排序」上（用户实测反馈）。
     var contentFocusTicket by remember { mutableIntStateOf(0) }
+    // 「设置」标签按 ↓ 进入设置页的首个左侧分组，由 SettingsScreen 消费
+    var settingsFocusTicket by remember { mutableIntStateOf(0) }
 
     // 省电模式：仅上传页可见时允许服务器运行
     LaunchedEffect(selected) {
@@ -102,25 +105,27 @@ fun MainScreen() {
             Spacer(Modifier.width(28.dp))
             MainTab.entries.forEachIndexed { index, tab ->
                 TabChip(
-                    tab = tab,
-                    selected = tab == selected,
+                    title = tab.title,
+                    // 设置页打开时不显示媒体标签的「选中」态，避免「其他」残留高亮
+                    selected = !showSettings && tab == selected,
                     onNavigateDown = { contentFocusTicket++ },
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
-                        .onFocusChanged { if (it.isFocused && tab != selected) selected = tab }
-                ) { selected = tab }
+                        .onFocusChanged { if (it.isFocused && tab != selected) { selected = tab; showSettings = false } }
+                ) { selected = tab; showSettings = false }
                 Spacer(Modifier.width(14.dp))
             }
+            //「设置」保持原有摆放：与媒体标签隔开、靠内容区右侧（仍是可聚焦的独立子菜单入口）。
+            // 功能不变：聚焦即打开设置页、焦点留在其上、按 ↓ 进入设置页选项、内容区按上键回到它。
             Spacer(Modifier.weight(1f))
-            Text(
-                "设置",
-                style = MaterialTheme.typography.titleMedium,
-                color = OnDarkDim,
+            TabChip(
+                title = "设置",
+                selected = showSettings,
+                onNavigateDown = { settingsFocusTicket++ },
                 modifier = Modifier
-                    .tvFocus()
-                    .clickable { showSettings = true }
-                    .padding(horizontal = 22.dp, vertical = 10.dp)
-            )
+                    .focusRequester(settingsFocusRequester)
+                    .onFocusChanged { if (it.isFocused && !showSettings) showSettings = true }
+            ) { showSettings = true }
             Spacer(Modifier.width(20.dp))
             ServerStatusBadge()
         }
@@ -134,7 +139,16 @@ fun MainScreen() {
                 .weight(1f)
                 .fillMaxWidth()
         ) {
-            when (selected) {
+            if (showSettings) {
+                // 设置子页面占据内容区（顶部导航栏保持不变）。
+                // 返回键经 SettingsScreen 内的 BackHandler 先退出设置页，再回顶部导航栏；
+                // focusTicket：设置标签按 ↓ 时进入首个分组；onFocusTabs：内容区按上键回设置标签。
+                SettingsScreen(
+                    onExit = { showSettings = false; focusSelectedTab() },
+                    focusTicket = settingsFocusTicket,
+                    onFocusTabs = { runCatching { settingsFocusRequester.requestFocus() } }
+                )
+            } else when (selected) {
                 MainTab.UPLOAD -> UploadScreen(
                     onFocusTabs = focusSelectedTab,
                     focusListTicket = contentFocusTicket
@@ -144,17 +158,13 @@ fun MainScreen() {
                 MainTab.OTHER -> LibraryScreen(Category.OTHER, onFocusTabs = focusSelectedTab, focusGridTicket = contentFocusTicket)
             }
         }
-
-        if (showSettings) {
-            ServerModeDialog(onDismiss = { showSettings = false })
-        }
     }
 }
 
-/** 导航标签：聚焦即选中（遥控器左右切换） */
+/** 导航标签：聚焦即选中（遥控器左右切换，「设置」也作为标签之一） */
 @Composable
 private fun TabChip(
-    tab: MainTab,
+    title: String,
     selected: Boolean,
     onNavigateDown: () -> Unit,
     modifier: Modifier = Modifier,
@@ -190,7 +200,7 @@ private fun TabChip(
             .padding(horizontal = 30.dp, vertical = 10.dp)
     ) {
         Text(
-            tab.title,
+            title,
             style = MaterialTheme.typography.titleMedium,
             color = if (focused) MaterialTheme.colorScheme.onPrimary
             else if (selected) MaterialTheme.colorScheme.primary

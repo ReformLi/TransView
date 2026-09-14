@@ -111,7 +111,10 @@ com.hpu.transview
 **焦点与按键（v1.3 重点）**
 - 卡片聚焦：`scale(1.1f)` + 2dp 主色边框 + `zIndex(1f)` 抬升。
 - 按键处理 `.onPreviewKeyEvent` **必须放在 `focusRequester`/`clickable` 之前**（放后面会吞掉确定键，导致卡片打不开）。
-- 确定键（`clickable`）→ 直达动作（文件夹进入 / 视频播放 / 图片查看 / 其他系统打开）；菜单键 → 弹「进入/播放、删除、取消」三选项；删除键 → 直接弹二次确认。
+- 确定键（`combinedClickable`）→ 直达动作（文件夹进入 / 视频播放 / 图片查看 / 其他系统打开）；**菜单键或长按确定键** → 弹「进入/播放、删除、取消」三选项；删除键 → 直接弹二次确认。
+  - **长按确定的实现（实测坑 ×2）**：① `combinedClickable` 的 `onLongClick` 对遥控器确定键长按**不生效**（foundation 未处理 FLAG_LONG_PRESS 按键事件，模拟器实测无反应；触摸长按仍有效）。② 不能在**按住期间**（收到 FLAG_LONG_PRESS KeyDown 时）就弹菜单——Dialog 弹出会抢走焦点，手一松的 KeyUp 落到菜单主按钮上直接误触「进入/播放」，表现为菜单闪一下文件就被打开（真机实测踩过；模拟器 `input keyevent --longpress` 注入按下/松开间隔极短，KeyUp 仍被卡片消费，测不出此问题）。**最终方案**：按住期间一律放行，在 `MediaCard.onPreviewKeyEvent` 的 **KeyUp** 上按按压时长（`eventTime - downTime`，事件序列全程不变，真机遥控可靠）判定，≥ `ViewConfiguration.getLongPressTimeout()` → 弹菜单并消费该 KeyUp（阻止 `combinedClickable` 触发「打开」）；短按放行 → 正常点击。菜单在**松开瞬间**弹出，无时序竞争。
+- **进入子目录焦点直接落第一个条目（v1.3，`FOCUS_FIRST`）**：曾设计为落「返回上级」卡片（`FOCUS_UP`），但 UpCard 抢焦点与网格首项渲染存在时序竞争，用户实测看到「第一个文件先亮一下再跳回上级」的可见两段跳，多轮修复（帧门控重试、`hadFocus` 先捕获）仍无法根治；最终按用户意见改为**进入后直接聚焦第一个条目**（`pendingFocusPath = FOCUS_FIRST`，只命中 `index == 0` 的 MediaCard），仅一次落点、无竞争。空目录（网格只剩 UpCard）时由 `LaunchedEffect` 兜底改投 `FOCUS_UP`。「返回上级」卡片仍可经 ← 键到达，行为不变。
+- **目录列表异步加载的陈旧过滤（实测踩过）**：`dirEntries` 经 `LaunchedEffect + Dispatchers.IO` 异步加载，切目录后的**第一帧**里它还是旧目录的子文件夹列表；组合时按 `it.file.parentFile == currentDir` **同步过滤**掉陈旧项，否则网格会闪一帧旧目录内容，且 `FOCUS_FIRST` 会错误命中即将被移出组合的旧卡片（焦点随之失控回退）。配套用 `dirEntriesStamp` 记录列表归属目录：`LaunchedEffect` 的 key 是 `entries`（List 的 equals 是**结构比较**，内容不变不重跑），目录列表加载完成必须靠 stamp 变化触发重跑，否则 `FOCUS_FIRST` 的空目录判断会卡死。
 - 从文件夹返回上级：`pendingFocusPath` 记录即将离开的文件夹路径 → `gridState.scrollToItem` 滚动定位 → 卡片自身 `FocusRequester` 请求焦点，实现「返回后焦点还原到刚才进入的卡片」。
 - **从播放器/查看器返回定位到最后浏览项（v1.3）**：打开图片/视频改走 `rememberLauncherForActivityResult(StartActivityForResult)`；两个 Activity 在**切图/切集的瞬间**（`switchImage`/`selectImage`/`skipTo`）`setResult` 当前文件路径。**坑**：不能拖到 `onPause` 再 `setResult`——系统在 `finish()` 执行时就按当时的 result 封装返回值，`onPause` 里设置会拿到 null（实测踩过）。返回后媒体库把 `pendingFocusPath` 指向该路径，复用既有滚动+聚焦机制。覆盖图片查看器内切图、视频连播自动下一集两种场景。
 - 网格内按返回键先「返回上一级」（`BackHandler(enabled = !atRoot)`）；到分类根目录时不拦截，交由 MainScreen 回到顶部导航栏。
