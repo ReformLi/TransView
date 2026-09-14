@@ -14,7 +14,6 @@ import com.hpu.transview.util.Constants
  * 接线状态（2026-09-14）：**全部已接入运行时**。
  * - 服务器与网络：服务器端口（`ServerController.setPort`，停旧起新）、开机自启（`BootReceiver`）、
  *   设备名称（`TransHttpServer` 渲染上传网页时注入）；
- * - 上传与解压：自动解压压缩包 / 保留原压缩包（`TransHttpServer` → `ZipExtractor`）；
  * - 播放设置：续播提示 / 自动连播 / 默认倍速 / 默认画面比例（`PlayerActivity.onCreate` 读取，
  *   打开视频即生效）；
  * - 界面设置：网格列数 / 默认排序（`LibraryScreen` 进入时读取，返回媒体库即生效）。
@@ -59,26 +58,6 @@ object SettingsStore {
     var deviceName: String
         get() = prefs()?.getString("device_name", DEFAULT_DEVICE_NAME) ?: DEFAULT_DEVICE_NAME
         set(v) { prefs()?.edit()?.putString("device_name", v)?.apply() }
-
-    // ——— 上传与解压 ———
-
-    /**
-     * 自动解压上传的压缩包（默认开）。已接入 TransHttpServer：
-     * 视频 / 图片分类上传 .zip 时自动解压、只保留该分类的文件并按包内结构归位；
-     * 关闭后 .zip 按普通文件落进所选分类目录（不自动解压）。
-     */
-    var autoUnzipZip: Boolean
-        get() = prefs()?.getBoolean("auto_unzip_zip", true) ?: true
-        set(v) { prefs()?.edit()?.putBoolean("auto_unzip_zip", v)?.apply() }
-
-    /**
-     * 解压成功后保留原压缩包（默认关 = 解压后删除）。已接入 ZipExtractor：
-     * 开启时原包移入 /sdcard/TransView/Downloads（「其他」分类），关闭时解压成功即删除原包。
-     * 注意：解压失败 / 空间不足 / 没找到目标文件时，原包**一律保留**到 Downloads，不受本开关影响。
-     */
-    var keepOriginalZip: Boolean
-        get() = prefs()?.getBoolean("keep_original_zip", false) ?: false
-        set(v) { prefs()?.edit()?.putBoolean("keep_original_zip", v)?.apply() }
 
     // ——— 播放设置 ———
 

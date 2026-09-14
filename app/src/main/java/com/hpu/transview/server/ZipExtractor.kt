@@ -3,7 +3,6 @@ package com.hpu.transview.server
 import android.content.Context
 import android.os.Build
 import com.hpu.transview.model.Category
-import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.IMAGE_EXTS
@@ -25,7 +24,8 @@ import java.util.zip.ZipFile
  * 4. 流式解压命中的条目到 `.temp_unzip/u<ns>/files/`（保持压缩包内的目录结构），
  *    非本分类的条目**直接跳过不落盘**；解压途中累计字节数超预算立即中止（防伪造元数据的膨胀包）；
  * 5. 命中文件按 [UploadStorage.save] 搬进分类目录（同名自动加 (1)(2) 后缀、不覆盖）；
- * 6. 收尾清空工作区；若「保留原压缩包」开启，则先把原包搬进 Downloads 再清。
+ * 6. 收尾清空工作区；解压成功即删原包（避免解压出的文件与原包双份占空间），
+ *    失败路径见下方兜底原则。
  *
  * 兜底原则：**任何失败路径都不丢用户的压缩包** —— 一个目标文件都没找到、空间不足、
  * ZIP 损坏、归位失败，统一把原包移入 `/sdcard/TransView/Downloads/` 并返回提示文案。
@@ -43,7 +43,7 @@ class ZipExtractor(private val context: Context) {
     /**
      * @param kind        结果类别
      * @param movedFiles  已归位到分类目录的文件（供媒体索引入库）
-     * @param keptZipPath 原压缩包被保留时的最终路径；已按设置删除时为 null
+     * @param keptZipPath 原压缩包被保留时的最终路径；解压成功（原包已删除）时为 null
      * @param message     面向用户的提示（网页端 toast + 电视端 Toast），必定非空
      */
     data class Outcome(
@@ -150,12 +150,11 @@ class ZipExtractor(private val context: Context) {
                 )
             }
 
-            // ——— 4. 收尾：原包按设置保留或删除（保留则放入 Downloads） ———
-            val kept = if (SettingsStore.keepOriginalZip) keepArchive(archive) else null
-            val tail = if (kept != null) "，原压缩包已保留在「其他」分类" else "，原压缩包已删除"
+            // ——— 4. 收尾：解压成功即删除原包（固定行为，避免解压出的文件与原包双份占空间；
+            //     失败路径一律保留原包，见上方各 return） ———
             return Outcome(
-                Kind.EXTRACTED, moved, kept,
-                "已从压缩包解压 ${moved.size} 个${categoryLabel(category)}文件$tail"
+                Kind.EXTRACTED, moved, null,
+                "已从压缩包解压 ${moved.size} 个${categoryLabel(category)}文件，原压缩包已删除"
             )
         } catch (e: Exception) {
             val kept = runCatching { keepArchive(archive) }.getOrNull()

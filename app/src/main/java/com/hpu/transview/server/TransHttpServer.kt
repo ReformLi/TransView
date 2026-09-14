@@ -45,8 +45,8 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
  * - 每个上传请求在 upload_records 表建立记录（上传中），经计数流实时回写百分比进度；
  * - 落盘成功/失败后更新记录状态，并将新文件立即写入 media_items 索引（视频后台提取时长）；
  * - UploadBus 仅保留为事件总线（媒体库自动刷新 / 空闲计时），不再承载记录展示。
- * - **压缩包自动解压**：视频 / 图片分类上传 `.zip` 且「设置 → 上传与解压 → 自动解压压缩包」开启时，
- *   改由 [ZipExtractor] 处理（暂存 → 空间校验 → 流式解压 → 按分类归位），解压结果经 JSON
+ * - **压缩包自动解压**：视频 / 图片分类上传 `.zip` 即改由 [ZipExtractor] 处理（固定行为，无开关——
+ *   分类本身就是意图表达），暂存 → 空间校验 → 流式解压 → 按分类归位，解压结果经 JSON
  *   `message` 回给网页端并同时 Toast 到电视端；「其他」分类的 `.zip` 仍原样存入 Downloads。
  *
  * @param token 会话内固定的访问码（6 位，已是大写）。服务器实例持有的是构造时的那一份；
@@ -265,11 +265,11 @@ class TransHttpServer(
         val multipartName = session.parameters["file"]?.firstOrNull()?.takeIf { it.isNotBlank() }
         val finalName = multipartName ?: displayName
 
-        // 压缩包自动解压：视频 / 图片分类上传 .zip 且设置开启时，改走「暂存 → 解压 → 按分类归位」，
-        // 不把 .zip 原样落进分类目录（「其他」分类的 .zip 仍然直接存 Downloads，不解压）
+        // 压缩包自动解压（固定行为，无设置开关）：视频 / 图片分类上传 .zip 即走
+        // 「暂存 → 解压 → 按分类归位」，不把 .zip 原样落进分类目录——分类本身就是意图表达，
+        // 想保留 zip 原样就选「其他」分类（「其他」的 .zip 仍然直接存 Downloads，不解压）
         if (category != Category.OTHER &&
-            finalName.endsWith(".zip", ignoreCase = true) &&
-            SettingsStore.autoUnzipZip
+            finalName.endsWith(".zip", ignoreCase = true)
         ) {
             return receiveZipAndExtract(tempFile, recordId, busId, finalName, category)
         }

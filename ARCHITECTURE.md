@@ -1,7 +1,8 @@
 # TransView 传视TV — 架构与实现说明
 
-> 版本：v1.8.1　日期：2026-09-14
+> 版本：v1.9　日期：2026-09-14
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.9 变更：**移除「上传与解压」设置组**——`SettingGroup.UPLOAD` 枚举、设置页 UI、`SettingsStore.autoUnzipZip/keepOriginalZip` 两键全部删除；压缩包解压改为固定行为：视频/图片分类 `.zip` 恒解压（`TransHttpServer` 触发条件去掉开关）、解压成功即删原包（`ZipExtractor` 第 4 步固定，失败路径仍一律保留）；设置页回归五分组（§3.9 / §3.14）。
 > v1.8.1 变更：**死数据治理**——① 僵尸「上传中」记录：进程被杀后 DB 残留的 RUNNING 记录永久卡在「上传中 xx%」，对账新增 0.5 步 `reapZombieRunning()` 统一标失败（仅在服务器未运行或本进程无在途上传时执行，防误伤活记录，§3.8）；② upload_records 表无限增长：insert 后自动裁剪只留最近 500 条（UI 最多显示 200，200 名之外为纯死数据，§3.8）；③ 删除无调用方的死 DAO 方法（MediaItemDao.getById/count、PlaybackHistoryDao.getPositionByPath）；④ 盘点报告：`addedTime`/`updatedTime` 为无读取方的预留字段（保留，成本可忽略）、`UploadStateCode.WAITING` 为无写入方的防御状态（保留 UI 映射）、`fallbackToDestructiveMigration` 发布 v3 起必须换正式迁移。
 > v1.8 变更：**需求级修正（按主流习惯）**——① 访问码**会话内固定**：`tryStart` 首次生成、进程内停启/改端口沿用、进程重启才轮换（原「每次启停轮换」会让熄屏/播放/休眠恢复反复把手机端打回输码界面）（§3.15）；② **传输不中断覆盖全部停服路径**：`apply(false)` 遇在途上传跳过停服，`UploadBus.records` 收集器在最后一个上传结束时补评估归位（原仅空闲休眠顺延）（§3.7）；③ 性能指标限定为增量对账 ≤5 秒、首扫视频时长提取为一次性成本（README §4.1）。
 > v1.7.2 变更：**健壮性修复**——上传落盘 `Files.move`（API 26+）改 `renameTo`/`copyTo`（minSdk 21 兼容，§3.1 第 4 步）；对账清理解压工作区跳过最近 10 分钟仍在写入的目录（防误删在途解压，§3.6 第 0 步）；上传进度回写改 `updateProgressIfRunning` 条件更新（迟到进度不覆盖最终状态）；播放器播完清史后挂 `finishedPaths` 守卫拦截 100% 进度复活；UploadBus 只裁剪已结束记录（RUNNING 全保留，防并发上传被休眠误伤）；网页端队列入队时快照分类。
@@ -71,8 +72,8 @@ com.hpu.transview
     ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码带访问码 + 访问码色块 + 地址 + 状态）
     │                           + 右侧可滚动上传记录列表；二维码尺寸随可用空间自适应
     ├── library/LibraryScreen.kt 多列网格卡片（列数由设置决定，4/5/6）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
-    ├── settings/SettingsScreen.kt 设置子页面（v1.4：六分组左组右详情——服务器与网络 / 上传与解压 /
-    │                           播放设置 / 界面设置 / 存储与数据 / 关于，**全部已接通**；
+    ├── settings/SettingsScreen.kt 设置子页面（v1.4 五分组左组右详情；v1.9 移除「上传与解压」组——
+    │                           服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于，**全部已接通**；
     │                           三类弹框关闭后焦点回原行）
     ├── settings/SettingsStore.kt 设置偏好持久化（SharedPreferences object；端口/自启/设备名/续播提示/
     │                           连播/倍速/画面比例/列数/默认排序，均含默认值）
@@ -285,7 +286,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
-**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 上传与解压 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
+**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
 设置项**已全部接通**（v1.4），因此 `SettingRow` 的灰色「待实现」徽标（原 `pending` 参数）已随最后两项接线一并移除。
 
 **焦点规范（v1.4 落地）**：
@@ -388,8 +389,8 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 ### 3.14 压缩包自动解压（v1.6，ZipExtractor）
 
-**触发条件（三者同时成立）**：分类是视频/图片 + 文件后缀 `.zip` + 设置「上传与解压 → 自动解压压缩包」开启。
-任一不满足 → `.zip` 按普通文件落进所选分类目录（「其他」分类永远不解压，直接存 Downloads）。
+**触发条件（v1.9 起为两者同时成立，无设置开关）**：分类是视频/图片 + 文件后缀 `.zip`——
+分类本身就是意图表达（想保留 zip 原样就选「其他」分类）。任一不满足 → `.zip` 按普通文件落进所选分类目录（「其他」分类永远不解压，直接存 Downloads）。
 
 **流水线**（`server/ZipExtractor.process(temp, name, category)`，`TransHttpServer.receiveZipAndExtract` 以
 `runBlocking(Dispatchers.IO)` 调起，不阻塞 UI；上传记录记为「成功」——包已安全收下，解压是后处理）：
@@ -401,7 +402,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
    非本分类条目跳过不落盘；累计写入超可用空间立即 `BudgetExceeded` 中止（防伪造元数据的膨胀包）；
 5. **归位**：`UploadStorage.save(file, name, 包内相对目录, category)` —— 同名加 `(1)(2)`、同名文件夹合并、不覆盖，
    随后 `indexMediaAsync` 写入媒体索引；
-6. **收尾**：`workspace.deleteRecursively()`；保留开关开启时先把原包 `moveInto(Downloads)` 再删工作区。
+6. **收尾**：`workspace.deleteRecursively()`；解压成功即删原包（固定行为——解压出的文件与原包内容重复，删包避免双份占空间）。
 
 **为什么用 `ZipFile` 而不是题面要求的 `ZipInputStream`**：① 预估体积必须读中央目录里记录的未压缩大小，
 流式读取要把整包解一遍才算得出来；② 中文包名兼容 —— Windows 资源管理器压缩的包用 GBK 编码条目名且不置
@@ -413,15 +414,13 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 - **Zip Slip**：条目名走 `UploadStorage.sanitizeRelativePath`（剔除 `..` / 绝对路径 / 隐藏段 / 盘符）+ 落点
   `canonicalPath` 前缀校验，越界条目丢弃。实测 `abs.zip`（`/abs_evil.mp4`）与 `deep.zip`（`good/x/../../../deep_evil.mp4`）
   被 Android `ZipFile` 在打开阶段直接拒绝，沙盒内外均无越界文件产生；即便被放行也会被上面的清洗拦住。
-- **失败必保留原包**（不受保留开关影响）：未命中目标文件 / 空间不足 / 包损坏 / 归位失败 →
+- **失败必保留原包**：未命中目标文件 / 空间不足 / 包损坏 / 归位失败 →
   原包移入 `Downloads` + 中文提示。结果经上传响应 JSON 的 `unzip` / `extracted` / `message` 三个字段回给网页端
   （网页 toast），同时 `Handler(Looper.getMainLooper())` 在电视端弹 Toast。
 - **残留清理**：工作区名以 `.` 开头 → `listMediaFilesRecursively` / `listEntries` 天然跳过，解压中途不污染媒体库；
   `SyncManager.sync()` 第 0 步 `FileUtils.purgeDirectory(FileLocations.tempUnzipDir)` 兜底清空（App 启动与手动刷新都会走到）。
-- **保留原包也要立即入库**：`Outcome.keptZipPath` 由服务器侧一并 `indexMediaAsync`，否则「其他」页要等下次对账才看得到
+- **保留的原包也要立即入库**：失败路径 `Outcome.keptZipPath` 由服务器侧一并 `indexMediaAsync`，否则「其他」页要等下次对账才看得到
   （媒体库由 Room 驱动，不读目录）。
-
-**设置项（`SettingGroup.UPLOAD`「上传与解压」）**：`autoUnzipZip`（默认开）、`keepOriginalZip`（默认关 = 解压成功后删包）。
 
 ### 3.15 上传访问码（最小认证，v1.7）
 
