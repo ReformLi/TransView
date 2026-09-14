@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
                                     Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                     Uri.parse("package:$packageName")
                                 ),
-                                "请手动到 设置 → 应用 → 传视TV 开启「所有文件访问」"
+                                "请手动到 设置 → 应用 → 传视 开启「所有文件访问」"
                             )
                         }
                     } else {

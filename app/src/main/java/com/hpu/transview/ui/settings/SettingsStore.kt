@@ -52,7 +52,7 @@ object SettingsStore {
         set(v) { prefs()?.edit()?.putBoolean("boot_autostart", v)?.apply() }
 
     /**
-     * 设备名称（默认「传视TV」）。已接入手机上传网页：
+     * 设备名称（默认「传视」）。已接入手机上传网页：
      * TransHttpServer 渲染 index.html 时注入，作为手机端页面标题与页头标题。
      */
     var deviceName: String

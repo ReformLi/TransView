@@ -28,7 +28,7 @@ fun PermissionScreen(onRequestPermission: () -> Unit) {
         Text("需要存储权限", style = MaterialTheme.typography.headlineMedium)
         Spacer(Modifier.height(16.dp))
         Text(
-            "传视TV 需要访问「电影 / 图片 / 下载」目录，\n" +
+            "传视(TransView) 需要访问「电影 / 图片 / 下载」目录，\n" +
                 "用于保存手机上传的文件并建立媒体库。\n\n" +
                 "点击下方按钮，在系统设置中授权\n「允许管理所有文件」后返回即可。",
             style = MaterialTheme.typography.bodyLarge,

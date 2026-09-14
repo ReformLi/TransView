@@ -84,6 +84,8 @@ private data class ChoiceState(
     val title: String,
     val options: List<String>,
     val selectedIndex: Int,
+    /** 可选的逐项说明：长度与 options 一致时，每项下方渲染一行灰色小字（如保活策略模式说明） */
+    val descriptions: List<String>? = null,
     val onPick: (Int) -> Unit
 )
 
@@ -118,7 +120,7 @@ private val DEVICE_NAMES = listOf(
 private val SPEED_OPTIONS = listOf("1.0x", "1.25x", "1.5x")
 
 private const val MIT_LICENSE = "MIT License\n\n" +
-    "Copyright (c) 2026 TransView 传视TV\n\n" +
+    "Copyright (c) 2026 TransView 传视(TransView)\n\n" +
     "Permission is hereby granted, free of charge, to any person obtaining a copy " +
     "of this software and associated documentation files (the \"Software\"), to deal " +
     "in the Software without restriction, including without limitation the rights " +
@@ -542,8 +544,8 @@ fun SettingsScreen(
                                     "保活策略",
                                     ServerMode.entries.map { it.label },
                                     ServerMode.entries.indexOf(mode),
-                                    { i -> ServerController.setMode(ServerMode.entries[i]) }
-                                ))
+                                    descriptions = ServerMode.entries.map { it.desc }
+                                ) { i -> ServerController.setMode(ServerMode.entries[i]) })
                             }
                             SettingRow(
                                 "${g.title}:1", "服务器端口",
@@ -828,6 +830,17 @@ fun SettingsScreen(
                         ) {
                             choiceState = null
                             cs.onPick(i)
+                        }
+                        // 逐项说明（灰色小字，对齐选项文字起点）：仅当调用方提供了 descriptions 时渲染
+                        cs.descriptions?.getOrNull(i)?.let { desc ->
+                            Text(
+                                desc,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnDarkDim,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 16.dp, end = 4.dp, bottom = 6.dp)
+                            )
                         }
                         Spacer(Modifier.height(4.dp))
                     }
