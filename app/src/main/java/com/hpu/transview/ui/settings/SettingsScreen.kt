@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -97,8 +96,15 @@ private data class ConfirmState(
     val onConfirm: () -> Unit
 )
 
-/** 纯展示弹框数据（版本信息 / 开源许可 / 致谢名单） */
-private data class InfoState(val title: String, val body: String)
+/**
+ * 「关于」页声明文案。
+ *
+ * 「关于」不再用弹框展示（内容较长、弹框在 720p 下要滚动且遮住页面），改为在设置页右侧
+ * 详情区**内联**成若干可聚焦条目，随焦点上下移动自动滚动，见 [SettingsScreen] 的 AboutEntry。
+ */
+private const val DECLARATION =
+    "本项目为AI工具开发，仅供学习、交流与个人使用，请勿用于商业倒卖。" +
+        "播放及上传的媒体内容版权归各自版权方所有。"
 
 /** 常见可选端口（电视遥控器无键盘，用预设免输入） */
 private val PORT_OPTIONS = listOf("8080", "8081", "8088", "8089", "9000")
@@ -155,7 +161,9 @@ private fun speedLabel(speed: Float): String = when (speed) {
  * 焦点规范（与媒体库/上传页一致，电视端）：
  * - 页面打开（设置标签聚焦）时焦点保持在顶部「设置」标签上；按 ↓ 才进入左侧第一个分组。
  * - 左侧分组上下键切换分组；右键进入右侧详情列表；首分组按上回到「设置」标签。
- * - 右侧详情左键回到左侧当前分组；每组首行按上回到「设置」标签；点击某行弹框，关闭弹框焦点回到刚才那一行。
+ * - 右侧详情左键回到左侧当前分组；每组首行按上回到「设置」标签；设置行点击后弹框，关闭弹框焦点回到刚才那一行。
+ * - 「关于」组特殊：信息**直接内联**在详情区（不再弹框），每条信息都是一个可聚焦条目，
+ *   按确定/右键都没有动作；内容超出可视区时随焦点上下移动自动滚动。
  * - 返回键先退出设置页，回到主界面。
  */
 @Composable
@@ -185,21 +193,27 @@ fun SettingsScreen(
     var defaultSpeedValue by remember { mutableStateOf(SettingsStore.defaultSpeed) }
     var defaultAspectValue by remember { mutableStateOf(SettingsStore.defaultAspect) }
 
+    // ——— 「界面设置」两项（已接线）的界面显示值 ———
+    var gridColumnsValue by remember { mutableIntStateOf(SettingsStore.gridColumns) }
+    var defaultSortValue by remember { mutableStateOf(SettingsStore.defaultSort) }
+
     var selectedGroupIndex by remember { mutableIntStateOf(0) }
     val groupFocusers = remember { List(SettingGroup.entries.size) { FocusRequester() } }
     val rowFocusMap = remember { mutableStateMapOf<String, FocusRequester>() }
     // 各行当前是否获得焦点，用于聚焦重试时确认落焦成功（见 detailTicket / dialog 关闭的 retry）
     val rowFocused = remember { mutableStateMapOf<String, Boolean>() }
     var detailTicket by remember { mutableIntStateOf(0) }
+    // 「关于」页信息较长，用独立滚动状态：内容超出可视区时随焦点上下移动自动滚动
+    // （可聚焦节点在滚动容器内会带上 bring-into-view 行为）。
+    val aboutScrollState = rememberScrollState()
 
-    // 三个弹框状态（同一时刻最多开一个）
+    // 两个弹框状态（同一时刻最多开一个）
     var choiceState by remember { mutableStateOf<ChoiceState?>(null) }
     var confirmState by remember { mutableStateOf<ConfirmState?>(null) }
-    var infoState by remember { mutableStateOf<InfoState?>(null) }
 
     // 弹框关闭后把焦点还给打开它的那行
     var pendingFocusReturn by remember { mutableStateOf<String?>(null) }
-    val dialogOpen = choiceState != null || confirmState != null || infoState != null
+    val dialogOpen = choiceState != null || confirmState != null
     var prevDialogOpen by remember { mutableStateOf(false) }
     LaunchedEffect(dialogOpen) {
         if (prevDialogOpen && !dialogOpen && pendingFocusReturn != null) {
@@ -259,7 +273,6 @@ fun SettingsScreen(
 
     val openChoice: (String, ChoiceState) -> Unit = { key, s -> pendingFocusReturn = key; choiceState = s }
     val openConfirm: (String, ConfirmState) -> Unit = { key, s -> pendingFocusReturn = key; confirmState = s }
-    val openInfo: (String, InfoState) -> Unit = { key, s -> pendingFocusReturn = key; infoState = s }
 
     val pickIndex = { list: List<String>, current: String ->
         val i = list.indexOf(current)
@@ -325,7 +338,6 @@ fun SettingsScreen(
         focusKey: String,
         label: String,
         value: String,
-        pending: Boolean = false,
         onClick: () -> Unit
     ) {
         val requester = remember(focusKey) { FocusRequester() }
@@ -335,8 +347,16 @@ fun SettingsScreen(
         Box(
             Modifier
                 .fillMaxWidth()
+                // 左右留白，理由同 AboutEntry：条目与卡片同宽时，tvFocus 焦点描边的左右两条会被
+                // 卡片（带圆角的 Surface）裁掉，只剩上下两条。留白 12dp + 内容内边距 10dp = 22dp，
+                // 与原先的内容缩进完全一致（文本位置不动），只是描边不再贴着卡片边缘。
+                .padding(horizontal = 12.dp)
                 .focusRequester(requester)
                 .onFocusChanged { rowFocused[focusKey] = it.isFocused }
+                // tvFocus 必须挂在可聚焦修饰符（clickable）的**上游**：它内部的 onFocusChanged
+                // 只能观察到「下游」的焦点节点，写在 clickable 之后会观察不到 → 焦点高亮整行不显示
+                // （实测：设置页所有设置行按方向键移动时看不到任何高亮）。
+                .tvFocus()
                 // clickable 必须在 onPreviewKeyEvent 之前：与媒体库网格项一致，
                 // clickable 会让元素可聚焦并处理 Enter/Center 激活，onPreviewKeyEvent
                 // 放在它之后可以拦截方向键（Left/Right/Up）而不影响点击激活
@@ -354,8 +374,7 @@ fun SettingsScreen(
                         else -> false
                     }
                 }
-                .tvFocus()
-                .padding(horizontal = 22.dp, vertical = 16.dp)
+                .padding(horizontal = 10.dp, vertical = 16.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -364,17 +383,88 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(Modifier.weight(1f))
-                if (pending) {
-                    Text("待实现", style = MaterialTheme.typography.bodySmall, color = OnDarkDim)
-                    Spacer(Modifier.width(10.dp))
-                }
                 Text(
                     value,
                     style = MaterialTheme.typography.bodyLarge,
-                    color = if (pending) OnDarkDim else MaterialTheme.colorScheme.primary
+                    color = MaterialTheme.colorScheme.primary
                 )
                 Spacer(Modifier.width(8.dp))
                 Text("▸", style = MaterialTheme.typography.bodyLarge, color = OnDarkDim)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+    }
+
+    /**
+     * 「关于」页的信息条目：**可聚焦，但没有动作**（遥控器确定 / 右键都不会弹框）。
+     *
+     * 内容较长时（开源许可全文 / 致谢名单），整块作为一个焦点单元，随焦点上下移动自动
+     * 滚动（可聚焦节点在 verticalScroll 容器内自带 bring-into-view）。
+     *
+     * 焦点边界与 [SettingRow] 保持一致：左键回左侧分组、首条上键回顶部「设置」标签、
+     * 右键吃掉（否则会环绕到右上角「设置」）；末条下键也吃掉（否则环绕到顶部标签并切页）。
+     */
+    @Composable
+    fun AboutEntry(
+        focusKey: String,
+        title: String,
+        value: String? = null,
+        body: String? = null,
+        isLast: Boolean = false
+    ) {
+        val requester = remember(focusKey) { FocusRequester() }
+        rowFocusMap[focusKey] = requester
+        val topEdge = focusKey.endsWith(":0")
+        Box(
+            Modifier
+                .fillMaxWidth()
+                // 左右留白：tvFocus 的焦点描边画在条目边界上，而外层卡片（带圆角的 Surface）会裁剪
+                // 超出卡片的部分 —— 条目与卡片同宽时只能看到上下两条线，左右两条被裁掉。
+                // 留出 12dp 后四边都可见（tvFocus 的 scale(1.03) 放大只占去约 8dp，仍在留白内）。
+                .padding(horizontal = 12.dp)
+                .focusRequester(requester)
+                .onFocusChanged { rowFocused[focusKey] = it.isFocused }
+                // tvFocus 放在 focusable 之前（上游），理由同 SettingRow：其 onFocusChanged
+                // 只观察下游焦点节点，写在下游会导致条目聚焦时没有任何视觉反馈。
+                .tvFocus()
+                .focusable()
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.DirectionLeft -> { backToGroups(); true }
+                        Key.DirectionRight -> true
+                        Key.DirectionUp -> { if (topEdge) onFocusTabs(); topEdge }
+                        Key.DirectionDown -> isLast
+                        else -> false
+                    }
+                }
+                // 内容内边距：与上面 12dp 留白合计 24dp，和设置行（SettingRow）的内容缩进基本对齐
+                .padding(horizontal = 12.dp, vertical = 16.dp)
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    if (value != null) {
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            value,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                if (body != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        body,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
         }
         Spacer(Modifier.height(6.dp))
@@ -407,14 +497,18 @@ fun SettingsScreen(
         Spacer(Modifier.width(28.dp))
 
         // 右侧详情
+        val group = SettingGroup.entries[selectedGroupIndex]
+        // 「关于」内容较长：内容靠上排列、卡片撑满剩余高度并在卡片内滚动（焦点下移自动滚动）；
+        // 其余分组内容少，维持垂直居中。
+        val aboutMode = group == SettingGroup.ABOUT
         Column(
             Modifier
                 .weight(1f)
                 .fillMaxHeight(),
-            verticalArrangement = Arrangement.Center
+            verticalArrangement = if (aboutMode) Arrangement.Top else Arrangement.Center
         ) {
             Text(
-                SettingGroup.entries[selectedGroupIndex].title,
+                group.title,
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onBackground
             )
@@ -422,10 +516,17 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = MaterialTheme.colorScheme.surface,
-                modifier = Modifier.fillMaxWidth()
+                modifier = if (aboutMode) Modifier.fillMaxWidth().weight(1f)
+                else Modifier.fillMaxWidth()
             ) {
-                Column(Modifier.padding(vertical = 8.dp)) {
-                    val g = SettingGroup.entries[selectedGroupIndex]
+                Column(
+                    Modifier
+                        .then(
+                            if (aboutMode) Modifier.verticalScroll(aboutScrollState) else Modifier
+                        )
+                        .padding(vertical = 8.dp)
+                ) {
+                    val g = group
                     when (g) {
                         SettingGroup.SERVER -> {
                             SettingRow("${g.title}:0", "保活策略", mode.label) {
@@ -597,25 +698,41 @@ fun SettingsScreen(
                         SettingGroup.UI -> {
                             SettingRow(
                                 "${g.title}:0", "网格列数",
-                                "${SettingsStore.gridColumns} 列", pending = true
+                                "$gridColumnsValue 列"
                             ) {
                                 openChoice("${g.title}:0", ChoiceState(
-                                    "网格列数（待实现）",
+                                    "网格列数",
                                     listOf("4 列", "5 列", "6 列"),
-                                    SettingsStore.gridColumns - 4,
-                                    { i -> SettingsStore.gridColumns = i + 4 }
-                                ))
+                                    gridColumnsValue - 4
+                                ) { i ->
+                                    val cols = i + 4
+                                    gridColumnsValue = cols
+                                    SettingsStore.gridColumns = cols
+                                    Toast.makeText(
+                                        context,
+                                        "媒体库网格已改为 $cols 列，返回媒体库即生效",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                             SettingRow(
                                 "${g.title}:1", "默认排序方式",
-                                SettingsStore.defaultSort.label, pending = true
+                                defaultSortValue.label
                             ) {
                                 openChoice("${g.title}:1", ChoiceState(
-                                    "默认排序方式（待实现）",
+                                    "默认排序方式",
                                     SortOrder.entries.map { it.label },
-                                    SortOrder.entries.indexOf(SettingsStore.defaultSort),
-                                    { i -> SettingsStore.defaultSort = SortOrder.entries[i] }
-                                ))
+                                    SortOrder.entries.indexOf(defaultSortValue)
+                                ) { i ->
+                                    val order = SortOrder.entries[i]
+                                    defaultSortValue = order
+                                    SettingsStore.defaultSort = order
+                                    Toast.makeText(
+                                        context,
+                                        "默认排序已设为「${order.label}」，返回媒体库即生效",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
                         }
 
@@ -623,7 +740,6 @@ fun SettingsScreen(
                             SettingRow(
                                 "${g.title}:0", "存储空间占用",
                                 if (storageComputing) "…" else storageLabel,
-                                pending = false,
                                 onClick = refreshStorage
                             )
                             SettingRow("${g.title}:1", "清空上传记录", "仅清记录") {
@@ -660,23 +776,14 @@ fun SettingsScreen(
                         }
 
                         SettingGroup.ABOUT -> {
-                            val versionBody =
-                                "传视TV 局域网媒体中心与传输工具\n\n版本：v${BuildConfig.VERSION_NAME}\n" +
-                                    "版本号：${BuildConfig.VERSION_CODE}\n构建时间：${BuildConfig.BUILD_TIME}\n\n" +
-                                    "电视端接收与媒体中心，手机扫码即可上传，无需安装 App。\n" +
-                                    "详见 GitHub README。"
-                            SettingRow(
-                                "${g.title}:0", "版本信息",
-                                "v${BuildConfig.VERSION_NAME} · ${BuildConfig.BUILD_TIME}"
-                            ) {
-                                openInfo("${g.title}:0", InfoState("版本信息", versionBody))
-                            }
-                            SettingRow("${g.title}:1", "开源许可", "MIT License") {
-                                openInfo("${g.title}:1", InfoState("开源许可", MIT_LICENSE))
-                            }
-                            SettingRow("${g.title}:2", "致谢名单", "3 个开源项目") {
-                                openInfo("${g.title}:2", InfoState("致谢名单", CREDITS))
-                            }
+                            // 直接内联展示：不弹框，每条信息可聚焦，内容超出可视区时随焦点滚动。
+                            AboutEntry(
+                                "${g.title}:0", "传视 TransView",
+                                value = "版本：v${BuildConfig.VERSION_NAME}"
+                            )
+                            AboutEntry("${g.title}:1", "声明", body = DECLARATION)
+                            AboutEntry("${g.title}:2", "开源许可", body = MIT_LICENSE)
+                            AboutEntry("${g.title}:3", "致谢名单", body = CREDITS, isLast = true)
                         }
                     }
                 }
@@ -686,6 +793,14 @@ fun SettingsScreen(
 
     // ————————————————— 弹框 —————————————————
     choiceState?.let { cs ->
+        // 打开弹框时把焦点放到**当前选中项**上，而不是第一项：
+        // 否则「● 当前值」与聚焦高亮分别停在两行，视觉上像两个选中项；
+        // 更实际的风险是用户直接按确定会静默改成第一项（实测踩到过：
+        // 网格列数当前 5 列，弹框焦点在「4 列」，直接确定就把列数改成了 4）。
+        val selectedOptionFocus = remember { FocusRequester() }
+        LaunchedEffect(cs.title, cs.selectedIndex) {
+            runCatching { selectedOptionFocus.requestFocusNextFrame() }
+        }
         Dialog(onDismissRequest = { choiceState = null }) {
             Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
                 Column(Modifier.padding(28.dp).width(380.dp)) {
@@ -696,7 +811,13 @@ fun SettingsScreen(
                     )
                     Spacer(Modifier.height(14.dp))
                     cs.options.forEachIndexed { i, opt ->
-                        OptionRow(opt, selected = i == cs.selectedIndex) {
+                        OptionRow(
+                            text = opt,
+                            selected = i == cs.selectedIndex,
+                            modifier = if (i == cs.selectedIndex) {
+                                Modifier.focusRequester(selectedOptionFocus)
+                            } else Modifier
+                        ) {
                             choiceState = null
                             cs.onPick(i)
                         }
@@ -726,32 +847,6 @@ fun SettingsScreen(
                         }
                         TvButton("取消") { confirmState = null }
                     }
-                }
-            }
-        }
-    }
-
-    infoState?.let { info ->
-        Dialog(onDismissRequest = { infoState = null }) {
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
-                Column(Modifier.padding(28.dp).width(560.dp)) {
-                    Text(
-                        info.title,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        info.body,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 420.dp)
-                            .verticalScroll(rememberScrollState())
-                    )
-                    Spacer(Modifier.height(22.dp))
-                    TvButton("关闭") { infoState = null }
                 }
             }
         }

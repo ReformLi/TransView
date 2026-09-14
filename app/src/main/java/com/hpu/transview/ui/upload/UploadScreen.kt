@@ -41,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -124,6 +125,18 @@ fun UploadScreen(
     // 记录列表第一行按「上键」落到这里，再按一次「上键」才把焦点交给顶部导航栏的「上传」标签。
     val clearAllFocus = remember { FocusRequester() }
 
+    // ——— 焦点安全港（与媒体库同机制，见 LibraryScreen 的 parkFocusSafe）———
+    // 记录区（含行内「删除」按钮）是否持有焦点
+    var listHasFocus by remember { mutableStateOf(false) }
+    // 「焦点过渡停靠中」：删除后焦点先停靠在「清空所有记录」上（1~2 帧后由下一条记录抢回），
+    // 停靠期间抑制该按钮的聚焦高亮，避免「按钮闪一下再跳到记录行」的感官跳动
+    var focusParking by remember { mutableStateOf(false) }
+    // 待聚焦的记录 id（删除后要落到的下一条记录）；落定后置空
+    var pendingFocusId by remember { mutableStateOf<Long?>(null) }
+    // 打开删除确认框的**那一刻**列表是否持有焦点。
+    // 必须在触发删除时捕获：确认框会取走焦点，等回到 onConfirm 再读就永远是 false（实测踩过）。
+    var deleteHadFocus by remember { mutableStateOf(false) }
+
     // 顶部标签按「下键」→ 直接聚焦记录第一行（见 MainScreen.contentFocusTicket）。
     // consumedFocusTicket 初始化为当前值：切标签进来会重建本页组合，
     // 若从 0 开始会让 LaunchedEffect 立刻跑一次抢走焦点，用户就没法继续按 → 切下一个标签。
@@ -133,6 +146,15 @@ fun UploadScreen(
         if (focusListTicket == consumedFocusTicket) return@LaunchedEffect
         consumedFocusTicket = focusListTicket
         if (records.isNotEmpty()) focusFirstRow = true
+    }
+
+    // 停靠超时兜底：下一条记录正常会在 1~2 帧内抢回焦点并清除标记；
+    // 若抢回失败（如记录被并发清空），800ms 后恢复按钮的聚焦高亮，避免它永远不亮
+    LaunchedEffect(focusParking) {
+        if (focusParking) {
+            kotlinx.coroutines.delay(800)
+            focusParking = false
+        }
     }
 
     // 网络可能在后台变化（Wi-Fi 重连等），回到前台时刷新
@@ -212,7 +234,9 @@ fun UploadScreen(
                                     Key.DirectionRight -> true
                                     else -> false
                                 }
-                            }
+                            },
+                        // 删除后焦点在此过渡停靠时不显示高亮（否则会有「按钮闪一下」的感官跳动）
+                        showFocusVisual = !focusParking
                     ) { showClearAll = true }
                 }
             }
@@ -231,15 +255,24 @@ fun UploadScreen(
                 }
             } else {
                 LazyColumn(
-                    Modifier.weight(1f),
+                    Modifier
+                        .weight(1f)
+                        // hasFocus = 记录区自身或其中任一行（含行内「删除」按钮）持有焦点。
+                        // 删除前据此决定是否需要「焦点安全港」：遥控器路径必须先停靠，
+                        // touch 路径焦点本来为空时可跳过。
+                        .onFocusChanged { listHasFocus = it.hasFocus },
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     itemsIndexed(records, key = { _, record -> record.id }) { index, record ->
                         UploadRecordRow(
                             record = record,
                             isFirstRow = index == 0,
-                            autoFocus = focusFirstRow && index == 0,
-                            onAutoFocused = { focusFirstRow = false },
+                            autoFocus = (focusFirstRow && index == 0) || record.id == pendingFocusId,
+                            onAutoFocused = {
+                                focusFirstRow = false
+                                pendingFocusId = null
+                                focusParking = false
+                            },
                             // 第一行按「上键」→ 列表头的「清空所有记录」；该按钮始终存在（有记录时），
                             // 请求失败则直接回导航栏「上传」标签，避免掉进右上角的「设置」。
                             onNavigateUp = {
@@ -247,7 +280,11 @@ fun UploadScreen(
                                     .onFailure { onFocusTabs() }
                                 true
                             },
-                            onDelete = { pendingDelete = record }
+                            // 删除前先记下列表是否持有焦点（确认框会取走焦点，见 deleteHadFocus 注释）
+                            onDelete = {
+                                deleteHadFocus = listHasFocus
+                                pendingDelete = record
+                            }
                         )
                     }
                     item { Spacer(Modifier.height(16.dp)) }
@@ -266,6 +303,25 @@ fun UploadScreen(
             onConfirm = {
                 val target = record
                 pendingDelete = null
+                // 被删的这条记录马上会被移出组合。若焦点正持有在记录区里，Compose 无法把焦点
+                // 交还给一个已消失的行，会回退到整棵树第一个可聚焦元素 —— 顶部「上传」标签
+                // （媒体库删除卡片是同一机制，见 LibraryScreen 的「焦点安全港」）。
+                // 修法：先把焦点停靠到列表头的「清空所有记录」上，再由「下一条记录」抢回。
+                // 目标是下一条；已是最后一条则退到上一条；列表即将清空时没有可落点，
+                // 交给自然回退（页面仍是「上传」页，不会切走）。
+                val visible = records
+                val index = visible.indexOfFirst { it.id == target.id }
+                val nextId = when {
+                    index < 0 -> null
+                    index + 1 < visible.size -> visible[index + 1].id
+                    index - 1 >= 0 -> visible[index - 1].id
+                    else -> null
+                }
+                if (deleteHadFocus && nextId != null) {
+                    focusParking = true
+                    runCatching { clearAllFocus.requestFocus() }
+                    pendingFocusId = nextId
+                }
                 coroutineScope.launch {
                     recordsRepo.deleteById(target.id)
                     Toast.makeText(context, "已删除记录，本地文件已保留", Toast.LENGTH_SHORT).show()

@@ -11,10 +11,12 @@ import com.hpu.transview.util.Constants
  * 这里保存的是用户在各分组里做出的选择（端口、设备名、倍速、网格列数等），
  * 供设置页展示与记忆。
  *
- * 接线状态（2026-09-14）：
- * - 已接入运行时：服务器端口（`ServerController.setPort`）、开机自启（`BootReceiver`）、
+ * 接线状态（2026-09-14）：**全部已接入运行时**。
+ * - 服务器与网络：服务器端口（`ServerController.setPort`，停旧起新）、开机自启（`BootReceiver`）、
  *   设备名称（`TransHttpServer` 渲染上传网页时注入）；
- * - 仍未接线（字段注释标注「待实现」）：续播提示 / 连播 / 默认倍速 / 默认画面比例、网格列数 / 默认排序。
+ * - 播放设置：续播提示 / 自动连播 / 默认倍速 / 默认画面比例（`PlayerActivity.onCreate` 读取，
+ *   打开视频即生效）；
+ * - 界面设置：网格列数 / 默认排序（`LibraryScreen` 进入时读取，返回媒体库即生效）。
  */
 object SettingsStore {
 
@@ -57,22 +59,22 @@ object SettingsStore {
 
     // ——— 播放设置 ———
 
-    /** 自动续播提示（默认开）。待接入播放器续播弹窗逻辑。 */
+    /** 自动续播提示（默认开）。已接入播放器：关闭后打开视频直接续播、不弹询问框。 */
     var autoResumePrompt: Boolean
         get() = prefs()?.getBoolean("auto_resume_prompt", true) ?: true
         set(v) { prefs()?.edit()?.putBoolean("auto_resume_prompt", v)?.apply() }
 
-    /** 自动连播（默认开）。待接入播放器连播逻辑。 */
+    /** 自动连播（默认开）。已接入播放器：关闭后一集播完停在片尾，不自动跳下一集。 */
     var autoPlayNext: Boolean
         get() = prefs()?.getBoolean("auto_play_next", true) ?: true
         set(v) { prefs()?.edit()?.putBoolean("auto_play_next", v)?.apply() }
 
-    /** 默认倍速（默认 1.0x）。待接入播放器默认倍速。 */
+    /** 默认倍速（默认 1.0x）。已接入播放器：作为打开视频时的初始倍速。 */
     var defaultSpeed: Float
         get() = prefs()?.getFloat("default_speed", 1.0f) ?: 1.0f
         set(v) { prefs()?.edit()?.putFloat("default_speed", v)?.apply() }
 
-    /** 默认画面比例（默认原始）。待接入播放器。 */
+    /** 默认画面比例（默认原始）。已接入播放器：映射为 PlayerView 的 FIT / FILL / ZOOM。 */
     var defaultAspect: AspectRatio
         get() = prefs()?.getString("default_aspect", AspectRatio.ORIGINAL.name)
             ?.let { runCatching { AspectRatio.valueOf(it) }.getOrNull() }
@@ -81,7 +83,7 @@ object SettingsStore {
 
     // ——— 界面设置 ———
 
-    /** 媒体库网格列数（默认 5）。待接入媒体库 LazyVerticalGrid 列数。 */
+    /** 媒体库网格列数（默认 5，合法 4~6）。已接入媒体库 `GridCells.Fixed` 与行首/行尾焦点判定。 */
     var gridColumns: Int
         get() {
             val v = prefs()?.getInt("grid_columns", 5) ?: 5
@@ -89,7 +91,7 @@ object SettingsStore {
         }
         set(v) { prefs()?.edit()?.putInt("grid_columns", v)?.apply() }
 
-    /** 媒体库默认排序方式（默认名称 A-Z）。待接入媒体库默认排序。 */
+    /** 媒体库默认排序方式（默认名称 A-Z）。已接入媒体库排序初值（工具条可临时改，不改本项）。 */
     var defaultSort: SortOrder
         get() = prefs()?.getString("default_sort", SortOrder.NAME_ASC.name)
             ?.let { runCatching { SortOrder.valueOf(it) }.getOrNull() }

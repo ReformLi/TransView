@@ -61,9 +61,8 @@ com.hpu.transview
     ├── MainScreen.kt           四标签导航 + 右侧「设置」入口（聚焦即打开设置页）+ 返回键回导航栏
     ├── permission/             存储权限引导页
     ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码+地址+状态）+ 右侧可滚动上传记录列表
-    ├── library/LibraryScreen.kt 多列网格卡片（5 列）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
-    ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；保活/端口/自启/设备名/续播提示/连播/倍速/
-    │                           画面比例/存储/清空记录/对账/版本/许可/致谢已接通，界面设置两项页面+持久化就绪待接线；
+    ├── library/LibraryScreen.kt 多列网格卡片（列数由设置决定，4/5/6）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
+    ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；**九项全部已接通**；
     │                           三类弹框关闭后焦点回原行）
     ├── settings/SettingsStore.kt 设置偏好持久化（SharedPreferences object；端口/自启/设备名/续播提示/
     │                           连播/倍速/画面比例/列数/默认排序，均含默认值）
@@ -203,7 +202,22 @@ com.hpu.transview
   - **播放器控制栏同样已按此处理**（v1.4）：`PlayerWidgets.PlayerIconButton` 的 `clickable` 恒为 `enabled = true`，禁用态自己吞掉确定键，并改用「灰底 + 灰色描边 + 更暗图标」渲染（不能用主色填充——暗图标压在亮蓝上糊成一片）。触发场景：「下一集」被聚焦时按确定键切到**最后一集**，`hasNext` 当场变 false，若按钮同时变不可聚焦，焦点会掉到播放器根节点、控制栏上一个高亮都不剩，后续左右键会直接变成快进/快退。
   - 播放器另有两条与焦点相关的约定：①控制栏显示时**左右键是焦点导航**（隐藏时才是快进/快退）；②左右键**也要刷新自动隐藏计时**——否则用户还在按钮间移动时控制栏就消失，之后的左右键会突然变成快进/快退（实测：连按 5 次右，中途控制栏隐藏，后几次被当成快进而弹出「02:21 / 13:01」徽标）。注意**上/下键是切换控制栏**，不能当「续命」用。
   - 附带收益：即使「抢回焦点」失败，焦点也仍留在本页工具条，不会跨页乱跑。
+- **触摸 / 鼠标点按后的焦点锚定（v1.4 修复）**：
+  - 现象：用触摸屏 / 鼠标点按内容区后再按一次方向键，焦点命中顶部「上传」标签 → 页面被切走（实测：视频页 tap 网格空白后按一下 ↓，直接跳回上传页）。
+  - 根因是两层叠加：① 触摸让设备进入 **touch mode**，Compose 在进入时清空焦点；② **touch mode 下「默认可聚焦节点」（`Modifier.clickable` / `Modifier.focusable()`）不接受程序化 `requestFocus`**——实测点按后让网格卡片抢焦点，`repeat(10)` 连试 10 次**全部失败**。于是第一次方向键只能由 Compose 从整棵树重新搜索，命中整棵树第一个可聚焦元素（顶部标签）。
+  - 修法（`MainScreen`，三处配合，缺一不可）：
+    1. 内容区 `Box` 在 `Press` 阶段**同步**调用 `rootView.requestFocusFromTouch()`（`rootView = LocalView.current`）。这是 View 层「在 touch mode 下请求焦点」的入口，内部会先让 `ViewRootImpl` 退出 touch mode——**这是根本动作**，缺了它下面两步都会被静默拒绝。
+    2. 内容区 `Box` 挂一个自身无任何视觉的焦点锚点（`focusRequester` + `focusable()`），点按结束后把焦点锚到它，随后的方向键就从内容区开始搜索。
+    3. 再把焦点票据投给内容区（`contentFocusTicket++` / `settingsFocusTicket++`），复用「标签按 ↓」的已验证路径，焦点落到本页第一个可聚焦元素（记录首行 / 网格首项 / 设置首项）。
+  - **时序**：锚定统一延后 150ms（`LaunchedEffect` + `delay`）——tap 手势期间焦点会被持续清空，立即 `requestFocus` 会被覆盖（实测）；150ms 远短于人的连续按键间隔。窗口失焦时跳过（点按可能已打开播放器 / 图片查看器）。
+  - 遥控器按键不产生 `PointerEvent`，对既有遥控器导航零影响（已验证回归：返回键 → 标签、标签 ↓ → 首行、首行 ↑ → 工具条、工具条 ↑ → 标签，全部正常）。
+- **上传页删除记录的焦点安全港（v1.4 修复）**：
+  - 现象：删掉一条上传记录后焦点回退到顶部「上传」标签（与媒体库删卡片同一机制：承载焦点的行被移出组合，Compose 回退到第一个可聚焦元素）。
+  - 修法（与媒体库同款：停靠 → 目标抢回）：打开删除确认框的**那一刻**捕获 `deleteHadFocus`——确认框有自己的 window、会取走焦点，等回到 `onConfirm` 再读永远是 `false`（注意这里与媒体库的 `performDelete` 不同：那边把 `hadFocus` 放在 `withContext(IO)` 挂起之后读，靠对话框关闭后的焦点归还拿到 `true`）。
+    确认后先把焦点停靠到列表头「清空所有记录」（`showFocusVisual = false` 抑制过渡高亮），再把 `pendingFocusId` 设为**下一条**记录（已是最后一条则退到上一条），由该行 `autoFocus` 在下一帧抢回；列表即将清空时没有落点，交给自然回退（页面仍是「上传」页，不会切走）。另有 `LaunchedEffect(focusParking)` 800ms 超时兜底复位。
+  - 实测：删除中间一条 → 焦点落到下一条；删除最后一条 → 焦点退到上一条。
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。
+- **标签焦点回调里「退出设置页」必须无条件执行**：媒体标签早期写法是 `if (isFocused && tab != selected) { selected = tab; showSettings = false }`——把 `showSettings = false` 和「切换标签」绑进了同一个条件。当 `selected` 恰好就是目标标签时条件不成立（典型路径：「其他」页 → 聚焦「设置」→ 按 ← 回「其他」，`selected` 一直是 `OTHER`、根本没变），于是 `showSettings` 停在 `true`，**内容区继续显示设置页，只有标签选中态变了**（用户实测反馈）。修法：焦点落到任一媒体标签即先无条件 `showSettings = false`，再按需更新 `selected`。
 - 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；
   请求焦点统一走 `requestFocusNextFrame()`（`withFrameNanos {}` 让出一帧再 `requestFocus()`）——LazyGrid 项刚组合、尚未完成布局时 `requestFocus()` 会抛 `IllegalStateException` 被 `runCatching` 静默吞掉，表现为「焦点还原没反应」。
 - 播放器/查看器根节点 `focusable()` 常驻焦点，浮层隐藏后 `FocusRequester` 归位（控制栏显示 → 落到播放/暂停按钮；隐藏 → 回根节点），遥控器永不失焦。
@@ -256,20 +270,31 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
-**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸，仍未接线的「界面设置」两项另显灰色「待实现」徽标）。居中布局，聚焦样式复用 `tvFocus()`。
+**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
+设置项**已全部接通**（v1.4），因此 `SettingRow` 的灰色「待实现」徽标（原 `pending` 参数）已随最后两项接线一并移除。
 
 **焦点规范（v1.4 落地）**：
 - 进入默认焦点在左侧首个分组；分组 ↑↓ 切换、→ 进右侧详情（`detailTicket` 驱动）、首分组 ↑ 回「设置」标签。
 - 详情行 ← 回左侧当前分组（`groupFocusers` 直接 requestFocus）；每组首行 ↑ 回「设置」标签；首分组 ↑ / 末分组 ↓ / 详情行首 ←、行尾 → 等边缘显式吃掉按键，防环绕到顶部标签切页（与媒体库「左右边界」同规）。
-- 弹框（单选 `ChoiceState` / 确认 `ConfirmState` / 信息 `InfoState` 三类，同一时刻最多一个）关闭后焦点回原行：`pendingFocusReturn` 记录行 key + `rowFocusMap` 每行 `FocusRequester` + **帧门控重试**（`repeat(10)` 次 `requestFocusNextFrame()`，用 `rowFocused[key]` 状态确认落焦成功——单次请求会被静默丢弃，媒体库同款经验）。
+- 弹框**打开时**焦点落在**当前选中项**上（`ChoiceState.selectedIndex` 那一行挂 `FocusRequester` + `LaunchedEffect` 里 `requestFocusNextFrame()`）：否则「● 当前值」与聚焦高亮分别停在两行，视觉上像两个选中项；更实际的风险是用户直接按确定会静默改成**第一项**（实测踩到：网格列数当前 5 列，弹框焦点停在「4 列」，直接确定就把列数改成了 4）。
+- 弹框（单选 `ChoiceState` / 确认 `ConfirmState` 两类，同一时刻最多一个）关闭后焦点回原行：`pendingFocusReturn` 记录行 key + `rowFocusMap` 每行 `FocusRequester` + **帧门控重试**（`repeat(10)` 次 `requestFocusNextFrame()`，用 `rowFocused[key]` 状态确认落焦成功——单次请求会被静默丢弃，媒体库同款经验）。
+- **「关于」组不使用弹框**（v1.4）：信息条目**直接内联**在右侧详情区。条目用 `AboutEntry`（`focusable()` 但**无 `clickable`**，故按确定 / → 都没有动作，只有焦点高亮）；该组外层 `Arrangement.Top` + Surface `weight(1f)` 撑满剩余高度，卡片内 `verticalScroll(aboutScrollState)`——可聚焦节点在滚动容器内自带 bring-into-view，**焦点上下移动即自动滚动**。条目左右/上下边缘按键与 `SettingRow` 同规（左键回分组、首条 ↑ 回标签、→ 吃掉、末条 ↓ 吃掉防环绕切页）。
 - 进入详情的聚焦重试前需**等 `rowFocusMap` 填充**（右侧行在切换分组后才组合渲染，立即请求必然 miss；外层 `repeat(10) + delay(16ms)` 等键出现再走重试）。
+- **焦点描边要四边可见，需两个条件同时满足**（v1.4 实测）：
+  ① `tvFocus()` 必须挂在可聚焦修饰符（`clickable` / `focusable`）的**上游**——它内部的 `onFocusChanged`
+  只能观察下游的焦点节点，写在下游会永远收不到事件，`focused` 恒 false，描边 / 底色 / 缩放全部不生效；
+  ② 条目与外层裁剪容器之间要留间隙：条目的描边画在自身边界上，而卡片（带圆角的 `Surface`）会裁剪
+  超出部分，条目 `fillMaxWidth()` 与卡片同宽时只剩上下两条描边。做法是
+  `.fillMaxWidth().padding(horizontal = 12.dp)` 后再挂 `tvFocus()`，内容内边距同步减少以**保持内容缩进
+  不变**（`SettingRow` 12+10=22dp 与改前一致，文本位置不动；`AboutEntry` 12+12=24dp），
+  `tvFocus` 的 `scale(1.03)` 向外多占约 8px，12dp 留白足够容纳。
 - 设置页打开期间媒体标签 `selected = !showSettings && …`——否则上一个媒体标签（如「其他」）残留选中高亮，与「设置」聚焦高亮叠加造成「两个都亮」的误导（实测踩过）。
 
-**已接通项**：保活策略（`ServerController.setMode`，立即生效）、服务器端口（`ServerController.setPort` 停旧起新，见 §3.10）、开机自启（`SettingsStore.bootAutostart` → `BootReceiver`，见 §3.10）、设备名称（`SettingsStore.deviceName` → 上传页注入，见 §3.10）、自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例（见 §3.11）、存储空间占用（`FileLocations.sandboxRoot.walkTopDown()` IO 线程统计）、清空上传记录（`UploadRecordRepository.clearAll`）、清空播放历史（`PlaybackDao.clearAllHistory` + `PlaybackRepository` v1.4 新增）、手动触发对账（`SyncManager.sync()`）、版本信息（`BuildConfig.VERSION_NAME` + `BUILD_TIME`，`build.gradle.kts` 开启 `buildConfig = true` 并注入构建时间字段）、开源许可（MIT 全文常量）、致谢名单。
+**已接通项**：保活策略（`ServerController.setMode`，立即生效）、服务器端口（`ServerController.setPort` 停旧起新，见 §3.10）、开机自启（`SettingsStore.bootAutostart` → `BootReceiver`，见 §3.10）、设备名称（`SettingsStore.deviceName` → 上传页注入，见 §3.10）、自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例（见 §3.11）、网格列数 / 默认排序（见 §3.12）、存储空间占用（`FileLocations.sandboxRoot.walkTopDown()` IO 线程统计）、清空上传记录（`UploadRecordRepository.clearAll`）、清空播放历史（`PlaybackDao.clearAllHistory` + `PlaybackRepository` v1.4 新增）、手动触发对账（`SyncManager.sync()`）、关于（应用名 + `BuildConfig.VERSION_NAME` + 声明 / MIT 全文 / 致谢三个常量，**内联条目**不弹框，见 §3.9）。
 
-**SettingsStore**（`ui/settings/SettingsStore.kt`）：SharedPreferences object（`transview_settings`），保存端口 / 开机自启 / 设备名 / 续播提示 / 连播 / 默认倍速 / 默认画面比例（`AspectRatio` 枚举）/ 网格列数 / 默认排序（`SortOrder`）。**仅「界面设置」的网格列数（4/5/6）与默认排序两项仍只持久化未接线**（媒体库当前固定 5 列、默认名称 A-Z），其余七项均已接入运行时。
+**SettingsStore**（`ui/settings/SettingsStore.kt`）：SharedPreferences object（`transview_settings`），保存端口 / 开机自启 / 设备名 / 续播提示 / 连播 / 默认倍速 / 默认画面比例（`AspectRatio` 枚举）/ 网格列数 / 默认排序（`SortOrder`）。**九项全部已接入运行时**（v1.4 收尾）。
 
-**设置值 → 界面刷新**：写 SharedPreferences 不会触发 Compose 重组，因此设置页对「副作用不是本地状态」的项统一用本地 `remember` 状态承载显示值（端口/自启/设备名/续播提示/连播/倍速/画面比例），先更新界面再落盘；端口这类异步项失败时回滚显示值。
+**设置值 → 界面刷新**：写 SharedPreferences 不会触发 Compose 重组，因此设置页对「副作用不是本地状态」的项统一用本地 `remember` 状态承载显示值（端口/自启/设备名/续播提示/连播/倍速/画面比例/列数/默认排序），先更新界面再落盘；端口这类异步项失败时回滚显示值。
 
 ### 3.10 服务器与网络设置接线（v1.4）
 
@@ -310,6 +335,21 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - **实现注意**：比例是 `PlayerView.resizeMode`，而 `AndroidView(update = …)` 的 update 块不在组合作用域内读 Compose 状态不会建立订阅（状态变化不会触发它重跑），因此把 `PlayerView` 存进 Activity 字段（`playerView`），初始值在 `factory` 里设置、切档时命令式 `playerView?.resizeMode = …`。
 - 对话框显隐需同步加进 `anyDialogVisible`（控制栏自动隐藏与焦点归属的判断依据），否则开着比例弹框时控制栏会自己消失、按键焦点也会跑偏。
 
+### 3.12 界面设置接线（v1.4）
+
+两项都由 `LibraryScreen` 在**组合期直接读** `SettingsStore`（与 `UploadScreen` 读 `deviceName` 同一套路，不引入总线）：设置页会替换掉内容区的媒体库组合（`MainScreen` 的 `if (showSettings) … else when (selected) …`），退出设置回媒体库时必然重新组合，直接读取即能拿到最新值 —— **返回媒体库即生效，无需重启 App**。
+
+**网格列数（`gridColumns`，4/5/6，默认 5）**
+- `GridCells.Fixed(gridColumns)`；`gridColumns` 与列数相关的**三处焦点边界判定必须是同一个变量**，否则左右边界会错位：`stayOnLeftEdge = gridIndex % gridColumns == 0`、`stayOnRightEdge = (gridIndex + 1) % gridColumns == 0 || gridIndex + 1 >= totalGridItems`、第一行判断 `gridIndex < gridColumns`。原先的 `private const val GRID_COLUMNS = 5` 已删除。
+- 子目录里 UpCard 占网格位 0，`gridIndex` 已含该偏移，故边界判定与根目录同式。
+- 注意 `列数` 只在**进入媒体库时**读一次（`val gridColumns = SettingsStore.gridColumns`，普通 `val` 而非 `remember`）——列数是重布局量（`LazyVerticalGrid` 会重建网格），没有必要为它做跨页实时同步。
+
+**默认排序方式（`defaultSort`，默认名称 A-Z）**
+- `sortOrder` 初值改为 `SettingsStore.defaultSort`（`rememberSaveable(category.name)`，三个分类各自独立）。
+- 语义是**默认值**：进入媒体库时按它开局，用户仍可用工具条「排序」按钮临时改；改动只作用于本次浏览（切标签 / 进设置页都会重建本页组合 → 回到默认值），**不回写** `defaultSort`。
+
+**设置界面**：两项去掉「待实现」徽标，选值后 Toast 提示「返回媒体库即生效」，显示值由本地 `remember` 状态承载（`gridColumnsValue` / `defaultSortValue`）——理由同 §3.9 末段。
+
 ## 4. 构建与运行
 
 ```bash
@@ -324,7 +364,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 **v1.1 数据库一致性重构已全部完成（模块 1-5）。**
 
 **功能 TODO：**
-- [ ] 设置页待接线项（页面 + SettingsStore 持久化已就绪，见 §3.9）：**仅剩界面设置两项** —— 网格列数（4/5/6）与默认排序接入媒体库（服务器端口 / 开机自启 / 设备名称已于 v1.4 接通，见 §3.10；自动续播提示 / 自动连播 / 默认倍速 / 默认画面比例已于 v1.4 接通播放器，见 §3.11）
+- [ ] （v1.4 已清空）设置页九项全部接通，无待接线项
 - [ ] zip 压缩包上传后服务端自动解压并按分类过滤（需求 3.3.5 备选方案）
 - [ ] 断点续传（需求 4.4 P2）
 - [ ] 上传页面 Token 验证（需求 4.5 可选项）

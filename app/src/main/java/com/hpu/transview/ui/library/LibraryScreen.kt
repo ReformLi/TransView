@@ -82,6 +82,7 @@ import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.tvFocus
 import com.hpu.transview.ui.image.ImageViewerActivity
 import com.hpu.transview.ui.player.PlayerActivity
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
@@ -94,8 +95,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-/** 网格列数（电视端多列，严禁单列列表） */
-private const val GRID_COLUMNS = 5
+// 网格列数由「设置 → 界面设置 → 网格列数」决定（4/5/6），见 LibraryScreen 内 gridColumns。
+// 电视端一律多列网格，严禁单列列表。
 
 /** 焦点还原「返回上级」卡片的哨兵路径 */
 private const val FOCUS_UP = "__up__"
@@ -149,9 +150,17 @@ fun LibraryScreen(
     val root = remember(category) { FileLocations.root(category) }
 
     var currentDir by remember(category) { mutableStateOf(root) }
-    var sortOrder by rememberSaveable(category.name) { mutableStateOf(SortOrder.NAME_ASC) }
+    // 排序初值取「设置 → 界面设置 → 默认排序方式」；之后用工具条「排序」按钮做的调整只作用于
+    // 本次浏览（切标签/进设置页都会重建本页组合，回到默认值）。rememberSaveable 以 category.name
+    // 为键，保证三个分类各自独立、互不串味。
+    var sortOrder by rememberSaveable(category.name) { mutableStateOf(SettingsStore.defaultSort) }
     var showSortDialog by remember { mutableStateOf(false) }
     var syncing by remember { mutableStateOf(false) }
+    // 网格列数取自「设置 → 界面设置 → 网格列数」。进入本页时读一次：设置页会替换掉本页组合，
+    // 退出设置回到媒体库时必然重新组合，直接读取即能拿到最新值，与 UploadScreen 读 deviceName 同一套路。
+    // 列数同时决定网格的「行首/行尾」判定（stayOnLeftEdge / stayOnRightEdge 与第一行判断），
+    // 必须和 GridCells.Fixed 用同一个变量，否则焦点边界会错位。
+    val gridColumns = SettingsStore.gridColumns
 
     var actionEntry by remember { mutableStateOf<FileEntry?>(null) }
     var pendingDelete by remember { mutableStateOf<FileEntry?>(null) }
@@ -457,7 +466,7 @@ fun LibraryScreen(
             }
             entries.isEmpty() && atRoot -> EmptyHint()
             else -> LazyVerticalGrid(
-                columns = GridCells.Fixed(GRID_COLUMNS),
+                columns = GridCells.Fixed(gridColumns),
                 state = gridState,
                 // hasFocus = 网格自身或其中任一卡片持有焦点。目录切换 / 返回上级 /
                 // 删除前据此决定是否需要「焦点安全港」：遥控器（键盘焦点）路径必须先停靠，
@@ -509,13 +518,13 @@ fun LibraryScreen(
                         onDelete = { pendingDelete = entry },
                         // 第一行按「上键」→ 本页工具条（网格已滚到顶才算是第一行，否则交回 Compose 做网格内上行）
                         onNavigateUp = {
-                            if (gridIndex < GRID_COLUMNS && gridState.firstVisibleItemIndex == 0) {
+                            if (gridIndex < gridColumns && gridState.firstVisibleItemIndex == 0) {
                                 runCatching { toolbarFocus.requestFocus() }
                                 true
                             } else false
                         },
-                        stayOnLeftEdge = gridIndex % GRID_COLUMNS == 0,
-                        stayOnRightEdge = (gridIndex + 1) % GRID_COLUMNS == 0 ||
+                        stayOnLeftEdge = gridIndex % gridColumns == 0,
+                        stayOnRightEdge = (gridIndex + 1) % gridColumns == 0 ||
                             gridIndex + 1 >= totalGridItems
                     )
                 }

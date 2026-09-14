@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -40,6 +41,11 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.dp
 import com.hpu.transview.model.Category
 import com.hpu.transview.model.MainTab
@@ -67,6 +73,24 @@ fun MainScreen() {
     var contentFocusTicket by remember { mutableIntStateOf(0) }
     // 「设置」标签按 ↓ 进入设置页的首个左侧分组，由 SettingsScreen 消费
     var settingsFocusTicket by remember { mutableIntStateOf(0) }
+
+    // 触摸锚定计数：内容区被点按一次自增一次（见内容区 Box 的 focusable/pointerInput 注释）。
+    // tap 手势期间 Compose 会清空焦点，立即 requestFocus 会被随后的清空覆盖（实测：立即请求时
+    // 目标卡片的 requestFocus 连试 10 次全部失败），所以统一延后一拍再锚定。
+    var touchAnchorTick by remember { mutableIntStateOf(0) }
+    val contentAnchor = remember { FocusRequester() }
+    val windowInfo = LocalWindowInfo.current
+    val rootView = LocalView.current
+    LaunchedEffect(touchAnchorTick) {
+        if (touchAnchorTick == 0) return@LaunchedEffect
+        kotlinx.coroutines.delay(150)
+        // 点按可能已经打开了播放器 / 图片查看器（本页已退到后台），此时不该抢焦点
+        if (!windowInfo.isWindowFocused) return@LaunchedEffect
+        runCatching { contentAnchor.requestFocus() }
+        // 兜底：把焦点票据投给内容区，让焦点继续落到本页第一个可聚焦元素
+        // （记录首行 / 网格首项 / 设置首项）。即使锚点没拿到焦点，这一票也不会切页。
+        if (showSettings) settingsFocusTicket++ else contentFocusTicket++
+    }
 
     // 省电模式：仅上传页可见时允许服务器运行
     LaunchedEffect(selected) {
@@ -111,7 +135,16 @@ fun MainScreen() {
                     onNavigateDown = { contentFocusTicket++ },
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
-                        .onFocusChanged { if (it.isFocused && tab != selected) { selected = tab; showSettings = false } }
+                        .onFocusChanged { state ->
+                            if (state.isFocused) {
+                                // 退出设置页必须**无条件**执行，不能塞进 `tab != selected` 条件里：
+                                // 从「设置」切回「先前停留的那个标签」时 selected 本来就没变，条件不成立
+                                // → showSettings 停在 true，内容区继续显示设置页
+                                //（用户实测：焦点已落在「其他」标签、标签态也对，内容却还是设置项）。
+                                showSettings = false
+                                if (tab != selected) selected = tab
+                            }
+                        }
                 ) { selected = tab; showSettings = false }
                 Spacer(Modifier.width(14.dp))
             }
@@ -138,6 +171,34 @@ fun MainScreen() {
             Modifier
                 .weight(1f)
                 .fillMaxWidth()
+                // ——— 触摸焦点锚点 ———
+                // 触摸 / 鼠标点按内容区后，Compose 会清空焦点并让设备进入 touch mode；
+                // 而 touch mode 下**默认可聚焦节点（Modifier.clickable / Modifier.focusable()）
+                // 不接受程序化 requestFocus**（实测：点按后让卡片抢焦点，连试 10 次全部失败）。
+                // 于是第一次按方向键时焦点必须从整棵树开始搜索，命中第一个可聚焦元素 ——
+                // 顶部「上传」标签，而标签是「聚焦即选中」→ 页面被立刻切走。
+                // 两处配合修复：
+                //  ① Press 阶段调 View.requestFocusFromTouch() —— View 层「在 touch mode 下
+                //     请求焦点」的入口，内部会先让 ViewRootImpl 退出 touch mode，之后的
+                //     requestFocus 才会生效（这是根本动作，缺了它下面两步都无效）；
+                //  ② 内容区挂一个自身无任何视觉的焦点锚点，点按结束后把焦点锚到这里，
+                //     随后的方向键就从内容区开始搜索，自然落到本页第一个可聚焦元素
+                //     （记录首行 / 网格首项 / 设置首项）。焦点若仍被页面票据接管则更好。
+                // 遥控器按键不产生 Press 事件，因此不影响既有的遥控器焦点导航。
+                .focusRequester(contentAnchor)
+                .focusable()
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.type == PointerEventType.Press) {
+                                // 只在 Press 阶段同步调用才来得及（晚了 touch mode 已生效）
+                                rootView.requestFocusFromTouch()
+                                touchAnchorTick++
+                            }
+                        }
+                    }
+                }
         ) {
             if (showSettings) {
                 // 设置子页面占据内容区（顶部导航栏保持不变）。
