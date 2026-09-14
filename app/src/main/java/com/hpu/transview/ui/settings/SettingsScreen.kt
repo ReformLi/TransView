@@ -198,6 +198,10 @@ fun SettingsScreen(
     var defaultSortValue by remember { mutableStateOf(SettingsStore.defaultSort) }
 
     var selectedGroupIndex by remember { mutableIntStateOf(0) }
+    // 焦点是否在设置页内容区（左侧分组/右侧详情）。顶部「设置」标签持有焦点时为 false ——
+    // 此时左侧分组**不显示**选中高亮，避免用户误以为「焦点自动跳进了内容区」
+    //（实测：进入设置页时「服务器与网络」默认带竖条+主色文字高亮，被误读为焦点跳转）。
+    var contentFocused by remember { mutableStateOf(false) }
     val groupFocusers = remember { List(SettingGroup.entries.size) { FocusRequester() } }
     val rowFocusMap = remember { mutableStateMapOf<String, FocusRequester>() }
     // 各行当前是否获得焦点，用于聚焦重试时确认落焦成功（见 detailTicket / dialog 关闭的 retry）
@@ -475,6 +479,9 @@ fun SettingsScreen(
         Modifier
             .fillMaxSize()
             .padding(horizontal = 40.dp, vertical = 16.dp)
+            // 跟踪「焦点是否在本内容区」：hasFocus 含子树（左侧分组/右侧详情）。
+            // 顶部「设置」标签持有焦点时本 Row 无焦点 → contentFocused=false → 左侧分组不显示高亮。
+            .onFocusChanged { contentFocused = it.hasFocus }
     ) {
         // 左侧分组
         Column(
@@ -490,7 +497,8 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(18.dp))
             SettingGroup.entries.forEachIndexed { i, g ->
-                LeftGroup(i, g.title, selected = selectedGroupIndex == i)
+                // 高亮条件追加 contentFocused：焦点在顶部「设置」标签时不显示选中态
+                LeftGroup(i, g.title, selected = selectedGroupIndex == i && contentFocused)
             }
         }
 

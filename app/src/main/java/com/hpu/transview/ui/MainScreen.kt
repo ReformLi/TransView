@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,18 +52,22 @@ import com.hpu.transview.model.Category
 import com.hpu.transview.model.MainTab
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.library.LibraryScreen
 import com.hpu.transview.ui.settings.SettingsScreen
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.upload.UploadScreen
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** 主界面：顶部四标签导航 + 内容区 */
 @Composable
 fun MainScreen() {
     var selected by rememberSaveable { mutableStateOf(MainTab.UPLOAD) }
     var showSettings by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val tabFocusRequesters = remember { MainTab.entries.map { FocusRequester() } }
     // 「设置」标签独立的焦点请求器（从设置内容区按上键回到它）
     val settingsFocusRequester = remember { FocusRequester() }
@@ -99,8 +104,28 @@ fun MainScreen() {
 
     // 把焦点送回顶部导航栏「当前选中的标签」：返回键、以及内容区工具条按上键时都用它。
     // 用 remember(selected) 捕获当前标签，避免闭包一直停在初始值。
+    // 帧门控重试：单次 requestFocus 可能静默失败（焦点停在内容区 / 左侧分组），
+    // 失败则 16ms 后再试，最多 10 次（与设置页弹框关闭的聚焦重试同一模式）。
     val focusSelectedTab: () -> Unit = remember(selected) {
-        { runCatching { tabFocusRequesters[selected.ordinal].requestFocus() } }
+        {
+            scope.launch {
+                val target = tabFocusRequesters[selected.ordinal]
+                repeat(10) {
+                    if (target.requestFocusNextFrame()) return@launch
+                    delay(16)
+                }
+            }
+        }
+    }
+
+    // 把焦点送回顶部「设置」标签（设置页内容区按上键时触发），同样带帧门控重试。
+    val focusSettingsTab: () -> Unit = {
+        scope.launch {
+            repeat(10) {
+                if (settingsFocusRequester.requestFocusNextFrame()) return@launch
+                delay(16)
+            }
+        }
     }
 
     // 返回键：先交给内容区（媒体库在子目录时返回上一级，它注册的 BackHandler 优先级更高），
@@ -207,7 +232,7 @@ fun MainScreen() {
                 SettingsScreen(
                     onExit = { showSettings = false; focusSelectedTab() },
                     focusTicket = settingsFocusTicket,
-                    onFocusTabs = { runCatching { settingsFocusRequester.requestFocus() } }
+                    onFocusTabs = focusSettingsTab
                 )
             } else when (selected) {
                 MainTab.UPLOAD -> UploadScreen(
@@ -238,10 +263,16 @@ private fun TabChip(
             // 标签按「下键」→ 显式交给内容区（见 MainScreen.contentFocusTicket 注释）。
             // 放在 clickable 之前，与页面内卡片的按键处理保持一致。
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
-                    onNavigateDown()
-                    true
-                } else false
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    Key.DirectionDown -> { onNavigateDown(); true }
+                    // 顶部标签行按「上」必须吃掉：否则按住上键（遥控器 auto-repeat）在焦点
+                    // 回到标签后，剩余的重发 KeyDown 会进入焦点系统向上导航 —— 顶部已无目标，
+                    // 焦点回退到整棵树第一个可聚焦元素 = 设置页左侧第一个分组
+                    //（用户实测：按上键回「设置」标签后焦点自动掉回设置内容区）。
+                    Key.DirectionUp -> true
+                    else -> false
+                }
             }
             .clip(RoundedCornerShape(50))
             .background(
