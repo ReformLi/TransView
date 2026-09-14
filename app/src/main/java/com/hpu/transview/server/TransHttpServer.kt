@@ -65,6 +65,13 @@ class TransHttpServer(
                 session.method == Method.GET && (session.uri == "/" || session.uri == "/index.html") ->
                     serveIndexPage()
 
+                // 网页图标（头部标识 + 浏览器标签页 favicon），与 assets/web/icon.* 同源
+                session.method == Method.GET && session.uri == "/icon.svg" ->
+                    serveAsset("web/icon.svg", "image/svg+xml")
+
+                session.method == Method.GET && session.uri == "/icon.png" ->
+                    serveAsset("web/icon.png", "image/png")
+
                 session.method == Method.POST && session.uri == "/upload" ->
                     handleUpload(session)
 
@@ -105,6 +112,21 @@ class TransHttpServer(
         .replace("\"", "&quot;")
         .replace("'", "&#39;")
 
+    /**
+     * 提供 assets 里的静态资源（图标）。
+     * 每次请求都重新读取，换图后手机端刷新即生效，无需重启服务器。
+     */
+    private fun serveAsset(assetPath: String, mime: String): Response {
+        val bytes = runCatching {
+            appContext.assets.open(assetPath).use { it.readBytes() }
+        }.getOrNull() ?: return newFixedLengthResponse(
+            Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not Found"
+        )
+        return newFixedLengthResponse(
+            Response.Status.OK, mime, bytes.inputStream(), bytes.size.toLong()
+        )
+    }
+
     private fun handleUpload(session: IHTTPSession): Response {
         // 手机网页把分类/文件名/相对路径放 URL query（请求头阶段即可用——multipart 字段
         // 必须等 parseBody 接收完整个请求体后才会填充，此前读取只会拿到回退值）
@@ -129,7 +151,28 @@ class TransHttpServer(
         // 2. 进度监视：计数流字节数 / Content-Length → 回写百分比（节流）
         val monitorJob = startProgressMonitor(recordId, contentLength)
 
-        // 3. 流式解析 multipart（大文件在此阻塞接收）
+        // 3. 接收 → 落盘 → 收尾。**必须兜底**：手机端「取消上传」= abort 连接，会让
+        //    parseBody 抛出 ResponseException 之外的异常（IO 中断）；不在这里收尾的话，
+        //    该条上传记录会永远停在「上传中」，异常还会冒泡到 serve() 变成 500。
+        return try {
+            receiveAndSave(session, recordId, busId, displayName, relPath, category)
+        } catch (e: Exception) {
+            finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
+            jsonError(Response.Status.INTERNAL_ERROR, e.message ?: "上传中断")
+        } finally {
+            monitorJob.cancel()
+        }
+    }
+
+    /** 流式接收 multipart → 落盘 → 更新记录 → 建媒体索引（成功/失败路径都由本函数收尾） */
+    private fun receiveAndSave(
+        session: IHTTPSession,
+        recordId: Long,
+        busId: Long,
+        displayName: String,
+        relPath: String,
+        category: Category
+    ): Response {
         val files = HashMap<String, String>()
         val parseError: ResponseException? = try {
             // NanoHTTPD 对不带 charset 的 multipart 请求按 US-ASCII 解析 part 头，
@@ -142,7 +185,6 @@ class TransHttpServer(
             e
         }
 
-        monitorJob.cancel()
         if (parseError != null) {
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
             return jsonError(parseError.status, parseError.message ?: "请求解析失败")

@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>__DEVICE_NAME__ · 文件上传</title>
+<!-- 浏览器标签页图标（favicon）：主选矢量 SVG，PNG 供不支持 SVG favicon 的浏览器兜底，
+     apple-touch-icon 用于「添加到主屏幕」的图标 -->
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="alternate icon" type="image/png" sizes="192x192" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
 <style>
   :root {
     --bg: #0e1116;
@@ -26,12 +31,11 @@
     min-height: 100vh;
   }
   header { display: flex; align-items: center; gap: 10px; padding: 8px 0 20px; }
-  header .tv {
-    width: 34px; height: 34px; border-radius: 8px;
-    background: var(--primary);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 18px; color: #14213d; font-weight: bold;
-  }
+  /* 头部图标：与 favicon 同一套矢量图形（圆角方块 + 播放三角） */
+  header .tv { width: 34px; height: 34px; border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+  header .tv svg { display: block; width: 100%; height: 100%; }
+  header .tv .bg { fill: var(--primary); }
+  header .tv .fg { fill: #14213d; }
   header h1 { font-size: 20px; font-weight: 600; }
   header .badge {
     margin-left: auto; font-size: 12px; color: var(--ok);
@@ -82,10 +86,21 @@
   .q-state.run  { color: var(--primary); }
   .q-state.ok   { color: var(--ok); }
   .q-state.err  { color: var(--err); }
+  .q-state.cancel { color: var(--dim); }
+  /* 每行的「取消 / 重试」按钮 */
+  .q-act {
+    flex-shrink: 0; font-size: 12px; font-weight: 600; line-height: 1;
+    font-family: inherit; cursor: pointer;
+    padding: 6px 11px; border-radius: 8px;
+    border: 1px solid #37455a; background: transparent; color: var(--dim);
+  }
+  .q-act.retry { color: var(--primary); border-color: rgba(79,195,247,.55); }
+  .q-act:active { background: var(--surface2); color: var(--on); }
   .bar { height: 4px; border-radius: 4px; background: #2c3744; margin-top: 10px; overflow: hidden; }
   .bar > i { display: block; height: 100%; width: 0; background: var(--primary); transition: width .15s; }
   .bar.ok > i { background: var(--ok); }
   .bar.err > i { background: var(--err); }
+  .bar.cancel > i { background: #55606e; }
 
   .toast {
     position: fixed; left: 50%; bottom: 60px; transform: translateX(-50%);
@@ -99,7 +114,12 @@
 </head>
 <body>
 <header>
-  <div class="tv">▶</div>
+  <div class="tv">
+    <svg viewBox="0 0 64 64" aria-hidden="true">
+      <rect class="bg" width="64" height="64" rx="15"/>
+      <path class="fg" d="M23 17.5 L47 32 L23 46.5 Z"/>
+    </svg>
+  </div>
   <h1>__DEVICE_NAME__</h1>
   <div class="badge" id="badge">已连接</div>
 </header>
@@ -141,7 +161,8 @@
   };
 
   var category = 'video';
-  var queue = [];        // {file, name, size, relPath, status, progress}
+  // status: wait（排队）/ run（上传中）/ ok / err（失败）/ cancel（已取消，可重试）
+  var queue = [];        // {file, name, size, relPath, status, progress, xhr}
   var uploading = false;
 
   var $ = function (id) { return document.getElementById(id); };
@@ -323,14 +344,33 @@
       state.textContent =
         item.status === 'wait' ? '等待' :
         item.status === 'run' ? item.progress + '%' :
-        item.status === 'ok' ? '成功' : '失败';
+        item.status === 'ok' ? '成功' :
+        item.status === 'cancel' ? '已取消' : '失败';
 
       row.appendChild(name);
       row.appendChild(size);
       row.appendChild(state);
 
+      // 操作按钮：排队中 / 上传中 → 取消；失败 / 已取消 → 重试（不必重新选文件）
+      var act = document.createElement('button');
+      act.className = 'q-act';
+      if (item.status === 'wait') {
+        act.textContent = '取消';
+        act.addEventListener('click', function () { dropItem(item); });
+      } else if (item.status === 'run') {
+        act.textContent = '取消';
+        act.addEventListener('click', function () { cancelItem(item); });
+      } else if (item.status === 'err' || item.status === 'cancel') {
+        act.textContent = '重试';
+        act.classList.add('retry');
+        act.addEventListener('click', function () { retryItem(item); });
+      } else {
+        act.style.display = 'none';   // 已成功的项不需要操作
+      }
+      row.appendChild(act);
+
       var bar = document.createElement('div');
-      bar.className = 'bar ' + (item.status === 'ok' ? 'ok' : item.status === 'err' ? 'err' : '');
+      bar.className = 'bar ' + (item.status === 'ok' ? 'ok' : item.status === 'err' ? 'err' : item.status === 'cancel' ? 'cancel' : '');
       var inner = document.createElement('i');
       inner.style.width = (item.status === 'ok' ? 100 : item.progress) + '%';
       bar.appendChild(inner);
@@ -339,6 +379,41 @@
       li.appendChild(bar);
       queueEl.appendChild(li);
     });
+  }
+
+  // ——— 队列操作：取消 / 重试 ———
+
+  /** 取消「排队中」的项：还没开始传，直接从队列移除 */
+  function dropItem(item) {
+    var i = queue.indexOf(item);
+    if (i >= 0) queue.splice(i, 1);
+    render();
+  }
+
+  /** 取消「上传中」的项：abort 掉 XHR，收尾交给 onabort 回调 */
+  function cancelItem(item) {
+    if (item.xhr) { item.xhr.abort(); return; }
+    // 极端情况：请求已结束但状态没落（如恰好在回调间隙点击），直接标为已取消
+    item.status = 'cancel';
+    render();
+  }
+
+  /** 重试：把「失败 / 已取消」的项重新排队，沿用原文件与相对路径 */
+  function retryItem(item) {
+    if (item.status !== 'err' && item.status !== 'cancel') return;
+    item.status = 'wait';
+    item.progress = 0;
+    // 插到「待上传区」最前面：批量上传时后面还排着一串文件，
+    // 若只把状态改回 wait，用户点了重试要等前面全部传完才有反应
+    var i = queue.indexOf(item);
+    if (i >= 0) queue.splice(i, 1);
+    var at = -1;
+    for (var j = 0; j < queue.length; j++) {
+      if (queue[j].status === 'wait') { at = j; break; }
+    }
+    if (at < 0) queue.push(item); else queue.splice(at, 0, item);
+    render();
+    uploadNext();
   }
 
   function uploadNext() {
@@ -358,6 +433,20 @@
     form.append('file', item.file, item.file.name);
 
     var xhr = new XMLHttpRequest();
+    item.xhr = xhr;
+
+    // 本轮结束收尾：幂等（abort 后个别浏览器会再补一个 error/load 回调，重复执行会并发跑起
+    // 两个上传），且只认本轮 xhr（取消后重试会新建 xhr，上一轮迟到的回调不得再改状态）
+    var done = false;
+    function finishOne() {
+      if (done) return;
+      done = true;
+      if (item.xhr === xhr) item.xhr = null;
+      uploading = false;
+      render();
+      uploadNext();
+    }
+
     // 分类/文件名/相对路径放 URL query：服务端在接收请求体之前就能读到，
     // 上传记录与进度条可立即建立（multipart 字段要接收完整个请求体才能解析）
     xhr.open('POST',
@@ -366,12 +455,14 @@
       '&relativepath=' + encodeURIComponent(item.relPath || ''),
       true);
     xhr.upload.onprogress = function (e) {
+      if (item.xhr !== xhr) return;
       if (e.lengthComputable) {
         item.progress = Math.floor(e.loaded / e.total * 100);
         render();
       }
     };
     xhr.onload = function () {
+      if (item.xhr !== xhr) return;
       item.status = (xhr.status >= 200 && xhr.status < 300) ? 'ok' : 'err';
       if (item.status === 'err') {
         try {
@@ -382,17 +473,19 @@
       finishOne();
     };
     xhr.onerror = function () {
+      if (item.xhr !== xhr) return;
       item.status = 'err';
       toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');
       finishOne();
     };
+    // 用户点「取消」：直接断开连接，已传的部分作废（电视端该条上传记录会记为失败）
+    xhr.onabort = function () {
+      if (item.xhr !== xhr) return;
+      item.status = 'cancel';
+      toast('已取消「' + item.name + '」');
+      finishOne();
+    };
     xhr.send(form);
-
-    function finishOne() {
-      uploading = false;
-      render();
-      uploadNext();
-    }
   }
 
   // ——— 服务器连通性 ———

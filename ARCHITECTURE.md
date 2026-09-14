@@ -350,6 +350,24 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **设置界面**：两项去掉「待实现」徽标，选值后 Toast 提示「返回媒体库即生效」，显示值由本地 `remember` 状态承载（`gridColumnsValue` / `defaultSortValue`）——理由同 §3.9 末段。
 
+### 3.13 手机网页上传队列的取消 / 重试（v1.5）
+
+**网页端（`assets/web/index.html`）**
+- 队列项状态机：`wait`（排队）→ `run`（上传中）→ `ok` / `err`；v1.5 新增 `cancel`（已取消，可重试）。每行按状态渲染操作按钮：`wait` / `run` → **取消**，`err` / `cancel` → **重试**，`ok` → 无按钮。
+- 取消 `wait`：直接从队列移除（还没开始传，没有残留）；取消 `run`：`xhr.abort()` **真断流**（不是只改 UI），项保留为灰色「已取消」，`onabort` 里落状态 + toast。
+- 重试：状态重置为 `wait` 并**插到待上传区最前面**——批量上传时后面还排着一串文件，若只把状态改回 `wait`，用户点了重试要等前面全部传完才有反应。
+- `finishOne()` 必须**幂等**：abort 之后部分浏览器会再补一个 `error` / `load` 回调，重复执行会把队列推进两次、**并发跑起两个上传**（用 `done` 标记挡掉）。
+- 每个回调开头统一 `if (item.xhr !== xhr) return`：取消后重试会新建 xhr 对象，上一轮迟到的回调不得再改状态。
+
+**服务端（`TransHttpServer.handleUpload`）——中断必须兜底收尾**
+- 客户端 `abort` 会让 `parseBody` 抛出 `ResponseException` **之外**的异常（IO 中断）。原先只捕 `ResponseException`，这类异常会冒泡到 `serve()` 变成 500，**且该条上传记录永远停在「上传中」**（`finishRecord` 从未执行过）。
+- 修法：接收 + 落盘逻辑抽到 `receiveAndSave(...)`，`handleUpload` 用 `try / catch (e: Exception) / finally { monitorJob.cancel() }` 兜底——任何异常都收尾为 `FAILED` 并返回错误响应。
+- 实测：取消一次上传后 DB 中该记录为 `state=3`（失败），**全库无一条 `state=1`（上传中）残留**；`upload_tmp` 临时目录无残留文件（NanoHTTPD 在会话结束时调用 `tempFileManager.clear()`）。
+
+**静态资源路由**
+- `GET /icon.svg` / `GET /icon.png` → `serveAsset("web/icon.*", mime)`，从 assets 现读现发（换图后手机端刷新即生效，无需重启服务器）。
+- 网页头部标识与浏览器标签页 favicon 共用同一套图形：`assets/web/icon.svg`（矢量，主选）+ `icon.png`（192×192，供不支持 SVG favicon 的浏览器兜底，同时作 `apple-touch-icon`）。
+
 ## 4. 构建与运行
 
 ```bash
@@ -368,4 +386,4 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - [ ] zip 压缩包上传后服务端自动解压并按分类过滤（需求 3.3.5 备选方案）
 - [ ] 断点续传（需求 4.4 P2）
 - [ ] 上传页面 Token 验证（需求 4.5 可选项）
-- [ ] 上传中断网时手机端支持「取消/重试」按钮（当前仅标记失败）
+- [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）
