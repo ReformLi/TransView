@@ -23,7 +23,7 @@ object SettingsStore {
     private const val PREFS = "transview_settings"
 
     /** 设备名称默认值（同时是设置页候选列表首项） */
-    const val DEFAULT_DEVICE_NAME = "传视TV"
+    const val DEFAULT_DEVICE_NAME = "传视"
 
     private var appContext: Context? = null
 

@@ -122,7 +122,7 @@ fun MainScreen() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                "传视TV",
+                "传视 TransView",
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -290,7 +290,8 @@ private fun ServerStatusBadge() {
         )
         Spacer(Modifier.width(10.dp))
         Text(
-            "· ${mode.label}",
+            // 首页只显示模式名本身（极速/智能/省电），不带「模式」后缀；设置页等处仍用完整 label
+            "· ${mode.label.removeSuffix("模式")}",
             style = MaterialTheme.typography.bodyMedium,
             color = OnDarkDim
         )

@@ -1,7 +1,8 @@
 # TransView 传视TV — 架构与实现说明
 
-> 版本：v1.9　日期：2026-09-14
+> 版本：v1.10　日期：2026-09-14
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.10 变更：**播放器交互重做——时间轴优先控制栏（§3.4 全节重写）**——① 控制栏三段结构（内联选择器 → 时间轴 → 按钮行），唤出时焦点落时间轴；② 倍速 / 画面比例改横排胶囊 `SelectorPill` 内联选择器、音轨 / 字幕改右侧滑入 `SettingsPanel`（删除 SpeedDialog / AspectDialog / TrackDialog 与 `anyDialogVisible`）；③ 时间轴可聚焦 + 左右拖动 + 上下换轨 / 边缘同向收起（`focusZone` 纵向轨道状态机）；④ 快进 / 快退反馈升级为缩略图预览卡（`loadThumb`：MediaMetadataRetriever + Mutex 串行 + 10s 分桶缓存 48 帧 + seq 守卫）；⑤ 播完自动连播前先弹下一集预告卡（5 秒倒计时，可立即播放 / 取消）。
 > v1.9 变更：**移除「上传与解压」设置组**——`SettingGroup.UPLOAD` 枚举、设置页 UI、`SettingsStore.autoUnzipZip/keepOriginalZip` 两键全部删除；压缩包解压改为固定行为：视频/图片分类 `.zip` 恒解压（`TransHttpServer` 触发条件去掉开关）、解压成功即删原包（`ZipExtractor` 第 4 步固定，失败路径仍一律保留）；设置页回归五分组（§3.9 / §3.14）。
 > v1.8.1 变更：**死数据治理**——① 僵尸「上传中」记录：进程被杀后 DB 残留的 RUNNING 记录永久卡在「上传中 xx%」，对账新增 0.5 步 `reapZombieRunning()` 统一标失败（仅在服务器未运行或本进程无在途上传时执行，防误伤活记录，§3.8）；② upload_records 表无限增长：insert 后自动裁剪只留最近 500 条（UI 最多显示 200，200 名之外为纯死数据，§3.8）；③ 删除无调用方的死 DAO 方法（MediaItemDao.getById/count、PlaybackHistoryDao.getPositionByPath）；④ 盘点报告：`addedTime`/`updatedTime` 为无读取方的预留字段（保留，成本可忽略）、`UploadStateCode.WAITING` 为无写入方的防御状态（保留 UI 映射）、`fallbackToDestructiveMigration` 发布 v3 起必须换正式迁移。
 > v1.8 变更：**需求级修正（按主流习惯）**——① 访问码**会话内固定**：`tryStart` 首次生成、进程内停启/改端口沿用、进程重启才轮换（原「每次启停轮换」会让熄屏/播放/休眠恢复反复把手机端打回输码界面）（§3.15）；② **传输不中断覆盖全部停服路径**：`apply(false)` 遇在途上传跳过停服，`UploadBus.records` 收集器在最后一个上传结束时补评估归位（原仅空闲休眠顺延）（§3.7）；③ 性能指标限定为增量对账 ≤5 秒、首扫视频时长提取为一次性成本（README §4.1）。
@@ -77,8 +78,10 @@ com.hpu.transview
     │                           三类弹框关闭后焦点回原行）
     ├── settings/SettingsStore.kt 设置偏好持久化（SharedPreferences object；端口/自启/设备名/续播提示/
     │                           连播/倍速/画面比例/列数/默认排序，均含默认值）
-    ├── player/PlayerActivity.kt 播放器（图标化控制栏、时间节点快进反馈、续播/连播/倍速/画面比例/音轨/字幕）
-    ├── player/PlayerWidgets.kt 播放器组件（Canvas 手绘 8 图标、进度条、中央反馈徽标）
+    ├── player/PlayerActivity.kt 播放器（v1.10 时间轴优先控制栏：内联选择器/可拖动时间轴/
+    │                           右侧音轨字幕面板/缩略图预览卡/下一集预告卡，续播/连播/倍速/比例）
+    ├── player/PlayerWidgets.kt 播放器组件（Canvas 手绘 9 图标含 SETTINGS、进度条聚焦态动画、
+    │                           选择器胶囊 SelectorPill、预览卡 PlayerScrubCard、预告卡 PlayerNextCard）
     └── image/ImageViewerActivity.kt 图片查看器（缩放/平移/切换）
 ```
 
@@ -142,40 +145,64 @@ com.hpu.transview
 - 顶部 `Row` 左右分栏（按占比自适应）：**左侧固定区**（`weight 0.9f`，不滚动）= 二维码 + 地址 + 复制按钮 + 服务器状态/唤醒入口；**右侧记录区**（`weight 2f`，`LazyColumn` 可滚动）= **纯上传记录列表**（数据库驱动）。
 - 每条记录含文件名/大小/进度条百分比/状态（等待中/上传中/成功/失败）/时间/分类六要素；焦点在记录上按**菜单键或删除键**（或右侧「删除」按钮）弹窗确认删除——**仅删 upload_records 日志，本地文件保留**；列表头部提供「清空所有记录」。
 
-### 3.4 播放器（v1.3 图标化控制栏）
+### 3.4 播放器（v1.10 时间轴优先控制栏）
 
 **播放列表与进度**
-- 同目录视频按**自然排序**（EP2 < EP10）构成播放列表；播完 `STATE_ENDED` 自动下一集。
-- **末集（或被连续快进跨过片尾）**：停在末尾、置 `ended=true`、弹出控制栏并显示「播放结束」，等待用户「重播」或按返回离开 —— **不调用 `finish()`**，避免被误当成闪退。
-- 进度每 2 秒及 onStop/onDestroy 入库；距片尾 <5s 视为看完自动清历史；再次打开 >10s 且 <95% 时弹续播提示（设置页「自动续播提示」关闭则静默续播，见 §3.11）。
+- 同目录视频按**自然排序**（EP2 < EP10）构成播放列表；播完 `STATE_ENDED` 进入结束分支。
+- **自动连播改为「预告卡 → 倒计时」两段式（v1.10）**：`hasNext && autoPlayNext` 时不再无感硬切，先 `showNextCard()` 弹右下预告卡（下一集缩略图 + 标题 + 5 秒倒计时，焦点落「立即播放」），倒计时归零 `skipTo(currentIndex+1)`；「取消」/Back/重播/seek 均作废倒计时，取消后停在片尾并徽标「已取消自动连播」。
+- **末集（或被连续快进跨过片尾 / 自动连播关闭）**：停在末尾、置 `ended=true`、弹出控制栏并显示「播放结束」（关闭连播时文案区分），等待用户「重播」或按返回离开 —— **不调用 `finish()`**，避免被误当成闪退。
+- 进度每 2 秒及 onStop 入库；距片尾 <5s 视为看完自动清历史（`finishedPaths` 守卫拦截清史后的 100% 回写）；再次打开 >10s 且 <95% 时弹续播提示（设置页「自动续播提示」关闭则静默续播，见 §3.11）。
 - 外挂字幕：同目录同主名 `.srt/.ass/.ssa/.vtt` 自动挂载为 `SubtitleConfiguration`。
-- 音轨/字幕选择基于 `player.currentTracks` + `TrackSelectionOverride`；倍速 0.5–2.0；画面比例 FIT/FILL/ZOOM 三档（均见 §3.11）。
+- 音轨/字幕选择基于 `player.currentTracks` + `TrackSelectionOverride`（面板打开时快照重算）；倍速 0.5–2.0；画面比例 FIT/FILL/ZOOM 三档（均见 §3.11）。
 
-**控制栏（`PlayerOverlay`，无文字主按钮）**
-- 全为 Canvas 手绘图标（`PlayerWidgets.kt`：`PlayerIconType { PREV, REWIND, PLAY, PAUSE, FORWARD, NEXT, AUDIO, SUBTITLE }`），仅倍速与画面比例用文字按钮（`PlayerTextButton`）；进度条为自绘（缓冲段 + 已播段 + 圆点滑块）。
-- 按钮组：上一集 / 快退 / 播放暂停 / 快进 / 下一集 + 倍速 / 比例 / 音轨 / 字幕。
+**控制栏三段结构（`PlayerOverlay`，v1.10 对齐 Netflix / tvOS）**
+自上而下：**内联选择器 → 时间轴 → 按钮行**。图标全为 Canvas 手绘（`PlayerWidgets.kt`：`PlayerIconType { PREV, REWIND, PLAY, PAUSE, FORWARD, NEXT, AUDIO, SUBTITLE, SETTINGS }`）。
+- **内联选择器（`InlineSelectorRow` + `SelectorPill`）**：倍速 / 画面比例的横排胶囊，出现在时间轴上方（`expandVertically` 动画）。来源按钮（`PlayerTextButton`「倍速 / 比例」，非默认值直接显示当前值）OK 打开，焦点落**当前选中项**（选中态主色淡填充 + 描边，聚焦态主色实填充 + 放大）；再 OK 即选即生效并收起；Back / 上键收起，焦点回来源按钮（`LaunchedEffect(inlineSelector)` 记录 `lastSelector` 来源并请求回焦）。**替代旧 SpeedDialog / AspectDialog 模态弹框**。
+- **时间轴（`TimelineRow`，控制栏主角）**：进度条区域可聚焦（28dp 热区），聚焦态轨道 6→10dp、圆点 7→11dp、主色光环（`PlayerProgressBar(focused=…)` + `animateFloatAsState` 平滑过渡）。聚焦时左右 = 拖动（复用 `onSeekDown/onSeekUp` 固定 10 秒步长 + 变速扫描，反馈走缩略图预览卡）、OK = 播放/暂停；上下交给焦点系统换轨。
+- **按钮行**：上一集 / 快退 / 播放暂停（60dp emphasized）/ 快进 / 下一集 ｜ 倍速 / 比例 / 设置（⚙ SETTINGS 图标）。音轨 / 字幕入口合并进 ⚙。
+- **右侧设置面板（`SettingsPanel`）**：⚙ 唤出右缘滑入面板（`slideInHorizontally`），内含「音轨 / 字幕」两分区（分区头用 AUDIO / SUBTITLE 手绘图标），`OptionRow` 列表可滚动（`heightIn(max=420dp) + verticalScroll`），字幕区恒有「关闭字幕」；OK 选择即生效并收起、焦点回 ⚙ 按钮；无轨道时占位提示「（无可切换音轨）」。**替代旧 TrackDialog**。
+- **下一集预告卡（`PlayerNextCard`）**：右下、控制栏上方；16:9 缩略图 + 标题 +「N 秒后自动播放」+「立即播放 / 取消」（`TvButton`，焦点落「立即播放」）。倒计时协程 `LaunchedEffect(nextCardVisible)` 每秒 -1；`hideNextCard()` 翻转状态即取消协程（取消 / 切集 / 重播 / seek 均走此路径）。
 
-**播放暂停图标统一为「动作式」语义（v1.3 关键决策）**
+**播放暂停图标统一为「动作式」语义（v1.3 关键决策，沿用）**
 - **图标表示按下去会发生什么**：`isPlaying && !ended` → 显示 `PAUSE`(‖)（按下会暂停）；否则显示 `PLAY`(▶)（按下会播放/重播）。
 - 单一来源函数 `playPauseIcon()`，**控制栏按钮与中央常驻图标共用**，两处方向永远一致（此前多轮“图标反了”的根因是「状态式」语义 + 两处各自判断）。
 - `togglePlayPause()` 按**按下前**的状态决定意图，不在 `player.play()` 后立刻读 `isPlaying` 反推（起播瞬间仍在 BUFFERING，`isPlaying==false`，会显示反）。
 
-**中央视觉反馈（`PlayerCentralBadge`，无底色面板）**
-- **瞬时徽标**：快进/快退显示 `FORWARD/REWIND` 图标 + 「`目标位置 / 总时长`」（如 `01:21 / 13:01`），**不再显示“快进 N 秒”**；起播显示「播放中」；结束显示「播放结束」。停留 1.2 秒后淡出。
-- **暂停常驻图标**：`!isPlaying && !ended && badgeText.isEmpty()` 时中央常驻播放图标（无背景），恢复播放淡出；有瞬时徽标时先让位，避免两图标重叠。
+**中央视觉反馈**
+- **缩略图预览卡（`PlayerScrubCard`，v1.10）**：快进 / 快退时中央显示「16:9 缩略图 + FORWARD/REWIND 图标 + `目标位置 / 总时长`」——用户能看到将要跳到的那一帧，拖动不再是盲跳；缩略图未就绪显示暗色占位。停留 1.2 秒淡出（`LaunchedEffect(scrubTick)`，变速扫描期间每 150ms 重置计时，卡片自然保持在场）。
+- **瞬时徽标（`PlayerCentralBadge`，无底色面板）**：起播为**纯图标**（‖，不带「播放中」文字——图标本身已是充分反馈，且与暂停常驻图标同样屏幕正中居中）、结束「播放结束」、取消连播「已取消自动连播」；与预览卡互斥让位。在场判定用 `badgeIcon != null || badgeText.isNotEmpty()`（纯图标徽标 text 为空，不能只判 text）。
+- **暂停常驻图标**：`!isPlaying && !ended && badgeIcon == null && badgeText.isEmpty() && scrubText.isEmpty()` 时中央常驻播放图标（无背景），恢复播放淡出。
 
-**快进/快退（`onSeekDown` / `onSeekUp`）**
-- 首次 `KeyDown` 起协程：400ms 内 `KeyUp` = 短按，否则进入变速扫描（节拍 150ms，倍率每 1.2s 翻倍 2x→4x→8x→16x）。
-- 短按连续快按累加步长 10→20→…→60 秒（`SEEK_CHAIN_WINDOW_MS = 1000` 窗口内判定），每次显示目标时间节点。
-- 长按期间系统重复 `KeyDown` 被 `seekJob` 拦截；`seekBy()` 对 `duration` 为 `TIME_UNSET`（负数）时兜底，避免 `coerceIn` 抛异常。
-- 快进只弹中央徽标、不弹控制栏，**保证连续快进不被打断**。
+**缩略图加载（`loadThumb` / `requestScrubThumb`，v1.10）**
+- `MediaMetadataRetriever` 取帧：`Dispatchers.IO` + `thumbMutex` 串行（retriever 非线程安全）；单实例复用（同文件不重复 `setDataSource`，切文件才重建）。
+- **10 秒分桶缓存**（`thumbBucket`）：预览不需精确到帧，分桶显著提高命中；`LinkedHashMap` 上限 48 帧（宽 256 缩放后 ≈ 7MB），超限淘汰最旧。
+- **seq 守卫**（`thumbReqSeq`）：慢速解码完成后只有最新请求才能上屏，防止旧位置的帧闪烁覆盖。
+- **变速扫描期间不追帧**（`showSeekBadge` 里 `!scrubStarted` 判定）：扫描每 150ms 一跳、取帧要几十到几百毫秒，追帧只会白烧 CPU 撑爆缓存；扫描结束（`onSeekUp`）与短按落点才请求最终帧。
+- 取帧失败（格式不支持 / 文件损坏）返回 null → 占位；`onDestroy` 释放 retriever。
 
-**遥控器映射**
-- 中键：控制栏隐藏时播放/暂停；控制栏显示时交给聚焦按钮。
-- 左右方向键：控制栏/对话框隐藏时才快退/快进（否则交给按钮做焦点导航）；**两种情况下都会刷新 6s 自动隐藏计时**——否则按键导航不续命，用户还在按钮间移动时控制栏就消失了，之后的左右键突然变成快进/快退（见 §3.6）。
-- 媒体键：⏪/⏩ 快退/快进；⏯/⏭/⏮ 播放暂停 / 下一集 / 上一集。
-- 菜单键 / 上 / 下：显示或收起控制栏（6s 无操作自动隐藏）；返回键：先收控制栏，再退出。
+**时间轴优先按键模型（`onKeyEvent` 根节点 `onPreviewKeyEvent` + `focusZone` 状态机）**
+- `focusZone`（TIMELINE / BUTTONS / SELECTOR / PANEL / CARD）由各区域 `onFocusChanged` **上报**（而非手动维护），上下键换轨与边缘收起都靠它判定。
+- 控制栏隐藏：左右 = 快退/快进（手势直控，连续快进不被打断）；OK = 播放/暂停；上 / 下 / 菜单 = 唤出控制栏，**焦点落时间轴**（`LaunchedEffect(overlayVisible)` → `timelineFocus`，v1.10 前是落播放按钮）。
+- 控制栏可见：时间轴聚焦时左右 = 拖动（根节点放行 → 时间轴自身 `onPreviewKeyEvent` 消费）、OK = 播放/暂停；**上下 = 在「时间轴 ↔ 按钮行」间换轨**（放行给焦点系统，物理相邻自动命中）；**最外缘再按同向 = 收起**（时间轴上再按上 / 按钮行上再按下，tvOS 边缘收起习惯；预告卡在场时豁免，防倒计时中途收走控制栏）。
+- 内联选择器打开：上键 = 收起（焦点回来源按钮）、下键吞掉（选择器下面没有轨道，防焦点掉进时间轴）、左右放行给胶囊焦点导航。
+- 设置面板打开：上下放行（面板内行间导航）；Back 收起。
+- 左右键**任何情况下都续命 6s 自动隐藏计时**（否则按键导航不续命，控制栏中途消失、左右键突然变成快进/快退）；选择器 / 面板 / 预告卡 / 续播弹窗在场时**不自动隐藏**（它们是自动隐藏 `LaunchedEffect` 的 key，打开即取消计时）。
+- 返回键分层：预告卡 → 设置面板 → 内联选择器 → 控制栏 → 退出。
+- 媒体键：⏪/⏩ 快退/快进（不受控制栏状态影响）；⏯/⏭/⏮ 播放暂停 / 下一集 / 上一集。
 - 「上一集/下一集」无对应集数时置灰但**仍保留焦点**（`PlayerIconButton` 禁用态可聚焦，见 §3.6）。
+
+**快进/快退（`onSeekDown` / `onSeekUp`，v1.3 沿用）**
+- 首次 `KeyDown` 起协程：400ms 内 `KeyUp` = 短按，否则进入变速扫描（节拍 150ms，倍率每 1.2s 翻倍 2x→4x→8x→16x）。
+- 短按固定跳 10 秒（v1.10 后不做链式累加：连按多少下都是一下 10 秒，落点可预估），每次弹预览卡。
+- 长按期间系统重复 `KeyDown` 被 `seekJob` 拦截（键盘 auto-repeat 拆成的独立按下/抬起对同样安全）；`seekBy()` 对 `duration` 为 `TIME_UNSET`（负数）时兜底，避免 `coerceIn` 抛异常。
+- 快进只弹预览卡、不弹控制栏，**保证连续快进不被打断**。
+
+**焦点流转总表（`PlayerScreen` 内各 `LaunchedEffect`，v1.10）**
+- 控制栏显隐切换：显示 → 时间轴；隐藏 → 根节点（常驻焦点，遥控器永不失焦）。
+- 内联选择器：开 → 选中项胶囊；关 → 来源按钮（倍速 / 比例）。控制栏被一并收起时（Menu / 边缘）不抢焦点，交给「隐藏 → 根节点」路径。
+- 设置面板：开 → 面板首个可聚焦行（首个音轨，无音轨则「关闭字幕」）；关 → ⚙ 按钮。
+- 预告卡：出现 → 「立即播放」；消失 → 时间轴（控制栏已隐藏则根节点）。
+- 续播弹窗：自己管理焦点，关闭后走「控制栏显示 → 时间轴」。
 
 ### 3.5 图片查看器
 - 全屏 Coil 展示；中键 1x↔2x 缩放，菜单键循环 1→1.5→2→3x；缩放时方向键平移（边界约束），未缩放时左右切换同目录图片（自然排序）。

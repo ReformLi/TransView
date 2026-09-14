@@ -1,15 +1,22 @@
 package com.hpu.transview.ui.player
 
 import android.content.Intent
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
@@ -20,10 +27,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -36,10 +46,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -74,40 +88,54 @@ import com.hpu.transview.ui.theme.TransViewTheme
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.isVideoFile
 import com.hpu.transview.util.naturalCompare
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * 视频播放器：
+ * 视频播放器（v1.10 时间轴优先控制栏，对齐 Netflix / tvOS 交互习惯）：
  * - Media3 ExoPlayer，支持外挂字幕（同名 .srt/.ass/.vtt）
  * - 播放进度自动入库（Room），再次打开弹出续播提示
- * - 播完自动连播同目录下一个视频（自然排序，EP2 < EP10）
+ * - 播完自动连播同目录下一个视频（自然排序，EP2 < EP10）；
+ *   自动连播开启时先弹「下一集预告卡」倒计时 5 秒（可立即播放/取消），不再无感硬切
  *
- * 设置页「播放设置」四项在此生效（`SettingsStore`，2026-09-14 接线）：
+ * 控制栏结构（自上而下）：
+ * - 内联选择器（倍速 / 画面比例横排胶囊）：取代旧模态弹框，OK 即选即生效，
+ *   Back / 上键关闭并回到来源按钮
+ * - 时间轴（控制栏主角）：聚焦时轨道加粗 + 主色光环；左右 = 拖动（中央弹
+ *   「快进/快退预览卡」：缩略图 + 目标时间，不再是盲跳）；OK = 播放/暂停
+ * - 按钮行：上一集 / 快退 / 播放暂停 / 快进 / 下一集 ｜ 倍速 / 比例 / 设置(⚙)
+ * - 设置面板（右侧滑入）：音轨 + 字幕两个分区的可滚动列表，取代旧 TrackDialog，
+ *   OK 即选即生效并收起，Back 收起并回到设置按钮
+ *
+ * 设置页「播放设置」四项在此生效（`SettingsStore`）：
  * - 自动续播提示：开（默认）→ 有历史进度时弹「续播/从头/取消」；关 → 静默从上次位置继续。
- * - 自动连播：开（默认）→ 播完自动跳下一集；关 → 播完停在片尾（显示「播放结束」，等用户重播/返回）。
- * - 默认倍速：打开播放器时的初始倍速（本次会话内仍可用倍速按钮随时改）。
- * - 默认画面比例：打开播放器时的初始画面比例（控制栏「比例」按钮可随时改，二者同一状态）。
+ * - 自动连播：开（默认）→ 播完弹预告卡倒计时 5 秒后连播；关 → 播完停在片尾。
+ * - 默认倍速 / 默认画面比例：打开播放器时的初始值（会话内可随时改，不回写设置）。
  *
- * 遥控器适配：
- * - 左/右方向键、遥控器 ⏪/⏩ 媒体键：快退/快进。短按 ±10 秒，连续快按累加步长（上限 60 秒），
- *   按住 400ms 后进入变速扫描（2x→4x→8x→16x），松开停止。反馈显示在屏幕中央（方向图标 +
- *   「01:21 / 13:01」目标时间节点，无底色面板），控制栏不会因此弹出 —— 保证连续快进不被打断。
- * - 图标统一按「动作式」显示 —— 图标表示按下去会发生什么：
- *   播放中显示 ‖（按下会暂停）、暂停显示 ▶（按下会播放）、播完显示 ▶（重播）。
- *   控制栏按钮与中央常驻图标共用 `playPauseIcon()`，两处方向永远一致。
- * - 中键：控制栏隐藏时播放/暂停；控制栏显示时确认当前聚焦按钮
- * - 菜单键 / 上 / 下：切换控制栏
- * - 遥控器 ⏯ / ⏭ / ⏮ 媒体键：播放暂停 / 下一集 / 上一集
- * - 返回键：先收控制栏，再退出
- * - 控制栏显示时的左右键是**焦点导航**（不是快进快退），且会刷新自动隐藏计时——
- *   否则用户还在按钮间移动时控制栏就消失了，之后的左右键会突然变成快进/快退。
- * - 「上一集/下一集」无对应集数时置灰，但**仍保留焦点**（`PlayerIconButton` 恒 `clickable(enabled = true)`，
- *   禁用态自己吞掉确定键 + 用灰色描边表示焦点）——否则在「下一集」上按确定键切到最后一集时，
- *   按钮当场变不可聚焦，焦点会掉到根节点、控制栏上一个高亮都不剩。详见 ARCHITECTURE §3.6。
+ * 遥控器适配（时间轴优先按键模型）：
+ * - 控制栏隐藏：左右 = 快退/快进（手势直控）；OK = 播放/暂停；上/下/菜单 = 唤出控制栏，
+ *   **焦点落在时间轴**。
+ * - 控制栏可见：时间轴聚焦 → 左右拖动（带缩略图预览）、OK 播放/暂停；上下在
+ *   「时间轴 ↔ 按钮行」之间换轨；**最外缘再按同向 = 收起控制栏**（时间轴上按上 /
+ *   按钮行上按下）。焦点所在轨道由 [focusZone] 跟踪（各区域 onFocusChanged 上报）。
+ * - 选择器 / 设置面板打开期间：不收起、不换轨（各自的边界处理）。
+ * - 快退/快进：短按固定 ±10 秒，按住 400ms 进入
+ *   变速扫描（2x→4x→8x→16x），反馈为中央预览卡（缩略图 + 目标时间）。
+ * - 遥控器 ⏪/⏩/⏯/⏭/⏮ 媒体键不受控制栏状态影响。
+ * - 返回键分层（BackHandler，predictive back 兼容）：预告卡 → 设置面板 → 选择器
+ *   → 控制栏 → 退出。
+ * - 图标按「动作式」显示（图标 = 按下去会发生什么），底栏与中央常驻图标共用
+ *   `playPauseIcon()`，两处方向永远一致。
+ * - 「上一集/下一集」无对应集数时置灰但**仍保留焦点**（`PlayerIconButton` 恒可聚焦，
+ *   禁用态自己吞掉确定键）——否则切到最后一集时按钮当场不可聚焦，焦点会掉到根节点。
+ *   详见 ARCHITECTURE §3.6。
  */
 class PlayerActivity : ComponentActivity() {
 
@@ -117,14 +145,8 @@ class PlayerActivity : ComponentActivity() {
         const val EXTRA_RESULT_PATH = "last_viewed_path"
         private val SPEED_OPTIONS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
 
-        /** 短按一次的快进/快退步长 */
+        /** 短按一次的快进/快退步长（固定 10 秒，不做链式累加） */
         private const val SEEK_STEP_MS = 10_000L
-
-        /** 连续快按的累加步长上限 */
-        private const val SEEK_CHAIN_MAX_MS = 60_000L
-
-        /** 判定「连续快按」的时间窗口 */
-        private const val SEEK_CHAIN_WINDOW_MS = 1_000L
 
         /** 按住超过该时长即进入变速扫描 */
         private const val SEEK_LONG_PRESS_MS = 400L
@@ -133,11 +155,14 @@ class PlayerActivity : ComponentActivity() {
         private const val SEEK_SCAN_INTERVAL_MS = 150L
         private const val SEEK_SCAN_STEP_MS = 150L
 
-        /** 中央徽标停留时长 */
+        /** 中央徽标 / 快进预览卡停留时长 */
         private const val BADGE_HOLD_MS = 1_200L
 
         /** 控制栏无操作自动隐藏时长 */
         private const val OVERLAY_AUTO_HIDE_MS = 6_000L
+
+        /** 下一集预告卡倒计时（秒） */
+        private const val NEXT_CARD_COUNTDOWN_SEC = 5
 
         /**
          * 默认画面比例 → PlayerView 缩放模式（常量定义在 `AspectRatioFrameLayout`，PlayerView 自身没有）：
@@ -159,10 +184,6 @@ class PlayerActivity : ComponentActivity() {
     // —— Compose 状态 ——
     var overlayVisible by mutableStateOf(true)
     var showResumeDialog by mutableStateOf(false)
-    var showSpeedDialog by mutableStateOf(false)
-    var showAspectDialog by mutableStateOf(false)
-    var showAudioDialog by mutableStateOf(false)
-    var showSubtitleDialog by mutableStateOf(false)
     var isPlaying by mutableStateOf(false)
     var positionMs by mutableStateOf(0L)
     var durationMs by mutableStateOf(0L)
@@ -176,11 +197,37 @@ class PlayerActivity : ComponentActivity() {
     /** 最后一个视频已播完：停在末尾等待用户「重播」或按返回离开，不再自动退出 */
     var ended by mutableStateOf(false)
 
-    // —— 中央反馈徽标 ——
+    // —— 时间轴优先控制栏（v1.10）：内联选择器 + 设置面板 + 下一集预告卡 ——
+
+    /** 控制栏上方弹出的内联选择器（倍速 / 画面比例），取代旧的模态弹框 */
+    var inlineSelector by mutableStateOf<InlineSelector>(InlineSelector.NONE)
+
+    /** 右侧滑入的「音轨 / 字幕」设置面板，取代旧的 TrackDialog */
+    var showSettingsPanel by mutableStateOf(false)
+
+    /** 焦点当前所处的纵向「轨道」：时间轴 / 按钮行 / 选择器 / 面板 / 预告卡。
+     *  上下键在轨道之间换轨、在最外缘收起控制栏，都靠它判定。 */
+    var focusZone by mutableStateOf(FocusZone.TIMELINE)
+
+    /** 播完且自动连播开启时的「下一集预告卡」（倒计时 5 秒，可取消） */
+    var nextCardVisible by mutableStateOf(false)
+    var nextCountdownSec by mutableStateOf(5)
+
+    // —— 中央反馈徽标（播放/暂停/起播等瞬时反馈；快进快退走 ScrubCard） ——
     private var badgeIcon by mutableStateOf<PlayerIconType?>(null)
     private var badgeText by mutableStateOf("")
     private var badgeTick by mutableStateOf(0)
     private var badgeTickSeq = 0
+
+    // —— 快进/快退预览卡（缩略图 + 目标时间，取代旧的纯文字徽标） ——
+    private var scrubForward by mutableStateOf(true)
+    private var scrubText by mutableStateOf("")
+    private var scrubTick by mutableStateOf(0)
+    private var scrubTickSeq = 0
+    private var scrubThumb by mutableStateOf<ImageBitmap?>(null)
+
+    /** 下一集预告卡的封面帧（取下一集开头附近的帧） */
+    var nextThumb by mutableStateOf<ImageBitmap?>(null)
 
     private var pendingResumePosition = 0L
 
@@ -202,15 +249,23 @@ class PlayerActivity : ComponentActivity() {
     // —— 快进/快退状态 ——
     private var seekJob: Job? = null
     private var scrubStarted = false
-    private var seekAccumMs = 0L
-    private var lastSeekAt = 0L
+
+    // —— 缩略图预览（MediaMetadataRetriever，IO 线程 + 互斥串行 + LRU 式缓存） ——
+    private val thumbCache = LinkedHashMap<String, ImageBitmap>()
+    private val thumbMutex = Mutex()
+    private var thumbRetriever: MediaMetadataRetriever? = null
+    private var thumbRetrieverPath: String? = null
+    private var thumbReqSeq = 0
 
     private val currentFile: File? get() = playlist.getOrNull(currentIndex)
     private val hasNext: Boolean get() = currentIndex + 1 < playlist.size
     private val hasPrev: Boolean get() = currentIndex > 0
-    private val anyDialogVisible: Boolean
-        get() = showResumeDialog || showSpeedDialog || showAspectDialog ||
-            showAudioDialog || showSubtitleDialog
+
+    /** 内联选择器类型（控制栏上方横排胶囊） */
+    enum class InlineSelector { NONE, SPEED, ASPECT }
+
+    /** 控制栏内的纵向焦点轨道 */
+    enum class FocusZone { TIMELINE, BUTTONS, SELECTOR, PANEL, CARD }
 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(playing: Boolean) {
@@ -228,16 +283,15 @@ class PlayerActivity : ComponentActivity() {
                     finishedPaths += file.absolutePath
                     lifecycleScope.launch { repository.clear(file.absolutePath) }
                 }
-                // 自动连播开启（默认）且还有下一集 → 直接续播；关闭时即使有下一集也停在片尾，
-                // 由用户决定「重播」还是按返回离开（与最后一集的收尾表现一致）。
+                ended = true
+                overlayVisible = true
+                lastInteractionTick++
                 if (hasNext && SettingsStore.autoPlayNext) {
-                    skipTo(currentIndex + 1)
+                    // 自动连播开启且还有下一集：弹「下一集预告卡」倒计时 5 秒
+                    // （主流做法：给用户反悔/立即播放的机会，而不是无感硬切）
+                    showNextCard()
                 } else {
-                    // 最后一集播到（或被连续快进跨过）片尾：停在末尾并弹出控制栏，
-                    // 由用户决定「重播」或按返回离开 —— 避免直接 finish 被误当成闪退。
-                    ended = true
-                    overlayVisible = true
-                    lastInteractionTick++
+                    // 最后一集 / 自动连播关闭：停在片尾由用户决定「重播」还是离开
                     showBadge(
                         null,
                         if (hasNext) "播放结束（自动连播已关闭）" else "播放结束"
@@ -245,8 +299,10 @@ class PlayerActivity : ComponentActivity() {
                 }
             } else if (ended) {
                 // seek / 重播后重新进入准备状态，退出结束态；
-                // 同时解除「已看完」守卫——用户回看（如快退到中部）时进度要恢复正常记录
+                // 同时解除「已看完」守卫——用户回看（如快退到中部）时进度要恢复正常记录。
+                // 离开结束态也意味着预告卡（若还在倒计时）作废——用户已经自己行动了。
                 ended = false
+                hideNextCard()
                 currentFile?.let { finishedPaths.remove(it.absolutePath) }
             }
         }
@@ -358,6 +414,9 @@ class PlayerActivity : ComponentActivity() {
         ServerController.setPlaying(false)
         player.removeListener(playerListener)
         player.release()
+        runCatching { thumbRetriever?.release() }
+        thumbRetriever = null
+        thumbRetrieverPath = null
         super.onDestroy()
     }
 
@@ -405,6 +464,7 @@ class PlayerActivity : ComponentActivity() {
     private fun skipTo(index: Int) {
         if (index !in playlist.indices) return
         saveProgress()
+        hideNextCard()
         currentIndex = index
         postResult()
         ended = false
@@ -443,23 +503,25 @@ class PlayerActivity : ComponentActivity() {
      * 播放 / 暂停。注意不能用 `player.play()` 之后立刻读 `player.isPlaying` 反推状态 ——
      * 起播瞬间播放器还在 BUFFERING，isPlaying 仍为 false，会导致反馈图标刚好显示反。
      * 这里按「按下前的状态」确定意图：暂停不弹瞬时徽标（由中央常驻图标负责），
-     * 起播则弹一次「播放中」徽标。
+     * 起播弹一次纯图标徽标（不带文字，与暂停常驻图标同样居中）。
      */
     private fun togglePlayPause() {
         if (ended) {
-            // 播完状态下按播放键 = 重播：解除「已看完」守卫，此后正常记录新进度
+            // 播完状态下按播放键 = 重播：解除「已看完」守卫，此后正常记录新进度。
+            // 重播意味着放弃预告卡倒计时（否则会边重播边被倒计时切走）
+            hideNextCard()
             currentFile?.let { finishedPaths.remove(it.absolutePath) }
             ended = false
             player.seekTo(0)
             player.play()
-            showBadge(PlayerIconType.PAUSE, "播放中")
+            showBadge(PlayerIconType.PAUSE, "")
             return
         }
         if (player.isPlaying) {
             player.pause()
         } else {
             player.play()
-            showBadge(PlayerIconType.PAUSE, "播放中")
+            showBadge(PlayerIconType.PAUSE, "")
         }
     }
 
@@ -477,8 +539,8 @@ class PlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 快进/快退反馈：方向图标 + 「01:21 / 13:01」（目标位置 / 总时长），
-     * 不再显示「快进 N 秒」，方便直接对到具体时间节点。
+     * 快进/快退反馈（v1.10 升级为预览卡）：缩略图（异步）+ 方向图标 +「01:21 / 13:01」
+     * （目标位置 / 总时长）。用户能看到将要跳到的那一帧，拖动不再是盲跳。
      */
     private fun showSeekBadge(dir: Int, targetMs: Long) {
         val total = player.duration
@@ -487,7 +549,85 @@ class PlayerActivity : ComponentActivity() {
         } else {
             FileUtils.formatDuration(targetMs)
         }
-        showBadge(if (dir > 0) PlayerIconType.FORWARD else PlayerIconType.REWIND, text)
+        scrubForward = dir > 0
+        scrubText = text
+        scrubTick = ++scrubTickSeq
+        // 变速扫描期间（每 150ms 一次）不追帧：retriever 取帧要几十到几百毫秒，
+        // 追不上只会白烧 CPU 撑爆缓存；扫描结束/短按落点才加载最终帧
+        currentFile?.let { if (!scrubStarted) requestScrubThumb(it, targetMs) }
+    }
+
+    // ————— 缩略图预览（快进预览卡 / 下一集预告卡共用） —————
+
+    /** 取 10 秒分桶：预览不需要精确到帧，分桶可显著提高缓存命中 */
+    private fun thumbBucket(ms: Long): Long = ms / 10_000L * 10_000L
+
+    /** 请求当前快进位置的预览帧（seq 守卫：慢速解码完成后，只有最新请求才能上屏） */
+    private fun requestScrubThumb(file: File, atMs: Long) {
+        val bucket = thumbBucket(atMs)
+        val key = "${file.absolutePath}#$bucket"
+        thumbCache[key]?.let { cached ->
+            scrubThumb = cached
+            return
+        }
+        scrubThumb = null // 占位（避免显示错误位置的旧帧）
+        val seq = ++thumbReqSeq
+        lifecycleScope.launch {
+            val bmp = loadThumb(file.absolutePath, bucket)
+            if (seq == thumbReqSeq) scrubThumb = bmp
+        }
+    }
+
+    /**
+     * 取指定文件、指定时间（10 秒桶）的预览帧：IO 线程 + 互斥串行（MediaMetadataRetriever
+     * 非线程安全）+ 进程内缓存（上限 48 帧 ≈ 7MB，超限淘汰最旧）。取帧失败（格式不支持 /
+     * 文件损坏）返回 null，调用方显示占位。
+     */
+    private suspend fun loadThumb(path: String, bucketMs: Long): ImageBitmap? =
+        thumbMutex.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val key = "$path#$bucketMs"
+                    thumbCache[key]?.let { return@runCatching it }
+                    if (thumbRetrieverPath != path) {
+                        thumbRetriever?.release()
+                        val retriever = MediaMetadataRetriever()
+                        retriever.setDataSource(path)
+                        thumbRetriever = retriever
+                        thumbRetrieverPath = path
+                    }
+                    val raw = thumbRetriever
+                        ?.getFrameAtTime(bucketMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        ?: return@runCatching null
+                    // 统一缩到宽 256（高按比例），控制缓存内存占用
+                    val scaled = if (raw.width > 256) {
+                        val ratio = 256f / raw.width
+                        Bitmap.createScaledBitmap(raw, 256, (raw.height * ratio).toInt(), true)
+                    } else raw
+                    val image = scaled.asImageBitmap()
+                    if (thumbCache.size >= 48) {
+                        thumbCache.remove(thumbCache.keys.first())
+                    }
+                    thumbCache[key] = image
+                    image
+                }.getOrNull()
+            }
+        }
+
+    // ————— 下一集预告卡 —————
+
+    private fun showNextCard() {
+        nextCountdownSec = NEXT_CARD_COUNTDOWN_SEC
+        nextCardVisible = true
+        nextThumb = null
+        // 预告卡封面：取下一集开头附近的帧（不必等它，加载完成自然出现）
+        playlist.getOrNull(currentIndex + 1)?.let { next ->
+            lifecycleScope.launch { nextThumb = loadThumb(next.absolutePath, 5_000L) }
+        }
+    }
+
+    private fun hideNextCard() {
+        nextCardVisible = false
     }
 
     // ————— 中央反馈徽标 —————
@@ -530,21 +670,30 @@ class PlayerActivity : ComponentActivity() {
         val wasScanning = scrubStarted
         job.cancel()
         scrubStarted = false
-        if (wasScanning) return
-
-        // 短按：连续快按累加步长 10 → 20 → 30 …（上限 60 秒）
-        val now = System.currentTimeMillis()
-        seekAccumMs = if (now - lastSeekAt < SEEK_CHAIN_WINDOW_MS) {
-            (seekAccumMs + SEEK_STEP_MS).coerceAtMost(SEEK_CHAIN_MAX_MS)
-        } else {
-            SEEK_STEP_MS
+        if (wasScanning) {
+            // 扫描结束：补一次最终落点的预览帧（扫描期间刻意不追帧，见 showSeekBadge）
+            currentFile?.let { requestScrubThumb(it, player.currentPosition) }
+            return
         }
-        lastSeekAt = now
-        showSeekBadge(dir, seekBy(dir * seekAccumMs))
+
+        // 短按：固定跳 10 秒（不累加——用户习惯一下一下蹦，链式步长反而难预估落点）
+        showSeekBadge(dir, seekBy(dir * SEEK_STEP_MS))
     }
 
     // ————— 遥控器按键 —————
 
+    /**
+     * 时间轴优先按键模型（v1.10，对齐 Netflix / tvOS 习惯）：
+     * - 控制栏隐藏：左右 = 快退/快进（手势直控，连续快进不被打断）；OK = 播放/暂停；
+     *   上 / 下 / 菜单 = 唤出控制栏，**焦点落在时间轴**（时间轴是主角）。
+     * - 控制栏可见：时间轴聚焦时左右 = 拖动（带缩略图预览）、OK = 播放/暂停；
+     *   上下 = 在「时间轴 ↔ 按钮行」之间换轨；**最外缘再按同向 = 收起控制栏**
+     *   （时间轴上再按上 / 按钮行上再按下，tvOS 边缘收起习惯）。
+     * - 内联选择器 / 设置面板打开期间：不收起、不换轨（各自的 handler 处理边界）。
+     * - 返回键分层：预告卡 → 设置面板 → 选择器 → 控制栏 → 退出。
+     *   统一由 PlayerScreen 里的 BackHandler 处理（predictive back 下返回键不进
+     *   KeyEvent 派发链；旧设备未消费的返回键也最终流入 OnBackPressedDispatcher）。
+     */
     private fun onKeyEvent(event: KeyEvent): Boolean {
         val down = event.type == KeyEventType.KeyDown
 
@@ -561,15 +710,13 @@ class PlayerActivity : ComponentActivity() {
             else -> Unit
         }
 
-        // 方向左右键：控制栏显示时交给按钮做焦点导航；隐藏时才是快退/快进。
-        // 快进只弹中央徽标、不弹控制栏，因此连续快进不会被打断。
         if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
-            // 左右键**也要续命**自动隐藏计时：否则按键导航不刷新计时，用户还在按钮之间移动时
-            // 控制栏会突然消失，接下来的左右键变成快进/快退（实测踩过：连按 5 次右，中途控制栏
-            // 隐藏，后几次直接被当成快进而弹出「02:21 / 13:01」徽标）。控制栏隐藏时自增无副作用，
-            // 因为自动隐藏的 LaunchedEffect 只在 overlayVisible 时生效。
+            // 左右键**要续命**自动隐藏计时：否则按键导航不刷新计时，用户还在移动时
+            // 控制栏会突然消失，之后的按键语义会突变（实测踩过）。
             if (down) lastInteractionTick++
-            if (overlayVisible || anyDialogVisible) return false
+            // 控制栏可见时交给焦点系统：时间轴聚焦 → 时间轴自身的 handler 把左右键变成拖动；
+            // 按钮 / 胶囊 / 面板聚焦 → 焦点导航（各行自带边界 trap）。
+            if (overlayVisible || showResumeDialog) return false
             val dir = if (event.key == Key.DirectionRight) 1 else -1
             if (down) onSeekDown(dir) else onSeekUp(dir)
             return true
@@ -579,17 +726,15 @@ class PlayerActivity : ComponentActivity() {
         lastInteractionTick++
 
         return when (event.key) {
-            Key.Back -> {
-                // 控制栏可见时先收起，再按才退出
-                if (overlayVisible && !anyDialogVisible) {
-                    overlayVisible = false
-                    true
-                } else false
-            }
+            // 注意：不处理 Key.Back —— 返回键统一由 PlayerScreen 里的 BackHandler 处理。
+            // 实测 API 34+ 上返回键的 DOWN 会正常进 KeyEvent 派发链、UP 会被 ViewRootImpl
+            // 转成 OnBackInvoked 回调：若这里也消费 DOWN 会「收起面板 + 退出」双重触发
+            //（旧设备上未消费的返回键最终也流入 OnBackPressedDispatcher，BackHandler 通吃）。
 
-            Key.Menu -> {
-                overlayVisible = !overlayVisible
-                true
+            Key.Menu -> when {
+                nextCardVisible -> { hideNextCard(); true }
+                overlayVisible -> { hideOverlay(); true }
+                else -> { openOverlay(); true }
             }
 
             Key.MediaPlayPause, Key.MediaPlay, Key.MediaPause -> {
@@ -607,16 +752,31 @@ class PlayerActivity : ComponentActivity() {
                 true
             }
 
-            Key.DirectionUp, Key.DirectionDown -> {
-                if (anyDialogVisible) false else {
-                    overlayVisible = !overlayVisible
-                    true
+            Key.DirectionUp -> when {
+                showResumeDialog -> false
+                inlineSelector != InlineSelector.NONE -> { closeSelector(); true }
+                showSettingsPanel -> false   // 面板内上下 = 行间导航
+                overlayVisible -> {
+                    // 时间轴已是最高轨道：再向上 = 收起（预告卡倒计时期间保持控制栏在场）
+                    if (focusZone == FocusZone.TIMELINE && !nextCardVisible) hideOverlay() else false
                 }
+                else -> openOverlay()
+            }
+
+            Key.DirectionDown -> when {
+                showResumeDialog -> false
+                inlineSelector != InlineSelector.NONE -> true  // 选择器下面没有轨道，吞掉防止焦点掉进时间轴
+                showSettingsPanel -> false
+                overlayVisible -> {
+                    // 按钮行已是最低轨道：再向下 = 收起
+                    if (focusZone == FocusZone.BUTTONS && !nextCardVisible) hideOverlay() else false
+                }
+                else -> openOverlay()
             }
 
             Key.DirectionCenter, Key.Enter -> {
-                // 控制栏显示时交给当前聚焦的按钮
-                if (overlayVisible || anyDialogVisible) false else {
+                // 控制栏可见时交给当前聚焦元素（时间轴聚焦 → 时间轴自己处理为播放/暂停）
+                if (overlayVisible || showResumeDialog) false else {
                     togglePlayPause()
                     true
                 }
@@ -626,12 +786,41 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
+    private fun openOverlay(): Boolean {
+        overlayVisible = true
+        return true
+    }
+
+    /** 收起控制栏，顺带关掉内联选择器 / 设置面板（它们是控制栏的子状态） */
+    private fun hideOverlay(): Boolean {
+        overlayVisible = false
+        inlineSelector = InlineSelector.NONE
+        showSettingsPanel = false
+        return true
+    }
+
+    private fun closeSelector(): Boolean {
+        inlineSelector = InlineSelector.NONE
+        return true
+    }
+
+    private fun closeSettingsPanel(): Boolean {
+        showSettingsPanel = false
+        return true
+    }
+
     // ————— Compose UI —————
 
     @Composable
     private fun PlayerScreen() {
         val rootFocus = remember { FocusRequester() }
-        val playFocus = remember { FocusRequester() }
+        val timelineFocus = remember { FocusRequester() }
+        val selectorFocus = remember { FocusRequester() }
+        val speedBtnFocus = remember { FocusRequester() }
+        val aspectBtnFocus = remember { FocusRequester() }
+        val settingsBtnFocus = remember { FocusRequester() }
+        val panelFocus = remember { FocusRequester() }
+        val cardPlayFocus = remember { FocusRequester() }
 
         // 位置 / 缓冲 / 时长刷新
         LaunchedEffect(Unit) {
@@ -643,38 +832,124 @@ class PlayerActivity : ComponentActivity() {
             }
         }
 
-        // 控制栏无操作自动隐藏（对话框打开期间不隐藏）
+        // 控制栏无操作自动隐藏。选择器 / 设置面板 / 预告卡 / 续播弹窗在场期间不隐藏
+        //（它们都是 key，打开即取消计时、关闭即重新计时）。
         LaunchedEffect(
-            overlayVisible, lastInteractionTick,
-            showResumeDialog, showSpeedDialog, showAspectDialog, showAudioDialog, showSubtitleDialog
+            overlayVisible, lastInteractionTick, showResumeDialog,
+            inlineSelector, showSettingsPanel, nextCardVisible
         ) {
-            if (overlayVisible && !anyDialogVisible) {
+            val pinned = showResumeDialog || nextCardVisible ||
+                inlineSelector != InlineSelector.NONE || showSettingsPanel
+            if (overlayVisible && !pinned) {
                 delay(OVERLAY_AUTO_HIDE_MS)
-                if (!anyDialogVisible) overlayVisible = false
+                val stillPinned = showResumeDialog || nextCardVisible ||
+                    inlineSelector != InlineSelector.NONE || showSettingsPanel
+                if (overlayVisible && !stillPinned) overlayVisible = false
             }
         }
 
-        // 中央徽标自动消失
+        // 中央徽标自动消失（纯图标徽标——如起播反馈——也要计时消失）
         LaunchedEffect(badgeTick) {
-            if (badgeText.isNotEmpty()) {
+            if (badgeIcon != null || badgeText.isNotEmpty()) {
                 delay(BADGE_HOLD_MS)
                 badgeText = ""
                 badgeIcon = null
             }
         }
 
-        // 焦点归属：对话框自己管焦点 → 控制栏显示则落到播放/暂停 → 否则回到根节点收键
-        LaunchedEffect(
-            overlayVisible,
-            showResumeDialog, showSpeedDialog, showAspectDialog, showAudioDialog, showSubtitleDialog
-        ) {
+        // 快进/快退预览卡自动消失：期间有新动作会重启本 effect（key = scrubTick），
+        // 变速扫描时每 150ms 一跳，卡片自然保持在场。
+        LaunchedEffect(scrubTick) {
+            if (scrubText.isNotEmpty()) {
+                delay(BADGE_HOLD_MS)
+                scrubText = ""
+            }
+        }
+
+        // 焦点归属：续播弹窗自己管焦点 → 控制栏显示则落到时间轴（时间轴是主角）
+        // → 否则回到根节点收键
+        LaunchedEffect(overlayVisible, showResumeDialog) {
             when {
-                anyDialogVisible -> Unit
+                showResumeDialog -> Unit
                 overlayVisible -> {
                     delay(50)
-                    runCatching { playFocus.requestFocus() }
+                    runCatching { timelineFocus.requestFocus() }
                 }
                 else -> runCatching { rootFocus.requestFocus() }
+            }
+        }
+
+        // 返回键分层：预告卡 → 设置面板 → 内联选择器 → 控制栏 → 退出。
+        // 必须用 BackHandler（OnBackPressedDispatcher）而非在 onKeyEvent 里处理 Key.Back：
+        // targetSdk 33+ 在 Android 13+ 上 predictive back 接管返回键，若 onKeyEvent 也消费
+        // DOWN 会「收起面板 + 退出」双重触发；未消费的返回键（新旧设备）最终都流入
+        // OnBackPressedDispatcher，BackHandler 通吃。
+        // 续播弹窗是独立 Dialog 窗口，返回键先由它的 onDismissRequest 处理，不经过这里。
+        BackHandler {
+            when {
+                nextCardVisible -> hideNextCard()
+                showSettingsPanel -> closeSettingsPanel()
+                inlineSelector != InlineSelector.NONE -> closeSelector()
+                overlayVisible -> hideOverlay()
+                else -> finish()
+            }
+        }
+
+        // 内联选择器开/关的焦点流转：开 → 焦点落到当前选中项；
+        // 关（选择生效 / Back / 上键）→ 焦点回到来源按钮（倍速/比例），「关了马上能再开」
+        var selectorWasOpen by remember { mutableStateOf(false) }
+        var lastSelector by remember { mutableStateOf(InlineSelector.NONE) }
+        LaunchedEffect(inlineSelector) {
+            if (inlineSelector != InlineSelector.NONE) {
+                lastSelector = inlineSelector
+                selectorWasOpen = true
+                delay(50)
+                runCatching { selectorFocus.requestFocus() }
+            } else if (selectorWasOpen) {
+                selectorWasOpen = false
+                // 控制栏被一并收起时（Menu/边缘收起）不抢焦点，交给 overlayVisible 的 effect 回根节点
+                if (overlayVisible) {
+                    val target = if (lastSelector == InlineSelector.SPEED) speedBtnFocus else aspectBtnFocus
+                    runCatching { target.requestFocus() }
+                }
+            }
+        }
+
+        // 设置面板开/关的焦点流转：开 → 面板首行；关 → 回到设置按钮
+        var panelWasOpen by remember { mutableStateOf(false) }
+        LaunchedEffect(showSettingsPanel) {
+            if (showSettingsPanel) {
+                panelWasOpen = true
+                delay(50)
+                runCatching { panelFocus.requestFocus() }
+            } else if (panelWasOpen) {
+                panelWasOpen = false
+                if (overlayVisible) runCatching { settingsBtnFocus.requestFocus() }
+            }
+        }
+
+        // 下一集预告卡：出现 → 焦点落到「立即播放」；消失 → 回到时间轴
+        var cardWasVisible by remember { mutableStateOf(false) }
+        LaunchedEffect(nextCardVisible) {
+            if (nextCardVisible) {
+                cardWasVisible = true
+                delay(50)
+                runCatching { cardPlayFocus.requestFocus() }
+            } else if (cardWasVisible) {
+                cardWasVisible = false
+                if (overlayVisible) runCatching { timelineFocus.requestFocus() }
+                else runCatching { rootFocus.requestFocus() }
+            }
+        }
+
+        // 预告卡倒计时：每秒 -1，归零自动切下一集（取消/切集会翻转 nextCardVisible 取消本协程）
+        LaunchedEffect(nextCardVisible) {
+            if (nextCardVisible) {
+                while (nextCountdownSec > 0) {
+                    delay(1_000)
+                    nextCountdownSec--
+                }
+                if (nextCardVisible) skipTo(currentIndex + 1)
             }
         }
 
@@ -703,11 +978,10 @@ class PlayerActivity : ComponentActivity() {
             )
 
             // 暂停后常驻的中央图标（无背景）：暂停后一直显示，恢复播放即淡出。
-            // 图标与底栏按钮同一套「动作式」规则（暂停时显示 ▶，表示按下去会播放），
-            // 两处方向永远一致，不会看起来像「反了」。
-            // 有瞬时反馈（快进/快退/起播）时先让位，避免两个图标叠在一起。
+            // 图标与底栏按钮同一套「动作式」规则（暂停时显示 ▶，表示按下去会播放）。
+            // 有瞬时反馈（快进/快退预览卡/起播图标）时先让位，避免两个图标叠在一起。
             AnimatedVisibility(
-                visible = !isPlaying && !ended && badgeText.isEmpty(),
+                visible = !isPlaying && !ended && badgeIcon == null && badgeText.isEmpty() && scrubText.isEmpty(),
                 enter = fadeIn(tween(160)),
                 exit = fadeOut(tween(200)),
                 modifier = Modifier.align(Alignment.Center)
@@ -715,14 +989,24 @@ class PlayerActivity : ComponentActivity() {
                 PlayerCentralBadge(icon = playPauseIcon(), text = "")
             }
 
-            // 中央瞬时反馈：快进/快退（目标时间节点）、起播、播放结束，控制栏不参与
+            // 中央瞬时反馈：起播（纯图标，居中同暂停常驻图标）、播放结束等，控制栏不参与（快进/快退走预览卡）
             AnimatedVisibility(
-                visible = badgeText.isNotEmpty(),
+                visible = (badgeIcon != null || badgeText.isNotEmpty()) && scrubText.isEmpty(),
                 enter = fadeIn(tween(140)),
                 exit = fadeOut(tween(240)),
                 modifier = Modifier.align(Alignment.Center)
             ) {
                 PlayerCentralBadge(icon = badgeIcon, text = badgeText)
+            }
+
+            // 快进/快退预览卡：缩略图 + 方向图标 +「目标位置 / 总时长」
+            AnimatedVisibility(
+                visible = scrubText.isNotEmpty(),
+                enter = fadeIn(tween(120)),
+                exit = fadeOut(tween(200)),
+                modifier = Modifier.align(Alignment.Center)
+            ) {
+                PlayerScrubCard(forward = scrubForward, text = scrubText, thumb = scrubThumb)
             }
 
             // 顶部标题栏
@@ -735,6 +1019,16 @@ class PlayerActivity : ComponentActivity() {
                 PlayerTopBar()
             }
 
+            // 右侧滑入的「音轨 / 字幕」设置面板
+            AnimatedVisibility(
+                visible = showSettingsPanel,
+                enter = fadeIn(tween(180)) + slideInHorizontally(tween(220)) { it / 2 },
+                exit = fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { it / 2 },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            ) {
+                SettingsPanel(panelFocus)
+            }
+
             // 底部控制栏
             AnimatedVisibility(
                 visible = overlayVisible,
@@ -742,14 +1036,46 @@ class PlayerActivity : ComponentActivity() {
                 exit = fadeOut(tween(240)),
                 modifier = Modifier.align(Alignment.BottomCenter)
             ) {
-                PlayerOverlay(playFocus)
+                PlayerOverlay(
+                    timelineFocus = timelineFocus,
+                    selectorFocus = selectorFocus,
+                    speedBtnFocus = speedBtnFocus,
+                    aspectBtnFocus = aspectBtnFocus,
+                    settingsBtnFocus = settingsBtnFocus
+                )
+            }
+
+            // 下一集预告卡（右下、控制栏上方）
+            AnimatedVisibility(
+                visible = nextCardVisible,
+                enter = fadeIn(tween(180)) + slideInHorizontally(tween(220)) { it / 3 },
+                exit = fadeOut(tween(200)) + slideOutHorizontally(tween(220)) { it / 3 },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 48.dp, bottom = 200.dp)
+            ) {
+                Box(Modifier.onFocusChanged { if (it.hasFocus) focusZone = FocusZone.CARD }) {
+                    playlist.getOrNull(currentIndex + 1)?.let { next ->
+                        PlayerNextCard(
+                            title = next.name,
+                            indexLabel = "第 ${currentIndex + 2} / ${playlist.size} 个",
+                            countdownSec = nextCountdownSec,
+                            thumb = nextThumb,
+                            playFocus = cardPlayFocus,
+                            onPlay = {
+                                skipTo(currentIndex + 1)
+                                lastInteractionTick++
+                            },
+                            onCancel = {
+                                hideNextCard()
+                                showBadge(null, "已取消自动连播")
+                            }
+                        )
+                    }
+                }
             }
 
             if (showResumeDialog) ResumeDialog()
-            if (showSpeedDialog) SpeedDialog()
-            if (showAspectDialog) AspectDialog()
-            if (showAudioDialog) TrackDialog(C.TRACK_TYPE_AUDIO)
-            if (showSubtitleDialog) TrackDialog(C.TRACK_TYPE_TEXT)
         }
     }
 
@@ -789,8 +1115,17 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 底部控制栏（时间轴优先，v1.10）：内联选择器 → 时间轴 → 按钮行，自上而下。
+     */
     @Composable
-    private fun PlayerOverlay(playFocus: FocusRequester) {
+    private fun PlayerOverlay(
+        timelineFocus: FocusRequester,
+        selectorFocus: FocusRequester,
+        speedBtnFocus: FocusRequester,
+        aspectBtnFocus: FocusRequester,
+        settingsBtnFocus: FocusRequester
+    ) {
         Column(
             Modifier
                 .fillMaxWidth()
@@ -799,33 +1134,25 @@ class PlayerActivity : ComponentActivity() {
                 )
                 .padding(horizontal = 48.dp, vertical = 30.dp)
         ) {
-            // ——— 进度条 + 时间 ———
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    FileUtils.formatDuration(positionMs),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White,
-                    modifier = Modifier.width(84.dp)
-                )
-                PlayerProgressBar(
-                    position = positionMs,
-                    buffered = bufferedMs,
-                    duration = durationMs,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    FileUtils.formatDuration(durationMs),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White.copy(alpha = 0.7f),
-                    textAlign = TextAlign.End,
-                    modifier = Modifier.width(84.dp)
-                )
+            // ——— 内联选择器（倍速/比例）：时间轴上方横排胶囊 ———
+            AnimatedVisibility(
+                visible = inlineSelector != InlineSelector.NONE,
+                enter = fadeIn(tween(160)) + expandVertically(tween(200)),
+                exit = fadeOut(tween(160)) + shrinkVertically(tween(200))
+            ) {
+                InlineSelectorRow(selectorFocus)
             }
 
-            Spacer(Modifier.height(22.dp))
+            // ——— 时间轴（控制栏主角） ———
+            TimelineRow(timelineFocus)
 
-            // ——— 图标按钮组 ———
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Spacer(Modifier.height(20.dp))
+
+            // ——— 按钮行 ———
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.onFocusChanged { if (it.hasFocus) focusZone = FocusZone.BUTTONS }
+            ) {
                 PlayerIconButton(
                     icon = PlayerIconType.PREV,
                     label = "上一集",
@@ -853,8 +1180,7 @@ class PlayerActivity : ComponentActivity() {
                         else -> "已暂停"
                     },
                     size = 60.dp,
-                    emphasized = true,
-                    modifier = Modifier.focusRequester(playFocus)
+                    emphasized = true
                 ) {
                     togglePlayPause()
                     lastInteractionTick++
@@ -887,9 +1213,10 @@ class PlayerActivity : ComponentActivity() {
                 Spacer(Modifier.width(22.dp))
 
                 PlayerTextButton(
-                    text = if (speed == 1.0f) "倍速" else "${speed}x"
+                    text = if (speed == 1.0f) "倍速" else "${speed}x",
+                    modifier = Modifier.focusRequester(speedBtnFocus)
                 ) {
-                    showSpeedDialog = true
+                    inlineSelector = InlineSelector.SPEED
                     lastInteractionTick++
                 }
 
@@ -897,29 +1224,232 @@ class PlayerActivity : ComponentActivity() {
 
                 PlayerTextButton(
                     // 与倍速同一套约定：非默认值时直接显示当前值（原始/拉伸/裁剪）
-                    text = if (aspect == AspectRatio.ORIGINAL) "比例" else aspect.label
+                    text = if (aspect == AspectRatio.ORIGINAL) "比例" else aspect.label,
+                    modifier = Modifier.focusRequester(aspectBtnFocus)
                 ) {
-                    showAspectDialog = true
+                    inlineSelector = InlineSelector.ASPECT
                     lastInteractionTick++
                 }
 
                 Spacer(Modifier.width(10.dp))
 
-                PlayerIconButton(PlayerIconType.AUDIO, "音轨") {
-                    showAudioDialog = true
-                    lastInteractionTick++
-                }
-
-                Spacer(Modifier.width(10.dp))
-
-                PlayerIconButton(PlayerIconType.SUBTITLE, "字幕") {
-                    showSubtitleDialog = true
+                PlayerIconButton(
+                    icon = PlayerIconType.SETTINGS,
+                    label = "音轨与字幕",
+                    modifier = Modifier.focusRequester(settingsBtnFocus)
+                ) {
+                    showSettingsPanel = true
                     lastInteractionTick++
                 }
 
                 Spacer(Modifier.weight(1f))
             }
         }
+    }
+
+    /** 内联选择器（倍速 / 画面比例）：横排胶囊，OK 即选即生效并收起 */
+    @Composable
+    private fun InlineSelectorRow(selectorFocus: FocusRequester) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .onFocusChanged { if (it.hasFocus) focusZone = FocusZone.SELECTOR }
+                .padding(bottom = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // 必须用 when 精确匹配而非 if/else：关闭时（NONE）AnimatedVisibility 的
+            // 收起动画期间内容仍在组合，if/else 会让 NONE 走 else 分支闪现成比例胶囊
+            //（实测：倍速弹框按返回/上键的收起动画中瞬间变成比例弹框）。
+            when (inlineSelector) {
+                InlineSelector.SPEED -> SPEED_OPTIONS.forEach { s ->
+                    SelectorPill(
+                        text = if (s == 1.0f) "正常" else "${s}x",
+                        selected = s == speed,
+                        // 打开时焦点落到当前选中项
+                        modifier = if (s == speed) Modifier.focusRequester(selectorFocus) else Modifier
+                    ) {
+                        speed = s
+                        player.setPlaybackSpeed(s)
+                        closeSelector()
+                    }
+                }
+                InlineSelector.ASPECT -> AspectRatio.entries.forEach { a ->
+                    SelectorPill(
+                        text = a.label,
+                        selected = a == aspect,
+                        modifier = if (a == aspect) Modifier.focusRequester(selectorFocus) else Modifier
+                    ) {
+                        aspect = a
+                        playerView?.resizeMode = resizeModeOf(a)
+                        closeSelector()
+                    }
+                }
+                InlineSelector.NONE -> Unit
+            }
+        }
+    }
+
+    /**
+     * 时间轴行：当前时间 + 进度条 + 总时长。进度条区域是**可聚焦**的（控制栏主角）：
+     * 聚焦时轨道加粗 + 主色光环（[PlayerProgressBar] 的 focused 态），
+     * 左右 = 拖动（与控制栏隐藏时的快进/快退同一套固定 10 秒步长/变速扫描），
+     * OK = 播放/暂停。上下键交给焦点系统在「时间轴 ↔ 按钮行」间换轨。
+     */
+    @Composable
+    private fun TimelineRow(timelineFocus: FocusRequester) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                FileUtils.formatDuration(positionMs),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.White,
+                modifier = Modifier.width(84.dp)
+            )
+            Box(
+                Modifier
+                    .weight(1f)
+                    .height(28.dp)
+                    .focusRequester(timelineFocus)
+                    .onFocusChanged { if (it.isFocused) focusZone = FocusZone.TIMELINE }
+                    .focusable()
+                    .onPreviewKeyEvent { onTimelineKey(it) },
+                contentAlignment = Alignment.Center
+            ) {
+                PlayerProgressBar(
+                    position = positionMs,
+                    buffered = bufferedMs,
+                    duration = durationMs,
+                    modifier = Modifier.fillMaxWidth(),
+                    focused = focusZone == FocusZone.TIMELINE
+                )
+            }
+            Text(
+                FileUtils.formatDuration(durationMs),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.White.copy(alpha = 0.7f),
+                textAlign = TextAlign.End,
+                modifier = Modifier.width(84.dp)
+            )
+        }
+    }
+
+    /** 时间轴聚焦时的按键：左右 = 快退/快进（复用固定 10 秒步长 + 变速扫描），OK = 播放/暂停 */
+    private fun onTimelineKey(event: KeyEvent): Boolean {
+        val down = event.type == KeyEventType.KeyDown
+        return when (event.key) {
+            Key.DirectionLeft, Key.DirectionRight -> {
+                val dir = if (event.key == Key.DirectionRight) 1 else -1
+                if (down) onSeekDown(dir) else onSeekUp(dir)
+                true
+            }
+            Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
+                if (down) togglePlayPause()
+                true
+            }
+            else -> false
+        }
+    }
+
+    /**
+     * 右侧「音轨 / 字幕」设置面板：两个分区纵向排布，轨道多时可滚动。
+     * OK 即选即生效并收起；Back 收起不改动。
+     */
+    @Composable
+    private fun SettingsPanel(panelFocus: FocusRequester) {
+        // 面板每次打开都重算（内容随组合离开作用域被丢弃）
+        val audioGroups = remember { trackGroups(C.TRACK_TYPE_AUDIO) }
+        val textGroups = remember { trackGroups(C.TRACK_TYPE_TEXT) }
+        val audioTracks = audioGroups.flatMapIndexed { gi, g -> (0 until g.length).map { gi to it } }
+        val textTracks = textGroups.flatMapIndexed { gi, g -> (0 until g.length).map { gi to it } }
+
+        Column(
+            Modifier
+                .width(340.dp)
+                .heightIn(max = 420.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color(0xF20B0F16))
+                .padding(vertical = 16.dp, horizontal = 12.dp)
+                .onFocusChanged { if (it.hasFocus) focusZone = FocusZone.PANEL }
+                .verticalScroll(rememberScrollState())
+        ) {
+            PanelSectionHeader(PlayerIconType.AUDIO, "音轨")
+            if (audioTracks.isEmpty()) {
+                PanelHint("（无可切换音轨）")
+            } else {
+                audioTracks.forEachIndexed { i, (gi, ti) ->
+                    val group = audioGroups[gi]
+                    val format = group.getTrackFormat(ti)
+                    val label = format.label
+                        ?: format.language?.uppercase()
+                        ?: format.sampleMimeType?.substringAfterLast('/')
+                        ?: "音轨 ${i + 1}"
+                    OptionRow(
+                        text = label,
+                        selected = group.isTrackSelected(ti),
+                        modifier = if (i == 0) Modifier.focusRequester(panelFocus) else Modifier
+                    ) {
+                        selectTrack(C.TRACK_TYPE_AUDIO, group, ti)
+                        closeSettingsPanel()
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            PanelSectionHeader(PlayerIconType.SUBTITLE, "字幕")
+            OptionRow(
+                text = "关闭字幕",
+                selected = !hasSelectedTrack(textGroups),
+                // 无音轨时面板首个可聚焦行是「关闭字幕」
+                modifier = if (audioTracks.isEmpty()) Modifier.focusRequester(panelFocus) else Modifier
+            ) {
+                player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                    .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                    .build()
+                closeSettingsPanel()
+            }
+            if (textTracks.isEmpty()) {
+                PanelHint("（无内嵌或外挂字幕轨道）")
+            } else {
+                textTracks.forEachIndexed { i, (gi, ti) ->
+                    val group = textGroups[gi]
+                    val format = group.getTrackFormat(ti)
+                    val label = format.label
+                        ?: format.language?.uppercase()
+                        ?: format.sampleMimeType?.substringAfterLast('/')
+                        ?: "字幕 ${i + 1}"
+                    OptionRow(
+                        text = label,
+                        selected = group.isTrackSelected(ti)
+                    ) {
+                        selectTrack(C.TRACK_TYPE_TEXT, group, ti)
+                        closeSettingsPanel()
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun PanelSectionHeader(icon: PlayerIconType, title: String) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            PlayerIconGlyph(icon, MaterialTheme.colorScheme.primary, Modifier.size(20.dp))
+            Text(title, style = MaterialTheme.typography.titleSmall, color = Color.White)
+        }
+    }
+
+    @Composable
+    private fun PanelHint(text: String) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.45f),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+        )
     }
 
     @Composable
@@ -939,86 +1469,6 @@ class PlayerActivity : ComponentActivity() {
                     startPlayback(0L)
                 }
                 TvButton("取消") { finish() }
-            }
-        }
-    }
-
-    @Composable
-    private fun SpeedDialog() {
-        TvDialog(onDismiss = { showSpeedDialog = false }) {
-            Text("倍速", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(10.dp))
-            SPEED_OPTIONS.forEach { s ->
-                OptionRow(
-                    text = if (s == 1.0f) "正常" else "${s}x",
-                    selected = s == speed
-                ) {
-                    speed = s
-                    player.setPlaybackSpeed(s)
-                    showSpeedDialog = false
-                    showBadge(null, "${s}x")
-                }
-            }
-        }
-    }
-
-    /** 画面比例：本次播放会话内临时切换，不回写设置页的「默认画面比例」 */
-    @Composable
-    private fun AspectDialog() {
-        TvDialog(onDismiss = { showAspectDialog = false }) {
-            Text(
-                "画面比例",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.height(10.dp))
-            AspectRatio.entries.forEach { a ->
-                OptionRow(text = a.label, selected = a == aspect) {
-                    aspect = a
-                    playerView?.resizeMode = resizeModeOf(a)
-                    showAspectDialog = false
-                    showBadge(null, a.label)
-                }
-            }
-        }
-    }
-
-    /** 音轨 / 字幕选择（遍历 Player 轨道） */
-    @Composable
-    private fun TrackDialog(trackType: Int) {
-        val isAudio = trackType == C.TRACK_TYPE_AUDIO
-        val groups = remember { trackGroups(trackType) }
-        TvDialog(onDismiss = { if (isAudio) showAudioDialog = false else showSubtitleDialog = false }) {
-            Text(
-                if (isAudio) "音轨" else "字幕",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.height(10.dp))
-            if (!isAudio) {
-                OptionRow("关闭字幕", !hasSelectedTrack(groups)) {
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                        .build()
-                    showSubtitleDialog = false
-                }
-            }
-            groups.forEachIndexed { groupIndex, group ->
-                for (trackIndex in 0 until group.length) {
-                    val format = group.getTrackFormat(trackIndex)
-                    val label = format.label
-                        ?: format.language?.uppercase()
-                        ?: format.sampleMimeType?.substringAfterLast('/')
-                        ?: "${if (isAudio) "音轨" else "字幕"} ${groupIndex + 1}"
-                    OptionRow(
-                        text = label,
-                        selected = group.isTrackSelected(trackIndex)
-                    ) {
-                        selectTrack(trackType, group, trackIndex)
-                        if (isAudio) showAudioDialog = false else showSubtitleDialog = false
-                    }
-                }
             }
         }
     }
