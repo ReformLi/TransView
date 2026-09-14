@@ -33,10 +33,12 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
 
 /**
  * 内嵌 HTTP 服务器（NanoHTTPD）：
- * - GET  /        → 手机上传网页（assets/web/index.html，渲染时注入设备名称）
- * - POST /upload  → multipart 上传，字段：category / relativePath / file
+ * - GET  /         → 手机上传网页（assets/web/index.html，渲染时注入设备名称）
+ * - GET  /verify   → 访问码校验（`?token=xxxxxx`），供「手动输入 IP」的网页在提交前先验一次
+ * - POST /upload   → multipart 上传，字段：category / relativePath / file；需带 `X-Upload-Token` 头
  *
- * 端口由 ServerController 决定（设置页可改，NanoHTTPD 端口构造时固定 → 改端口需停旧起新）。
+ * 端口与**访问码**由 ServerController 决定（端口可在设置页改；改端口 / 重启都会轮换访问码，
+ * NanoHTTPD 端口构造时固定 → 改端口需停旧起新），两者都在构造时注入。
  *
  * 上传链路（数据库驱动）：
  * - 每个上传请求在 upload_records 表建立记录（上传中），经计数流实时回写百分比进度；
@@ -45,10 +47,15 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
  * - **压缩包自动解压**：视频 / 图片分类上传 `.zip` 且「设置 → 上传与解压 → 自动解压压缩包」开启时，
  *   改由 [ZipExtractor] 处理（暂存 → 空间校验 → 流式解压 → 按分类归位），解压结果经 JSON
  *   `message` 回给网页端并同时 Toast 到电视端；「其他」分类的 `.zip` 仍原样存入 Downloads。
+ *
+ * @param token 本次监听周期内的访问码（6 位，已是大写）。服务器实例持有的是构造时的那一份，
+ *   ServerController 每次启动都新建实例并轮换，因此不存在「运行中换码」。
+ *   详见 [checkToken]。
  */
 class TransHttpServer(
     context: Context,
-    port: Int
+    port: Int,
+    private val token: String
 ) : NanoHTTPD(port) {
 
     private val appContext = context.applicationContext
@@ -72,8 +79,13 @@ class TransHttpServer(
     override fun serve(session: IHTTPSession): Response {
         return try {
             when {
+                // 根路径**不校验访问码**：网页本身得先加载出来，才有地方显示「输入访问码」界面
                 session.method == Method.GET && (session.uri == "/" || session.uri == "/index.html") ->
                     serveIndexPage()
+
+                // 访问码预校验（手动输入 IP 进入的手机网页在提交前先验一次，避免输错了要等上传才报错）
+                session.method == Method.GET && session.uri == "/verify" ->
+                    handleVerify(session)
 
                 // 网页图标（头部标识 + 浏览器标签页 favicon），与 assets/web/icon.* 同源
                 session.method == Method.GET && session.uri == "/icon.svg" ->
@@ -95,6 +107,35 @@ class TransHttpServer(
             )
         }
     }
+
+    /**
+     * `GET /verify?token=xxxxxx` —— 访问码校验。
+     *
+     * 匹配返回 200（`{"status":"ok"}`），缺失或不匹配返回 403。
+     * 大小写不敏感（统一按大写比较），与手机端输入框自动转大写的行为对齐。
+     */
+    private fun handleVerify(session: IHTTPSession): Response {
+        if (!checkToken(session.parameters["token"]?.firstOrNull())) {
+            return jsonError(Response.Status.FORBIDDEN, "认证失败")
+        }
+        return newFixedLengthResponse(Response.Status.OK, "application/json", """{"status":"ok"}""")
+    }
+
+    /**
+     * 访问码比对：统一 trim + 大写后按全等比较（服务器生成的码本身就是大写）。
+     * 传入 null / 空串一律不通过。
+     */
+    private fun checkToken(candidate: String?): Boolean {
+        val normalized = candidate?.trim()?.uppercase().orEmpty()
+        return normalized.isNotEmpty() && normalized == token.uppercase()
+    }
+
+    /**
+     * 取请求头。NanoHTTPD 把请求头名统一转成小写存表，这里再兜一层原名，
+     * 免得将来换实现 / 自造请求时大小写不一致取不到。
+     */
+    private fun headerOf(session: IHTTPSession, name: String): String? =
+        session.headers[name.lowercase()] ?: session.headers[name]
 
     /**
      * 手机上传页。每次请求都重新渲染：把 assets 里的模板占位符替换为当前设备名称
@@ -138,6 +179,13 @@ class TransHttpServer(
     }
 
     private fun handleUpload(session: IHTTPSession): Response {
+        // 认证门槛：缺 Header 或访问码不匹配 → 403，且**不接收任何文件**。
+        // 必须放在函数最前面：此刻还没建上传记录、也没调 parseBody —— 请求体一个字节都不会落盘，
+        // 不会在电视端记录列表里留下任何痕迹（否则未授权设备能靠刷请求塞满上传记录）。
+        if (!checkToken(headerOf(session, "X-Upload-Token"))) {
+            return jsonError(Response.Status.FORBIDDEN, "认证失败")
+        }
+
         // 手机网页把分类/文件名/相对路径放 URL query（请求头阶段即可用——multipart 字段
         // 必须等 parseBody 接收完整个请求体后才会填充，此前读取只会拿到回退值）
         val query = session.parameters

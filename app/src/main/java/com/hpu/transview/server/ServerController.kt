@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 
 /**
@@ -30,13 +31,22 @@ import java.util.concurrent.Executors
  * - SMART       智能：未休眠 && 屏幕亮 && 非播放；15 分钟无上传自动休眠
  * - POWER_SAVER 省电：仅上传页内手动启动，离开上传页即停
  *
- * 对外唯一输出口是 ServerBus（running / hibernated / mode StateFlow），
+ * 对外唯一输出口是 ServerBus（running / hibernated / mode / port / token StateFlow），
  * UI 与前台服务通知只依赖总线，不持有引擎引用。
+ *
+ * **访问码（Token）**：见 [tryStart] —— 与监听同生命周期，起则轮换、停则销毁，
+ * 生成后注入 [TransHttpServer] 实例，服务器据此拦截未授权的上传请求。
  */
 object ServerController {
 
     /** 智能模式空闲休眠时长 */
     private const val IDLE_TIMEOUT_MS = 15 * 60 * 1000L
+
+    /** 访问码字符集：大写字母 + 数字（需求固定，不做易混字符剔除） */
+    private const val TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    /** 访问码长度固定 6 位 */
+    private const val TOKEN_LENGTH = 6
 
     private var appContext: Context? = null
     private var prefs: SharedPreferences? = null
@@ -45,6 +55,17 @@ object ServerController {
 
     /** 当前监听端口：初始值来自设置项，运行中可经 setPort 切换 */
     private var port = SettingsStore.serverPort
+
+    /**
+     * 当前访问码（内存状态，不持久化）。
+     *
+     * 每次 [tryStart] 成功都轮换；[stopServer] 置 null。服务器实例持有的是**构造时注入的那一份**，
+     * 因此本字段始终与实际在跑的监听一致（不会出现「显示的是新码、服务器认的是旧码」）。
+     */
+    private var token: String? = null
+
+    /** 访问码用密码学随机源：局域网门槛虽低，也没必要让码可被线性预测 */
+    private val secureRandom = SecureRandom()
 
     // —— 策略信号 ——
     private var mode = ServerMode.SMART
@@ -83,6 +104,8 @@ object ServerController {
             SettingsStore.init(appContext!!)
             port = SettingsStore.serverPort
             ServerBus.setPort(port)
+            // 服务器尚未启动，此时不应存在有效访问码
+            ServerBus.setToken(null)
             prefs = appContext!!.getSharedPreferences("server_policy", Context.MODE_PRIVATE)
             mode = prefs!!.getString("mode", null)
                 ?.let { runCatching { ServerMode.valueOf(it) }.getOrNull() }
@@ -152,8 +175,7 @@ object ServerController {
         mainHandler.removeCallbacks(idleRunnable)
         scope.cancel()
         serverExecutor.execute {
-            runCatching { httpServer?.stop() }
-            httpServer = null
+            stopServer()
             ServerBus.update(false, hibernated)
         }
         initialized = false
@@ -166,7 +188,8 @@ object ServerController {
      * 结果经 [onResult]（主线程）回调：
      * - 成功：更新端口 + 写回设置项 + 刷新 [ServerBus]，上传页二维码/地址随即跟着变；
      * - 失败（几乎只有端口被占用）：用旧端口重新拉起，设置项保持不变，由 UI 提示用户。
-     * 切换会打断正在进行的上传连接，属预期行为。
+     * 切换会打断正在进行的上传连接，属预期行为；由于是「停旧起新」，**访问码也会随之轮换**
+     * （用户需重新扫码或重新输入），与「服务器每次启动轮换」的约定一致。
      */
     fun setPort(newPort: Int, onResult: (Boolean) -> Unit) {
         if (newPort !in Constants.PORT_RANGE) {
@@ -186,19 +209,19 @@ object ServerController {
                 mainHandler.post { onResult(false) }
                 return@execute
             }
-            // 停掉旧端口上的监听（存在的话）
-            runCatching { httpServer?.stop() }
-            httpServer = null
+            // 停掉旧端口上的监听（存在的话），并销毁旧访问码
+            stopServer()
 
             var ok = true
             if (wantRun) {
-                val started = startOn(context, newPort)
+                val started = tryStart(context, newPort)
                 if (started != null) {
                     httpServer = started
                 } else {
                     // 新端口起不来：尽力用旧端口恢复监听，避免「改端口把服务器改没了」
+                    // （此时访问码由 tryStart 重新生成一次，与服务实例一一对应）
                     ok = false
-                    httpServer = startOn(context, previous)
+                    httpServer = tryStart(context, previous)
                 }
             }
             if (ok) {
@@ -226,19 +249,47 @@ object ServerController {
     private fun apply(run: Boolean) {
         val context = appContext ?: return
         if (run) {
+            // 从休眠 / 暂停 / 熄屏中恢复也走这里 → 视为「一次启动」，访问码随之轮换
             if (httpServer == null) {
-                httpServer = startOn(context, port)
+                httpServer = tryStart(context, port)
             }
         } else if (httpServer != null) {
-            runCatching { httpServer?.stop() }
-            httpServer = null
+            stopServer()
         }
         publishState()
     }
 
-    /** 在指定端口上启动监听；端口被占用等失败情况返回 null（调用方决定回滚或保持停止） */
-    private fun startOn(context: Context, targetPort: Int): TransHttpServer? =
-        runCatching { TransHttpServer(context, targetPort).also { it.start() } }.getOrNull()
+    /**
+     * 启动监听 + 轮换访问码；端口被占用等失败情况返回 null。
+     *
+     * 生成顺序很关键：**先建码、再起服务，起成功才提交**。这样：
+     * ① 服务器实例拿到的是构造时注入的那一份，后续 `httpServer` 不会再变，不存在「运行中换码」的竞态；
+     * ② 启动失败（端口占用）时不动已有状态，回滚到旧端口也能拿到一份与实例匹配的新码。
+     */
+    private fun tryStart(context: Context, targetPort: Int): TransHttpServer? {
+        val fresh = generateToken()
+        val started = runCatching {
+            TransHttpServer(context, targetPort, fresh).also { it.start() }
+        }.getOrNull() ?: return null
+        token = fresh
+        ServerBus.setToken(fresh)
+        return started
+    }
+
+    /** 停止监听并销毁访问码（码与监听同生命周期：停则失效，下次启动重新生成） */
+    private fun stopServer() {
+        runCatching { httpServer?.stop() }
+        httpServer = null
+        token = null
+        ServerBus.setToken(null)
+    }
+
+    /** 生成一个 6 位访问码：字符集 A-Z + 0-9，密码学随机源 */
+    private fun generateToken(): String {
+        val sb = StringBuilder(TOKEN_LENGTH)
+        repeat(TOKEN_LENGTH) { sb.append(TOKEN_CHARS[secureRandom.nextInt(TOKEN_CHARS.length)]) }
+        return sb.toString()
+    }
 
     /** 把当前启停状态同步到总线，并重排空闲休眠计时 */
     private fun publishState() {

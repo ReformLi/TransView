@@ -9,6 +9,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -62,6 +63,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -114,6 +116,9 @@ fun UploadScreen(
     // 监听端口来自设置（设置页改端口后经总线即时同步）；二维码与地址必须跟着变，
     // 否则会显示一个已经没人监听的旧端口
     val port by ServerBus.port.collectAsState()
+    // 访问码：服务器每次启动（含休眠/暂停恢复、改端口重启）轮换。二维码要带上它，
+    // 手机扫码即自动通过认证（零输入）；屏幕上同时显示出来，供「手输 IP」的用户照着输入
+    val token by ServerBus.token.collectAsState()
 
     val recordsRepo = remember { UploadRecordRepository(context) }
     val records by recordsRepo.observeRecent().collectAsState(initial = emptyList())
@@ -167,10 +172,14 @@ fun UploadScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(ip, port) {
-        qr = if (ip != null) {
+    LaunchedEffect(ip, port, token) {
+        val host = ip
+        val code = token
+        qr = if (host != null && code != null) {
             withContext(Dispatchers.Default) {
-                QrCode.generate("http://$ip:$port", 480)
+                // 二维码直接带上访问码：扫码进来的手机端解析 URL 后自动通过，用户完全无感；
+                // 屏幕上另有大号「访问码」文字，供无法扫码、只能手输 IP 的用户使用
+                QrCode.generate("http://$host:$port/?token=$code", 480)
             }
         } else null
     }
@@ -179,7 +188,9 @@ fun UploadScreen(
     Row(
         Modifier
             .fillMaxSize()
-            .padding(horizontal = 40.dp, vertical = 24.dp),
+            // 竖向留白 18dp（原 24dp）：左面板是「二维码 + 访问码 + 地址 + 复制」的竖向堆叠，
+            // 高度直接决定二维码能长多大；把这 12dp 让给二维码，宽屏下的观感更好
+            .padding(horizontal = 40.dp, vertical = 18.dp),
         horizontalArrangement = Arrangement.spacedBy(28.dp)
     ) {
         // ——— 左侧固定区：二维码 + 地址 + 服务器状态 ———
@@ -192,7 +203,8 @@ fun UploadScreen(
             mode = mode,
             qr = qr,
             ip = ip,
-            port = port
+            port = port,
+            token = token
         )
 
         // ——— 右侧：上传记录（可滚动） ———
@@ -358,7 +370,8 @@ private fun ServerPanel(
     mode: ServerMode,
     qr: Bitmap?,
     ip: String?,
-    port: Int
+    port: Int,
+    token: String?
 ) {
     Surface(
         modifier = modifier,
@@ -366,52 +379,112 @@ private fun ServerPanel(
         color = MaterialTheme.colorScheme.surface
     ) {
         if (running) {
-            // ——— 运行中：二维码 + 地址 + 复制 + 提示 ———
+            // ——— 运行中：二维码（带访问码）+ 访问码牌 + 地址 + 复制 + 提示 ———
+            // 竖向是一条「从上到下、越往下越次要」的信息流：
+            //   标题 → 二维码（主） → 访问码牌（次主，有色块承载） → 地址 → 复制 → 提示
+            // 二维码用 weight(1f) 吃掉所有剩余高度，所以上面每一块的高度都要抠着给。
             Column(
                 Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 24.dp, vertical = 26.dp),
+                    .padding(horizontal = 22.dp, vertical = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
                     "手机扫码上传",
-                    style = MaterialTheme.typography.titleMedium,
+                    // labelLarge（14sp）：比 titleMedium 矮 4dp，且这不是强调信息，
+                    // 不需要和「访问码」抢视觉层级
+                    style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.primary
                 )
-                Spacer(Modifier.height(18.dp))
+                Spacer(Modifier.height(10.dp))
 
-                qr?.let { bitmap ->
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = "上传地址二维码",
-                        modifier = Modifier
-                            .size(180.dp)
+                // 二维码占据中间剩余空间**自动缩放**：写死尺寸（原 180dp）在 720p 上会把下方文案
+                // 整个挤出面板（历史问题）。这里用 BoxWithConstraints 量出可用空间后显式取正方形边长，
+                // 不能写成 `fillMaxSize().aspectRatio(1f)` —— 那个链里 fillMaxSize 已经把约束变成
+                // 「固定」，`aspectRatio` 收到固定约束时直接原样返回（不做比例修正），
+                // 结果是图片按**宽度**撑成正方形、竖向外溢压住下方的访问码（实测踩过）。
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val side = minOf(maxWidth, maxHeight)
+                    qr?.let { bitmap ->
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "上传地址二维码（已包含访问码）",
+                            modifier = Modifier
+                                .size(side)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White)
+                                .padding(8.dp),
+                            contentScale = ContentScale.Fit
+                        )
+                    } ?: Box(
+                        Modifier
+                            .size(side)
                             .clip(RoundedCornerShape(12.dp))
-                            .background(Color.White)
-                            .padding(8.dp),
-                        contentScale = ContentScale.Fit
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
                     )
-                } ?: Box(
-                    Modifier
-                        .size(180.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                )
+                }
 
-                Spacer(Modifier.height(20.dp))
+                Spacer(Modifier.height(10.dp))
+
+                // ——— 访问码牌 ———
+                // 做成一条**有底色的横条**，而不是原来那行裸文字：访问码是「手输方式的唯一凭据」，
+                // 需要一块视觉载体把它从上下两条信息（二维码 / 地址）里独立出来，否则看着像
+                // 「小标签贴在大字左边」的错位行（用户反馈的「位置和布局有点丑」即此）。
+                // 标签与码值同行居中：竖排两行要多吃 22dp 高度，代价由二维码来付，不划算。
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    // 主色 14% 叠在 surface(#161B22) 上 ≈ #1E3240：蓝调足够辨识，
+                    // 又不会被误认为可点击按钮（不用 surfaceVariant 是因为它太中性、分不出主次）
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                ) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "访问码",
+                            // bodyMedium（14sp）：原来用 bodySmall，紧贴 24sp 的大字会显得标签"没做完"
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = OnDarkDim
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            // 服务器未运行时（切换中的一帧）没有有效访问码，用占位符而不是留空
+                            token ?: "------",
+                            style = MaterialTheme.typography.headlineSmall.copy(letterSpacing = 4.sp),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
 
                 val address = if (ip != null) "http://$ip:$port" else null
                 if (address != null) {
                     Text(
                         address,
-                        style = MaterialTheme.typography.titleLarge,
+                        style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface,
                         textAlign = TextAlign.Center,
-                        maxLines = 2,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(Modifier.height(10.dp))
-                    CopyAddressButton(address)
+                    Spacer(Modifier.height(2.dp))
+                    // 复制**带访问码**的完整链接：粘到手机浏览器即直接通过认证，等价于扫码。
+                    // 屏幕上显示的仍是不带码的短地址（手输用），两者用途不同。
+                    CopyAddressButton(
+                        copyText = "http://$ip:$port/?token=${token ?: ""}",
+                        displayText = address
+                    )
                 } else {
                     Text(
                         "无法获取网络地址\n请检查网络连接",
@@ -421,24 +494,18 @@ private fun ServerPanel(
                     )
                 }
 
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.height(2.dp))
 
+                // 只留一行：原来两行提示要占 32dp 高度，而高度预算归二维码。
+                // 「手输要填访问码」由上方那条色块本身说明，不必再用文字复述。
                 Text(
-                    "手机与电视连接同一 Wi-Fi，\n扫码或输入上方地址即可上传",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OnDarkDim,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(Modifier.height(8.dp))
-                // 注意：本行在 720p 电视上会被面板高度裁掉（二维码 180dp 撑满，属既有问题，
-                // 与设备名/端口无关）。端口信息在上方地址里已可见，设备名在手机端网页展示，
-                // 因此这里不新增行（新增行只会更容易被裁）。
-                Text(
-                    "当前模式：${mode.label}（右上角「设置」可切换）",
+                    "手机需连接同一 Wi-Fi",
                     style = MaterialTheme.typography.bodySmall,
                     color = OnDarkDim,
                     textAlign = TextAlign.Center
                 )
+                // 这里不再重复「当前模式」：顶部状态区（服务器运行中 · 极速模式）已经显示，
+                // 重复一行只会挤掉二维码的可用高度。省下的空间由上面的 weight(1f) 自动给二维码。
             }
         } else {
             // ——— 未运行：状态 + 唤醒/启动 ———
@@ -646,9 +713,14 @@ private fun ConfirmDialog(
 
 // ————————————————— 复制地址按钮 —————————————————
 
-/** 复制地址按钮：图标 + 点击复制到剪贴板，Toast 确认 */
+/**
+ * 复制链接按钮：图标 + 点击复制到剪贴板，Toast 确认。
+ *
+ * [copyText] 是实际写进剪贴板的内容（**带访问码**的完整链接，粘到手机浏览器即直接通过认证）；
+ * [displayText] 只用于提示语里说明这是哪台电视的地址，避免 Toast 太长。
+ */
 @Composable
-private fun CopyAddressButton(address: String) {
+private fun CopyAddressButton(copyText: String, displayText: String) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
@@ -664,20 +736,22 @@ private fun CopyAddressButton(address: String) {
         Modifier
             .tvFocus(cornerRadius = 8)
             .clickable {
-                clipboard.setText(AnnotatedString(address))
+                clipboard.setText(AnnotatedString(copyText))
                 copied = true
-                Toast.makeText(context, "地址已复制：$address", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "$displayText 已复制（链接含访问码）", Toast.LENGTH_SHORT).show()
             }
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            // 竖向 padding 收到 5dp：这是一个「附属于地址行」的次要操作，
+            // 40dp 的点击热区在焦点框里显得虚胖，也白占左面板本就紧张的高度
+            .padding(horizontal = 12.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         CopyIcon(
             tint = if (copied) SuccessGreen else MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(24.dp)
+            modifier = Modifier.size(22.dp)
         )
         Text(
-            if (copied) "已复制" else "复制",
+            if (copied) "已复制" else "复制链接",
             style = MaterialTheme.typography.bodyLarge,
             color = if (copied) SuccessGreen else MaterialTheme.colorScheme.primary
         )

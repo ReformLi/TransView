@@ -1,8 +1,11 @@
 # TransView 传视TV — 架构与实现说明
 
-> 版本：v1.4.0　日期：2026-09-14
+> 版本：v1.7.1　日期：2026-09-14
 > 对应需求：README.md（局域网媒体中心与传输工具）
-> v1.4 变更：设置页改造为独立子页面（SettingsScreen + SettingsStore，五分组左组右详情）+ 长按确定键 = 操作菜单（自计时方案，修复键盘 auto-repeat）。v1.3 变更：TV 端界面重做 —— 媒体库统一多列网格卡片、上传页左右分栏、播放页图标化控制 + 时间节点反馈。
+> v1.7.1 变更：**上传页左面板视觉重做**——访问码由裸文字行改为**色块横条**（主色 14% 底 + 同行居中的标签/码值），
+> 标题降为 `labelLarge`、底部提示压成一行、复制按钮收紧，省下的竖向空间全部给二维码
+> （720p 实测 220×220 → 283×283 px，占面板宽 80%）（§3.15）。
+> v1.7 变更：**上传访问码（最小认证）**——服务器每次启动轮换 6 位访问码（`A-Z`+`0-9`），二维码带码扫码零输入、屏幕大号显示访问码；新增 `GET /verify` 与 `POST /upload` 的 `X-Upload-Token` 校验（未授权 403 且不接收任何文件），网页端 403 自动回门槛并续跑队列（§3.15）；顺带把上传页二维码改为自适应尺寸。v1.6 变更：压缩包服务端解压（§3.14）。v1.4 变更：设置页改造为独立子页面（SettingsScreen + SettingsStore，五分组左组右详情）+ 长按确定键 = 操作菜单（自计时方案，修复键盘 auto-repeat）。v1.3 变更：TV 端界面重做 —— 媒体库统一多列网格卡片、上传页左右分栏、播放页图标化控制 + 时间节点反馈。
 
 ## 1. 技术栈
 
@@ -34,14 +37,16 @@ com.hpu.transview
 │   ├── NetUtils.kt            本机 IP 探测、存储权限统一入口（StoragePermission，含写探针）
 │   ├── IntentUtils.kt         安全启动 Activity（隐式 Intent 显式化，规避 ROM hook NPE）
 │   ├── QrCode.kt              ZXing 二维码生成
-│   └── Constants.kt(并入NetUtils) 默认端口 DEFAULT_PORT=8080、可选端口范围、上传路径
+│   └── Constants.kt(并入NetUtils) 默认端口 DEFAULT_PORT=2333、预设端口列表 ALLOWED_PORTS、上传路径
 ├── server/                    网络接收层（不依赖 UI）
-│   ├── TransHttpServer.kt     NanoHTTPD：上传页/上传接口；记录入 Room + 计数流回写进度
-│   │                          + 落盘后立即建媒体索引；上传页每次请求注入设备名（__DEVICE_NAME__）
+│   ├── TransHttpServer.kt     NanoHTTPD：上传页/访问码校验/上传接口；记录入 Room + 计数流回写进度
+│   │                          + 落盘后立即建媒体索引；上传页每次请求注入设备名（__DEVICE_NAME__）；
+│   │                          Token 构造时注入（每次启动新实例 = 新码），/upload 前置校验 X-Upload-Token
 │   ├── UploadStorage.kt       落盘规则：分类根目录/同名重命名/文件夹合并/路径消毒
 │   ├── UploadBus.kt           上传事件总线（媒体库刷新/空闲计时信号）
-│   ├── ServerBus.kt           服务器状态总线（running/hibernated/mode/port）
-│   └── ServerController.kt    智能保活策略引擎（模式+屏幕/播放/页面信号 → 启停状态机；setPort 停旧起新）
+│   ├── ServerBus.kt           服务器状态总线（running/hibernated/mode/port/token）
+│   └── ServerController.kt    智能保活策略引擎（模式+屏幕/播放/页面信号 → 启停状态机；setPort 停旧起新；
+│                              访问码内存权威值：tryStart 轮换 / stopServer 销毁）
 ├── service/
 │   ├── ServerService.kt       前台服务（API 34+ specialUse / API 29~33 dataSync）+ 常驻通知
 │   └── BootReceiver.kt        开机自启（BOOT_COMPLETED → 读设置决定是否拉起 ServerService）
@@ -60,7 +65,8 @@ com.hpu.transview
     │                           FileTypeIcon（Canvas 手绘）、VideoMeta（时长缓存）
     ├── MainScreen.kt           四标签导航 + 右侧「设置」入口（聚焦即打开设置页）+ 返回键回导航栏
     ├── permission/             存储权限引导页
-    ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码+地址+状态）+ 右侧可滚动上传记录列表
+    ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码带访问码 + 访问码色块 + 地址 + 状态）
+    │                           + 右侧可滚动上传记录列表；二维码尺寸随可用空间自适应
     ├── library/LibraryScreen.kt 多列网格卡片（列数由设置决定，4/5/6）、文件夹层级、工具条（面包屑+排序+刷新）、菜单/删除/长按确定选项
     ├── settings/SettingsScreen.kt 设置子页面（v1.4：五分组左组右详情；**九项全部已接通**；
     │                           三类弹框关闭后焦点回原行）
@@ -237,6 +243,7 @@ com.hpu.transview
 - 启停在单一后台执行器串行执行，UI 线程零阻塞；`ServerBus`（StateFlow）同时驱动 UI 与前台服务通知文案（运行中/已暂停/已休眠/已停止）。
 - 空闲计时带保护：仍有上传在途（如单个大文件传输超 15 分钟）时顺延，绝不中断传输。
 - 上传页在服务器未运行时顶部固定区显示状态面板：省电模式「启动服务器」按钮、智能休眠「唤醒服务器」按钮（<1 秒恢复）、播放/熄屏暂停提示（自动恢复，无需操作）。
+- **访问码同生命周期**：启停在 `tryStart` / `stopServer` 两个口子上同时维护「监听 + 访问码」，因此**从休眠/暂停/熄屏恢复也视为一次启动 → 访问码轮换**（用户需重新扫码或重新输入）。见 §3.15。
 - 与 README 3.6.1「待机仍可接收」的差异：默认智能模式改为待机暂停接收；需要旧行为请选择极速模式。
 
 ### 3.8 数据库与物理文件一致性（SyncManager 对账引擎）
@@ -300,7 +307,10 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 ### 3.10 服务器与网络设置接线（v1.4）
 
 **服务器端口**
-- 运行时端口唯一来源是 `SettingsStore.serverPort`；`Constants.DEFAULT_PORT = 8080` 仅作默认值与 `PORT_RANGE` 校验。
+- 运行时端口唯一来源是 `SettingsStore.serverPort`；`Constants.DEFAULT_PORT = 2333` 为默认值，预设候选为
+  `Constants.ALLOWED_PORTS = [2333, 5210, 8080, 8888, 9527]`（遥控器无键盘，预设免输入）。
+- 读值校验：存盘端口不在候选列表时（旧版本遗留的 8081/8088/8089/9000）回落 `DEFAULT_PORT`；
+  `PORT_RANGE` 校验仍保留在 `ServerController.setPort()` 里兜底。
 - `ServerBus` 新增 `port: StateFlow<Int>`，端口变化即时广播；上传页的地址文本与二维码 `LaunchedEffect(ip, port)` 依赖它，改端口后自动重画。
 - **NanoHTTPD 端口在构造时固定**，故 `ServerController.setPort(newPort, onResult)` 走「停旧 → 在新端口重建监听」：成功则持久化 + 刷新总线 + 回调 `true`；失败（多为端口被占用）则**用旧端口回滚重建**并回调 `false`，避免「改端口把服务器改没了」。
 - 设置页在该回调里才更新显示值，并 Toast 告知成功/回滚。
@@ -406,6 +416,76 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 
 **设置项（`SettingGroup.UPLOAD`「上传与解压」）**：`autoUnzipZip`（默认开）、`keepOriginalZip`（默认关 = 解压成功后删包）。
 
+### 3.15 上传访问码（最小认证，v1.7）
+
+**目标**：在不破坏「扫码即传、零手机安装」的前提下加一道门槛，挡住同网段不知道访问码的设备。
+**不做**（最小实现）：过期时间、刷新接口、多用户、权限分级、HTTPS、记住访问码。
+
+**访问码生命周期**（权威值在 `ServerController` 内存，不持久化；经 `ServerBus.token: StateFlow<String?>` 广播给 UI，
+与 `port` / `mode` 同套路 —— UI 不持有引擎引用）
+
+| 时机 | 行为 |
+|:--|:--|
+| 服务器启动（首次 / 休眠唤醒 / 熄屏・播放暂停后恢复 / 改端口重启） | `tryStart()` 生成新码 |
+| 服务器停止（休眠 / 暂停 / 改端口 / 服务销毁） | `stopServer()` 销毁（置 null） |
+
+- 6 位，字符集 `A-Z` + `0-9`，`SecureRandom` 生成（不做易混字符剔除，按需求固定字符集）。
+- **先建码、再起服务，起成功才提交**：码在构造时注入 `TransHttpServer`，所以不存在「运行中换码」的竞态；
+  启动失败（端口占用）不动已有状态，回滚到旧端口也能拿到一份与实例匹配的新码。
+- 由于是「停旧起新」，**改端口也会轮换访问码**，与「每次启动轮换」的约定一致。
+
+**服务端接口**（`TransHttpServer`）
+
+| 接口 | 校验 | 说明 |
+|:--|:--|:--|
+| `GET /` | **不校验** | 网页本身得先加载出来，才有地方显示「输入访问码」界面 |
+| `GET /verify?token=xxx` | 是 | 匹配 200 `{"status":"ok"}`；缺失/不匹配 403 |
+| `GET /icon.svg` `/icon.png` | 否 | 静态图标，无敏感信息 |
+| `POST /upload` | 是 | 读请求头 `X-Upload-Token`；缺失或不匹配 → 403 `{"status":"error","message":"认证失败"}` |
+
+- 比对统一 `trim + uppercase`（`checkToken`），与手机端输入框自动转大写对齐；取头走 `headerOf()` 兜一层大小写
+  （NanoHTTPD 把头部名统一转小写存表，但不依赖它）。
+- **上传的校验放在 `handleUpload` 最前面**：此刻还没建上传记录、也没调 `parseBody` → **请求体一个字节都不落盘**，
+  电视端记录列表不会留下任何痕迹（否则未授权设备能靠刷请求把上传记录塞满）。
+
+**TV 端**（`UploadScreen`，v1.7.1 重做左面板视觉）
+- 二维码内容 = `http://ip:port/?token=XXXXXX`，扫码后手机端解析 URL 即自动通过，**用户零输入**。
+- 访问码做成**色块横条**（`Surface` 铺满面板宽 + `primary.copy(alpha=0.14f)` 底 + 12dp 圆角），
+  条内「访问码」小标签（`bodyMedium`）与 6 位码值（`headlineSmall` + 字距 4sp）**同行居中**。
+  不用两行竖排：多出的 22dp 高度要由二维码来付，而二维码受竖向预算约束。
+  也不用「裸文字行」：小标签紧贴大字会显得像没做完的一行，且无法从上下两条信息里独立出来。
+- 左上角标题用 `labelLarge`（原 `titleMedium`）——面板是「越往下越次要」的信息流，标题不该与访问码抢层级。
+- 「复制链接」复制的是**带访问码的完整链接**（粘到手机浏览器等同扫码）；屏幕上显示的是不带码的短地址（手输用），两者用途不同。
+- 底部只留一行提示（「手机需连接同一 Wi-Fi」），不再重复「当前模式」（顶部状态区已显示）——
+  面板竖向预算直接决定二维码能长多大，每一块高度都是抠着给的。
+
+**面板竖向预算**（改这块前先看这条）：左面板高度 = 屏幕高 − Row 的上下 padding（18dp×2），
+内部 = 标题 + 二维码(`weight(1f)`) + 访问码条 + 地址 + 复制按钮 + 一行提示。
+二维码吃满剩余高度，所以**动任何一块的高度都会等比反噬二维码**。
+
+**二维码尺寸自适应（顺带修掉的历史问题）**：二维码容器为 `weight(1f)`，内部用 **`BoxWithConstraints` 量出可用空间后
+显式取 `min(maxWidth, maxHeight)` 作正方形边长**（实测 1280×720 / density 213 下 283×283 px = 213dp，
+占面板宽 80%）。
+⚠️ **不要写成 `fillMaxSize().aspectRatio(1f)`**：这个链里 `fillMaxSize` 已经把约束变成「固定」，
+而 `aspectRatio` 在 `hasFixedWidth && hasFixedHeight` 时**直接原样返回、不做比例修正** ——
+结果是图片按**宽度**撑成正方形、竖向外溢压住下方的访问码（实测踩过，白底方块 171px 高 vs 容器 153px）。
+改用 `BoxWithConstraints` 后小屏不溢出、大屏也不会被放大过头。
+
+**手机网页**（`assets/web/index.html`）
+- 加载时解析 URL：带 `token` → 存 `sessionStorage` 并直接进上传界面（**情况 A：扫码，全程无感**）；
+  不带 → 显示**「输入访问码」界面**（**情况 B：手输 IP**）。补充：URL 无 token 但本标签页已验证过（用户按刷新）
+  → 复用 `sessionStorage`，不重复输入；**新开标签页**（书签/直连）一律重新过门槛。
+- 输入框 `maxlength=6`、`oninput` 自动转大写并剔除非字母数字、回车即提交；「确认」先 `fetch /verify` 预校验再放行。
+- 取到访问码后立即 `history.replaceState` 抹掉地址栏里的码：避免刷新/收藏/转发时带着一个可能已失效的码反复进入上传界面，
+  也避免访问码随 URL 泄露给被转发到的其他设备。
+- 上传请求带 `X-Upload-Token`。
+- **403 失效处理**：清 `sessionStorage` → **暂停队列**（`uploadNext` 在无 token 时直接返回，否则剩余文件会被逐个撞成 403 全标失败）
+  → 回门槛并提示「认证已失效，请重新输入电视屏幕上显示的访问码」；重新认证成功后 `submitGate` 主动调 `uploadNext()` **让队列续跑**。
+- **探针兜底**：服务端读完请求体前就回 403 并关连接时，浏览器（大文件尤其明显）报的是**网络错误而不是 403**。
+  `xhr.onerror` 里先探一次 `/verify`：403 → 走失效流程；200 → 按真实连接失败提示；探针失败 → 维持原有「服务器可能已休眠」提示。
+  不这样做的话，服务器重启后用户永远看不到「请重新输入访问码」。
+  （注意 `finishOne` 定义在 `uploadNext` 内部，`probeAuth` 在 IIFE 作用域，须由调用方把收尾回调传进去。）
+
 ## 4. 构建与运行
 
 ```bash
@@ -422,6 +502,6 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 **功能 TODO：**
 - [ ] （v1.4 已清空）设置页九项全部接通，无待接线项
 - [x] ~~zip 压缩包上传后服务端自动解压并按分类过滤~~（v1.6 已完成，见 §3.14）
+- [x] ~~上传访问码（最小认证）~~（v1.7 已完成，见 §3.15）
 - [ ] 断点续传（需求 4.4 P2）
-- [ ] 上传页面 Token 验证（需求 4.5 可选项）
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）

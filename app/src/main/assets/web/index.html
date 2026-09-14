@@ -109,6 +109,37 @@
     opacity: 0; transition: opacity .2s; pointer-events: none;
   }
   .toast.show { opacity: 1; }
+
+  /* ——— 访问码门槛（手动输入 IP 进入时显示，扫码进入不会看到） ——— */
+  #gate { display: flex; align-items: center; justify-content: center; min-height: 62vh; }
+  /* display:flex 会盖掉 [hidden] 的默认 display:none，必须显式补回来 */
+  #gate[hidden], #app[hidden] { display: none !important; }
+  .gate-card {
+    width: 100%; background: var(--surface);
+    border-radius: 16px; padding: 26px 20px 22px; text-align: center;
+  }
+  .gate-lock { font-size: 32px; line-height: 1; margin-bottom: 14px; }
+  .gate-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  .gate-sub { font-size: 13px; color: var(--dim); line-height: 1.6; margin-bottom: 18px; }
+  #gate-input {
+    width: 100%; text-align: center;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 26px; font-weight: 700;
+    /* letter-spacing 会在最后一个字符**之后**也加一格，用等量 text-indent 抵消，视觉才居中 */
+    letter-spacing: 6px; text-indent: 6px;
+    padding: 13px 10px; border-radius: 12px;
+    border: 1px solid #37455a; background: var(--bg); color: var(--on);
+    outline: none; text-transform: uppercase;
+  }
+  #gate-input:focus { border-color: var(--primary); }
+  #gate-input::placeholder {
+    font-size: 14px; font-weight: 400; letter-spacing: 0; text-indent: 0; color: var(--dim);
+  }
+  #gate-submit { width: 100%; margin-top: 14px; padding: 14px 0; font-size: 16px; }
+  #gate-submit[disabled] { opacity: .55; }
+  .gate-err { margin-top: 12px; font-size: 13px; color: var(--err); line-height: 1.5; }
+  .gate-err[hidden] { display: none; }
+
   footer { text-align: center; font-size: 12px; color: var(--dim); margin-top: 22px; }
 </style>
 </head>
@@ -124,26 +155,45 @@
   <div class="badge" id="badge">已连接</div>
 </header>
 
-<section class="cats" id="cats">
-  <div class="cat active" data-cat="video">视频</div>
-  <div class="cat" data-cat="image">图片</div>
-  <div class="cat" data-cat="other">其他</div>
-</section>
-<p class="tip" id="tip"></p>
-
-<div id="dropzone">
-  <div class="icon">📁</div>
-  <p>点击选择文件，或将文件 / 文件夹拖拽到此处</p>
-  <div class="btns">
-    <button class="btn primary" id="pick-files">选择文件</button>
-    <button class="btn" id="pick-folder">选择文件夹</button>
+<!-- 访问码门槛：URL 未带 token（手动输入 IP 进入）且本标签页尚未验证过时显示 -->
+<section id="gate" hidden>
+  <div class="gate-card">
+    <div class="gate-lock">🔒</div>
+    <div class="gate-title">请输入电视屏幕上显示的访问码</div>
+    <div class="gate-sub">访问码显示在电视「上传」页二维码的下方，共 6 位（大写字母 + 数字）</div>
+    <input id="gate-input" type="text" maxlength="6" inputmode="latin"
+           autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false"
+           placeholder="6 位访问码">
+    <button class="btn primary" id="gate-submit">确认</button>
+    <div class="gate-err" id="gate-err" hidden></div>
   </div>
-  <input type="file" id="file-input" multiple hidden>
-  <input type="file" id="folder-input" webkitdirectory multiple hidden>
+</section>
+
+<!-- 上传界面：验证通过后才显示（initial hidden，避免门槛未过时闪一下上传界面） -->
+<div id="app" hidden>
+  <section class="cats" id="cats">
+    <div class="cat active" data-cat="video">视频</div>
+    <div class="cat" data-cat="image">图片</div>
+    <div class="cat" data-cat="other">其他</div>
+  </section>
+  <p class="tip" id="tip"></p>
+
+  <div id="dropzone">
+    <div class="icon">📁</div>
+    <p>点击选择文件，或将文件 / 文件夹拖拽到此处</p>
+    <div class="btns">
+      <button class="btn primary" id="pick-files">选择文件</button>
+      <button class="btn" id="pick-folder">选择文件夹</button>
+    </div>
+    <input type="file" id="file-input" multiple hidden>
+    <input type="file" id="folder-input" webkitdirectory multiple hidden>
+  </div>
+
+  <ul id="queue"></ul>
+  <footer>上传完成后，可在电视端对应分类页面查看</footer>
 </div>
 
-<ul id="queue"></ul>
-<footer>上传完成后，可在电视端对应分类页面查看</footer>
+<!-- toast 放在 #app 之外：访问码门槛界面也要能弹提示 -->
 <div class="toast" id="toast"></div>
 
 <script>
@@ -176,6 +226,114 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 2600);
   }
+
+  // ————————————————— 访问码（Token） —————————————————
+  // 电视端每次启动服务器都会轮换访问码。手机侧只存 sessionStorage：同标签页刷新可复用，
+  // 新开标签页（书签 / 直接输 IP）一律重新过门槛 —— 不做「记住访问码」。
+  var TOKEN_KEY = 'uploadToken';
+  var token = '';
+
+  var gateEl = $('gate');
+  var appEl = $('app');
+  var gateInput = $('gate-input');
+  var gateErr = $('gate-err');
+
+  /** 统一按大写 + 只留字母数字（服务端字符集就是 A-Z + 0-9） */
+  function normalizeToken(v) {
+    return (v || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  }
+
+  function storeToken(v) {
+    token = normalizeToken(v);
+    try { sessionStorage.setItem(TOKEN_KEY, token); } catch (_) {}
+  }
+
+  function readStoredToken() {
+    try { return normalizeToken(sessionStorage.getItem(TOKEN_KEY)); } catch (_) { return ''; }
+  }
+
+  function clearToken() {
+    token = '';
+    try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  }
+
+  function setGateError(msg) {
+    gateErr.textContent = msg || '';
+    gateErr.hidden = !msg;
+  }
+
+  function showApp() {
+    gateEl.hidden = true;
+    appEl.hidden = false;
+  }
+
+  function showGate(msg) {
+    appEl.hidden = true;
+    gateEl.hidden = false;
+    setGateError(msg || '');
+    // 等一帧再聚焦，否则移动端软键盘弹不出来
+    setTimeout(function () { try { gateInput.focus(); } catch (_) {} }, 60);
+  }
+
+  /** 点「确认」：先用 GET /verify 验一次，通过才放行（避免输错码要等上传才报错） */
+  function submitGate() {
+    var v = normalizeToken(gateInput.value);
+    if (v.length !== 6) { setGateError('请输入 6 位访问码'); return; }
+    var btn = $('gate-submit');
+    btn.disabled = true;
+    fetch('/verify?token=' + encodeURIComponent(v))
+      .then(function (res) {
+        btn.disabled = false;
+        if (res.ok) {
+          storeToken(v);
+          gateInput.value = '';
+          setGateError('');
+          showApp();
+          uploadNext();          // 之前因认证失效被暂停的队列继续跑
+        } else {
+          setGateError('访问码错误，请重试');
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        setGateError('连接不上电视端，请确认电视「上传」页的服务器已启动');
+      });
+  }
+
+  /** 访问码失效（服务器重启 / 休眠恢复后轮换）：清本地码、暂停队列、把用户送回门槛 */
+  function authLost() {
+    clearToken();
+    gateInput.value = '';
+    showGate('认证已失效，请重新输入电视屏幕上显示的访问码');
+  }
+
+  /** 上传中断后探一次 /verify：区分「访问码失效」与「真的连不上」。
+   *  done = 当前这一轮的收尾回调（finishOne 定义在 uploadNext 内部，这里必须由调用方传进来） */
+  function probeAuth(item, done) {
+    var sent = token;
+    fetch('/verify?token=' + encodeURIComponent(sent))
+      .then(function (res) {
+        if (res.ok) {
+          toast('「' + item.name + '」上传中断，请重试');
+        } else {
+          authLost();
+        }
+        done();
+      })
+      .catch(function () {
+        toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');
+        done();
+      });
+  }
+
+  $('gate-submit').addEventListener('click', submitGate);
+  gateInput.addEventListener('input', function () {
+    var v = normalizeToken(gateInput.value);
+    if (v !== gateInput.value) gateInput.value = v;   // 自动转大写 + 剔除非法字符
+  });
+  gateInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); submitGate(); }
+  });
 
   function extOf(name) {
     var i = name.lastIndexOf('.');
@@ -421,6 +579,9 @@
 
   function uploadNext() {
     if (uploading) return;
+    // 未认证时暂停队列：首次进入门槛、或收到 403 已清空访问码时，都在等用户重新输入。
+    // 不 return 的话会把队列里剩下的文件一个个撞成 403，全被标成失败。
+    if (!token) return;
     var item = null;
     for (var i = 0; i < queue.length; i++) {
       if (queue[i].status === 'wait') { item = queue[i]; break; }
@@ -457,6 +618,8 @@
       '&filename=' + encodeURIComponent(item.file.name) +
       '&relativepath=' + encodeURIComponent(item.relPath || ''),
       true);
+    // 访问码走请求头（服务端校验 X-Upload-Token）；URL query 里只放分类/文件名/相对路径
+    xhr.setRequestHeader('X-Upload-Token', token);
     xhr.upload.onprogress = function (e) {
       if (item.xhr !== xhr) return;
       if (e.lengthComputable) {
@@ -466,6 +629,13 @@
     };
     xhr.onload = function () {
       if (item.xhr !== xhr) return;
+      // 403 = 访问码失效（电视端服务器重启/休眠恢复后轮换了新码）
+      if (xhr.status === 403) {
+        item.status = 'err';
+        authLost();
+        finishOne();
+        return;
+      }
       var okStatus = xhr.status >= 200 && xhr.status < 300;
       item.status = okStatus ? 'ok' : 'err';
       var resp = null;
@@ -481,8 +651,14 @@
     xhr.onerror = function () {
       if (item.xhr !== xhr) return;
       item.status = 'err';
-      toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');
-      finishOne();
+      // 服务端在读完请求体之前就回了 403 并关掉连接时，浏览器报的是网络错误而不是 403
+      // （大文件尤其明显）。用一次 /verify 探针把「访问码失效」和「真连不上」分开，
+      // 否则服务器重启后用户只会看到「服务器可能已休眠」，永远不知道该重新输入访问码。
+      if (token) probeAuth(item, finishOne);
+      else {
+        toast('连接失败：电视端服务器可能已休眠或正在播放视频，请在电视「上传」页唤醒/等待恢复后重试');
+        finishOne();
+      }
     };
     // 用户点「取消」：直接断开连接，已传的部分作废（电视端该条上传记录会记为失败）
     xhr.onabort = function () {
@@ -492,6 +668,23 @@
       finishOne();
     };
     xhr.send(form);
+  }
+
+  // ——— 启动：决定进上传界面还是访问码门槛 ———
+  // 情况 A：扫码进入（URL 带 token）→ 自动取用，用户完全无感；
+  // 情况 B：手动输入 IP 进入（URL 无 token）→ 显示「输入访问码」界面。
+  // 补充一条：URL 无 token 但本标签页已验证过（用户按了刷新）→ 复用 sessionStorage，不必重复输入。
+  var urlToken = '';
+  try { urlToken = normalizeToken(new URLSearchParams(location.search).get('token')); } catch (_) {}
+  if (urlToken) {
+    storeToken(urlToken);
+    // 把访问码从地址栏抹掉：① 避免刷新/收藏/转发时带着一个可能已失效的码反复进入上传界面；
+    // ② 避免访问码随 URL 泄露给被转发到的其他设备
+    try { if (location.search) history.replaceState(null, '', location.pathname); } catch (_) {}
+    showApp();
+  } else {
+    var reused = readStoredToken();
+    if (reused) { token = reused; showApp(); } else { showGate(''); }
   }
 
   // ——— 服务器连通性 ———

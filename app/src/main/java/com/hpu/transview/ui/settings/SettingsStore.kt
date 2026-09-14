@@ -37,11 +37,13 @@ object SettingsStore {
 
     // ——— 服务器与网络 ———
 
-    /** 服务器监听端口（默认 8080）。已接入运行时：ServerController.setPort() 切换后立即生效 */
+    /** 服务器监听端口（默认 2333，候选见 Constants.ALLOWED_PORTS）。
+     *  已接入运行时：ServerController.setPort() 切换后立即生效。
+     *  读值时校验候选列表：旧版本存过已移除的端口（8081/8088/8089/9000 等）统一回落默认值。 */
     var serverPort: Int
         get() {
             val v = prefs()?.getInt("server_port", Constants.DEFAULT_PORT) ?: Constants.DEFAULT_PORT
-            return if (v in Constants.PORT_RANGE) v else Constants.DEFAULT_PORT
+            return if (v in Constants.ALLOWED_PORTS) v else Constants.DEFAULT_PORT
         }
         set(v) { prefs()?.edit()?.putInt("server_port", v)?.apply() }
 

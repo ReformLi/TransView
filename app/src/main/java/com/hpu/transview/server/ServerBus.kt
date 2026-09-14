@@ -28,6 +28,18 @@ object ServerBus {
     private val _port = MutableStateFlow(SettingsStore.serverPort)
     val port: StateFlow<Int> = _port.asStateFlow()
 
+    /**
+     * 当前访问码（6 位，A-Z + 0-9）。
+     *
+     * 生命周期与监听绑定：服务器**每次启动**（首次启动、休眠/暂停恢复、改端口重启）都会轮换一个新值，
+     * 停止时置 null。上传页据此重画二维码（`http://ip:port/?token=xxxxxx`）并在屏幕上显示访问码。
+     *
+     * 唯一权威值在 [ServerController] 里（由它生成并注入服务器实例），总线只负责广播给 UI ——
+     * 与 [port] / [ServerMode] 同套路（UI 只依赖总线，不持有引擎引用）。
+     */
+    private val _token = MutableStateFlow<String?>(null)
+    val token: StateFlow<String?> = _token.asStateFlow()
+
     fun update(running: Boolean, hibernated: Boolean) {
         _running.value = running
         _hibernated.value = hibernated
@@ -39,5 +51,9 @@ object ServerBus {
 
     fun setPort(port: Int) {
         _port.value = port
+    }
+
+    fun setToken(token: String?) {
+        _token.value = token
     }
 }
