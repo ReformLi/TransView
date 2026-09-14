@@ -251,7 +251,8 @@ com.hpu.transview
 
 DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访问 Room 的唯一通道；`PlaybackRepository` 对外保持 path 键调用面，内部桥接外键并在保存进度时自动补建缺失索引。
 
-**三步对账**（`SyncManager.sync()`，全程 Dispatchers.IO，Mutex 串行，严禁阻塞主线程）：
+**四步对账**（`SyncManager.sync()`，全程 Dispatchers.IO，Mutex 串行，严禁阻塞主线程）：
+0. **清理解压工作区**：物理清空 `/sdcard/TransView/.temp_unzip/`（`FileUtils.purgeDirectory`）——压缩包解压途中断电 / 进程被杀会留下半个工作目录，不清理会一直占着空间（见 §3.14）。
 1. **清理空文件夹**：沙盒内三个分类根目录递归扫描，物理删除空文件夹——子删父空继续向上递归（分类根受 `FileLocations.isRoot` 保护永不删除；入口处 `isInsideSandbox` 断言，越界直接拒绝）。
 2. **同步外部删除**（防"有索引无文件"）：遍历 DB 全部 filePath，物理不存在 → 删记录（播放历史经 CASCADE 级联删除）。
 3. **同步新增/变更**（防"有文件无索引"）：递归收集**沙盒内**物理文件（用户 U 盘拷入的文件同样入库，属预期行为）→ 无记录的入库（视频时长 MediaMetadataRetriever 提取 + 进程内 ConcurrentHashMap 缓存）；有记录但 fileSize/lastModified 变化的更新。
@@ -270,7 +271,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
-**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
+**布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 上传与解压 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
 设置项**已全部接通**（v1.4），因此 `SettingRow` 的灰色「待实现」徽标（原 `pending` 参数）已随最后两项接线一并移除。
 
 **焦点规范（v1.4 落地）**：
@@ -368,6 +369,43 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - `GET /icon.svg` / `GET /icon.png` → `serveAsset("web/icon.*", mime)`，从 assets 现读现发（换图后手机端刷新即生效，无需重启服务器）。
 - 网页头部标识与浏览器标签页 favicon 共用同一套图形：`assets/web/icon.svg`（矢量，主选）+ `icon.png`（192×192，供不支持 SVG favicon 的浏览器兜底，同时作 `apple-touch-icon`）。
 
+### 3.14 压缩包自动解压（v1.6，ZipExtractor）
+
+**触发条件（三者同时成立）**：分类是视频/图片 + 文件后缀 `.zip` + 设置「上传与解压 → 自动解压压缩包」开启。
+任一不满足 → `.zip` 按普通文件落进所选分类目录（「其他」分类永远不解压，直接存 Downloads）。
+
+**流水线**（`server/ZipExtractor.process(temp, name, category)`，`TransHttpServer.receiveZipAndExtract` 以
+`runBlocking(Dispatchers.IO)` 调起，不阻塞 UI；上传记录记为「成功」——包已安全收下，解压是后处理）：
+
+1. 上传临时文件 → `.temp_unzip/u<ns>/archive/<原文件名>`（每次上传一个独立工作区，避免并发互踩）；
+2. **元数据预估**：`ZipFile` 读中央目录，只累加匹配当前分类条目的未压缩大小；
+3. **空间校验**：`预估 × 1.2 > 可用空间` → 拒绝解压，原包保留下载目录；
+4. **流式解压**：逐条目 `ZipFile.getInputStream` → 64KiB 缓冲区写工作区 `files/`，保持包内目录结构；
+   非本分类条目跳过不落盘；累计写入超可用空间立即 `BudgetExceeded` 中止（防伪造元数据的膨胀包）；
+5. **归位**：`UploadStorage.save(file, name, 包内相对目录, category)` —— 同名加 `(1)(2)`、同名文件夹合并、不覆盖，
+   随后 `indexMediaAsync` 写入媒体索引；
+6. **收尾**：`workspace.deleteRecursively()`；保留开关开启时先把原包 `moveInto(Downloads)` 再删工作区。
+
+**为什么用 `ZipFile` 而不是题面要求的 `ZipInputStream`**：① 预估体积必须读中央目录里记录的未压缩大小，
+流式读取要把整包解一遍才算得出来；② 中文包名兼容 —— Windows 资源管理器压缩的包用 GBK 编码条目名且不置
+UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `ZipException`）整包会解不出来。
+读取仍是**逐条目流式**（`getInputStream` 边解压边读），内存由调用方的 64KiB 缓冲区决定。
+
+**安全与兜底**
+
+- **Zip Slip**：条目名走 `UploadStorage.sanitizeRelativePath`（剔除 `..` / 绝对路径 / 隐藏段 / 盘符）+ 落点
+  `canonicalPath` 前缀校验，越界条目丢弃。实测 `abs.zip`（`/abs_evil.mp4`）与 `deep.zip`（`good/x/../../../deep_evil.mp4`）
+  被 Android `ZipFile` 在打开阶段直接拒绝，沙盒内外均无越界文件产生；即便被放行也会被上面的清洗拦住。
+- **失败必保留原包**（不受保留开关影响）：未命中目标文件 / 空间不足 / 包损坏 / 归位失败 →
+  原包移入 `Downloads` + 中文提示。结果经上传响应 JSON 的 `unzip` / `extracted` / `message` 三个字段回给网页端
+  （网页 toast），同时 `Handler(Looper.getMainLooper())` 在电视端弹 Toast。
+- **残留清理**：工作区名以 `.` 开头 → `listMediaFilesRecursively` / `listEntries` 天然跳过，解压中途不污染媒体库；
+  `SyncManager.sync()` 第 0 步 `FileUtils.purgeDirectory(FileLocations.tempUnzipDir)` 兜底清空（App 启动与手动刷新都会走到）。
+- **保留原包也要立即入库**：`Outcome.keptZipPath` 由服务器侧一并 `indexMediaAsync`，否则「其他」页要等下次对账才看得到
+  （媒体库由 Room 驱动，不读目录）。
+
+**设置项（`SettingGroup.UPLOAD`「上传与解压」）**：`autoUnzipZip`（默认开）、`keepOriginalZip`（默认关 = 解压成功后删包）。
+
 ## 4. 构建与运行
 
 ```bash
@@ -383,7 +421,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **功能 TODO：**
 - [ ] （v1.4 已清空）设置页九项全部接通，无待接线项
-- [ ] zip 压缩包上传后服务端自动解压并按分类过滤（需求 3.3.5 备选方案）
+- [x] ~~zip 压缩包上传后服务端自动解压并按分类过滤~~（v1.6 已完成，见 §3.14）
 - [ ] 断点续传（需求 4.4 P2）
 - [ ] 上传页面 Token 验证（需求 4.5 可选项）
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）

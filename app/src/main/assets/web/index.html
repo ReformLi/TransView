@@ -155,9 +155,9 @@
     image: ['jpg','jpeg','png','gif','bmp','webp','heic','heif','tiff']
   };
   var TIPS = {
-    video: '仅支持视频文件（mp4、mkv、avi、mov 等），将保存到电视「视频」分类',
-    image: '仅支持图片文件（jpg、png、gif、webp 等），将保存到电视「图片」分类',
-    other: '接受除视频、图片外的所有格式（apk、pdf、zip 等），将通过电视系统工具打开'
+    video: '视频文件（mp4、mkv、avi 等）保存到电视「视频」分类；zip 压缩包会自动解压，只保留其中的视频',
+    image: '图片文件（jpg、png、gif 等）保存到电视「图片」分类；zip 压缩包会自动解压，只保留其中的图片',
+    other: '接受除视频、图片外的所有格式（apk、pdf、zip 等），zip 原样保存到「其他」分类，将通过电视系统工具打开'
   };
 
   var category = 'video';
@@ -184,6 +184,9 @@
 
   function isAllowed(name) {
     var ext = extOf(name);
+    // 压缩包在所有分类下都允许选择：视频/图片分类由电视端自动解压、
+    // 只保留对应分类的文件；「其他」分类则原样保存
+    if (ext === 'zip') return true;
     if (category === 'video') return EXT.video.indexOf(ext) >= 0;
     if (category === 'image') return EXT.image.indexOf(ext) >= 0;
     // 其他：接受非视频、非图片格式
@@ -463,12 +466,15 @@
     };
     xhr.onload = function () {
       if (item.xhr !== xhr) return;
-      item.status = (xhr.status >= 200 && xhr.status < 300) ? 'ok' : 'err';
+      var okStatus = xhr.status >= 200 && xhr.status < 300;
+      item.status = okStatus ? 'ok' : 'err';
+      var resp = null;
+      try { resp = JSON.parse(xhr.responseText); } catch (_) {}
       if (item.status === 'err') {
-        try {
-          var resp = JSON.parse(xhr.responseText);
-          if (resp.message) toast('「' + item.name + '」上传失败：' + resp.message);
-        } catch (_) { toast('「' + item.name + '」上传失败'); }
+        toast('「' + item.name + '」上传失败：' + ((resp && resp.message) || '未知错误'));
+      } else if (resp && resp.message) {
+        // 电视端回传的处理结果：压缩包解压成功 / 未找到对应文件 / 空间不足等
+        toast('「' + item.name + '」' + resp.message);
       }
       finishOne();
     };

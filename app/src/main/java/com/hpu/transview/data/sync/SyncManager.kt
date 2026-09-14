@@ -37,6 +37,8 @@ sealed interface SyncState {
  * 数据库与物理文件一致性对账引擎（单例）。
  *
  * 三步（全部在 Dispatchers.IO，严禁阻塞主线程）：
+ * 0. 清理解压工作区：物理删除 `/sdcard/TransView/.temp_unzip/` 下的全部残留
+ *    （压缩包解压途中断电 / 进程被杀会留下半个工作目录，不清理会一直占着空间）；
  * 1. 清理空文件夹：递归扫描三个媒体根目录，物理删除空文件夹，子删父空继续向上；
  * 2. 同步外部删除：数据库有索引但物理文件不存在 → 删记录（播放历史经外键级联删除）；
  * 3. 同步新增/变更：物理文件无记录 → 提取信息入库；有记录但 lastModified/fileSize 变化 → 更新。
@@ -62,9 +64,15 @@ class SyncManager private constructor(context: Context) {
      */
     suspend fun sync(): SyncResult = syncMutex.withLock {
         val startAt = System.currentTimeMillis()
-        _syncState.value = SyncState.Running("正在清理空文件夹")
+        _syncState.value = SyncState.Running("正在清理临时文件")
+
+        // 0. 清理解压工作区残留（断电 / 强杀后可能留下半个工作目录）
+        withContext(Dispatchers.IO) {
+            FileUtils.purgeDirectory(FileLocations.tempUnzipDir)
+        }
 
         // 1. 清理空文件夹
+        _syncState.value = SyncState.Running("正在清理空文件夹")
         val removedFolders = withContext(Dispatchers.IO) {
             FileLocations.allRoots().sumOf { FileUtils.cleanEmptyFolders(it) }
         }

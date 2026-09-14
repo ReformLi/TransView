@@ -73,6 +73,7 @@ import kotlinx.coroutines.withContext
 /** 设置页分组 */
 enum class SettingGroup(val title: String) {
     SERVER("服务器与网络"),
+    UPLOAD("上传与解压"),
     PLAY("播放设置"),
     UI("界面设置"),
     STORAGE("存储与数据"),
@@ -185,6 +186,10 @@ fun SettingsScreen(
     var portValue by remember { mutableIntStateOf(SettingsStore.serverPort) }
     var bootAutostartValue by remember { mutableStateOf(SettingsStore.bootAutostart) }
     var deviceNameValue by remember { mutableStateOf(SettingsStore.deviceName) }
+
+    // ——— 「上传与解压」两项（已接线）的界面显示值 ———
+    var autoUnzipValue by remember { mutableStateOf(SettingsStore.autoUnzipZip) }
+    var keepZipValue by remember { mutableStateOf(SettingsStore.keepOriginalZip) }
 
     // ——— 「播放设置」四项（已接线）的界面显示值 ———
     // 写 SharedPreferences 不会触发本页重组，用本地状态承载显示值，选完立刻刷新。
@@ -604,6 +609,49 @@ fun SettingsScreen(
                                     Toast.makeText(
                                         context,
                                         "设备名称已改为「$name」，手机端上传页将显示该名称",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
+                            }
+                        }
+
+                        SettingGroup.UPLOAD -> {
+                            SettingRow(
+                                "${g.title}:0", "自动解压压缩包",
+                                if (autoUnzipValue) "开启" else "关闭"
+                            ) {
+                                openChoice("${g.title}:0", ChoiceState(
+                                    "自动解压压缩包",
+                                    listOf("开启", "关闭"),
+                                    if (autoUnzipValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    autoUnzipValue = on
+                                    SettingsStore.autoUnzipZip = on
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启：上传到「视频 / 图片」的 zip 将自动解压，只保留对应分类的文件"
+                                        else "已关闭：zip 将作为普通文件直接保存，不再自动解压",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
+                            }
+                            SettingRow(
+                                "${g.title}:1", "保留原压缩包",
+                                if (keepZipValue) "保留" else "解压后删除"
+                            ) {
+                                openChoice("${g.title}:1", ChoiceState(
+                                    "保留原压缩包",
+                                    listOf("开启（保留到「其他」）", "关闭（解压后删除）"),
+                                    if (keepZipValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    keepZipValue = on
+                                    SettingsStore.keepOriginalZip = on
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启：解压成功后原 zip 保留在「其他」分类"
+                                        else "已关闭：解压成功后删除原 zip（解压失败时仍会保留原包）",
                                         Toast.LENGTH_LONG
                                     ).show()
                                 })

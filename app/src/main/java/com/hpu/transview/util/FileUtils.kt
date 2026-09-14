@@ -35,6 +35,16 @@ object FileLocations {
             }
         ).apply { mkdirs() }
 
+    /**
+     * 压缩包解压工作区：/sdcard/TransView/.temp_unzip
+     *
+     * 上传的 .zip 先落到这里解压，命中分类的文件再搬进分类目录；无论成功失败都会整目录清理。
+     * 目录名以 `.` 开头 → 媒体扫描（listMediaFilesRecursively / listEntries）默认跳过隐藏项，
+     * 解压中途不会污染媒体库；SyncManager 每次对账还会兜底物理清空（防断电后残留）。
+     */
+    val tempUnzipDir: File
+        get() = File(sandboxRoot, ".temp_unzip")
+
     /** 三个分类根目录（对账/清理范围仅限沙盒内） */
     fun allRoots(): List<File> = Category.entries.map { root(it) }
 
@@ -140,6 +150,26 @@ object FileUtils {
             if (child.isDirectory && child.listFiles()?.isEmpty() == true) {
                 if (child.delete()) removed++
             }
+        }
+        return removed
+    }
+
+    /**
+     * 清空一个目录下的全部内容（递归），目录本身保留。
+     * 用于压缩包解压工作区（`/sdcard/TransView/.temp_unzip`）的残留清理：
+     * 解压中途断电 / 进程被杀会留下半个工作目录，SyncManager 每次对账兜底清掉。
+     * 越界保护：目标必须在 /sdcard/TransView 沙盒内，否则拒绝执行。
+     * @return 实际删除的顶层条目数
+     */
+    fun purgeDirectory(dir: File): Int {
+        if (!FileLocations.isInsideSandbox(dir)) return 0
+        val children = dir.listFiles() ?: return 0
+        var removed = 0
+        for (child in children) {
+            runCatching {
+                if (child.isDirectory) child.deleteRecursively() else child.delete()
+            }
+            if (!child.exists()) removed++
         }
         return removed
     }

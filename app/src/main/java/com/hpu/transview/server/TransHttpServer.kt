@@ -1,6 +1,9 @@
 package com.hpu.transview.server
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.MediaType
 import com.hpu.transview.data.UploadRecordRepository
@@ -39,6 +42,9 @@ private const val DEVICE_NAME_PLACEHOLDER = "__DEVICE_NAME__"
  * - 每个上传请求在 upload_records 表建立记录（上传中），经计数流实时回写百分比进度；
  * - 落盘成功/失败后更新记录状态，并将新文件立即写入 media_items 索引（视频后台提取时长）；
  * - UploadBus 仅保留为事件总线（媒体库自动刷新 / 空闲计时），不再承载记录展示。
+ * - **压缩包自动解压**：视频 / 图片分类上传 `.zip` 且「设置 → 上传与解压 → 自动解压压缩包」开启时，
+ *   改由 [ZipExtractor] 处理（暂存 → 空间校验 → 流式解压 → 按分类归位），解压结果经 JSON
+ *   `message` 回给网页端并同时 Toast 到电视端；「其他」分类的 `.zip` 仍原样存入 Downloads。
  */
 class TransHttpServer(
     context: Context,
@@ -47,9 +53,13 @@ class TransHttpServer(
 
     private val appContext = context.applicationContext
     private val storage = UploadStorage(appContext)
+    private val zipExtractor = ZipExtractor(appContext)
     private val uploadRecords = UploadRecordRepository(appContext)
     private val mediaRepository = MediaRepository(appContext)
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 电视端 Toast 需要主线程 Looper */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     init {
         // 临时文件放在应用外部私有目录，与 /sdcard 同卷，移动零拷贝
@@ -204,7 +214,18 @@ class TransHttpServer(
         // 4. 落盘 + 更新记录 + 建媒体索引
         // 落盘文件名以 multipart 头为准（服务端可信源）；缺失时回退 URL query 的 filename
         val multipartName = session.parameters["file"]?.firstOrNull()?.takeIf { it.isNotBlank() }
-        val result = storage.save(tempFile, multipartName ?: displayName, relPath, category)
+        val finalName = multipartName ?: displayName
+
+        // 压缩包自动解压：视频 / 图片分类上传 .zip 且设置开启时，改走「暂存 → 解压 → 按分类归位」，
+        // 不把 .zip 原样落进分类目录（「其他」分类的 .zip 仍然直接存 Downloads，不解压）
+        if (category != Category.OTHER &&
+            finalName.endsWith(".zip", ignoreCase = true) &&
+            SettingsStore.autoUnzipZip
+        ) {
+            return receiveZipAndExtract(tempFile, recordId, busId, finalName, category)
+        }
+
+        val result = storage.save(tempFile, finalName, relPath, category)
         val savedFile = result.getOrNull()
         finishRecord(
             recordId, busId,
@@ -225,6 +246,57 @@ class TransHttpServer(
                 Response.Status.INTERNAL_ERROR,
                 result.exceptionOrNull()?.message ?: "保存失败"
             )
+        }
+    }
+
+    /**
+     * 压缩包自动解压分支的收尾：解压与归位全部在 IO 线程完成，回包时把结果 JSON 交给网页端提示。
+     *
+     * 上传记录一律记为「成功」—— 压缩包本身已经安全收下；解压是后处理，
+     * 其结果（已解压 N 个 / 未找到目标文件 / 空间不足）通过 [ZipExtractor.Outcome.message]
+     * 同时提示给网页端（JSON `message`）与电视端（Toast）。
+     */
+    private fun receiveZipAndExtract(
+        tempFile: File,
+        recordId: Long,
+        busId: Long,
+        zipName: String,
+        category: Category
+    ): Response {
+        val outcome = runBlocking(Dispatchers.IO) {
+            runCatching { zipExtractor.process(tempFile, zipName, category) }
+                .getOrElse { e ->
+                    ZipExtractor.Outcome(
+                        ZipExtractor.Kind.FAILED, emptyList(), null,
+                        "解压失败：${e.message ?: "未知错误"}，请重新上传"
+                    )
+                }
+        }
+
+        finishRecord(recordId, busId, UploadStateCode.SUCCESS, 100)
+        // 归位后的文件立即建媒体索引（视频后台提取时长）
+        outcome.movedFiles.forEach { indexMediaAsync(it) }
+        // 解压失败 / 空间不足 / 未找到目标文件时保留到 Downloads 的原压缩包也要立即入库，
+        // 否则「其他」页要等下次对账才看得到（媒体库由 Room 驱动，不读目录）
+        outcome.keptZipPath?.let { path -> indexMediaAsync(File(path)) }
+        toastOnTv(outcome.message)
+
+        val json = JSONObject()
+            .put("status", "ok")
+            .put("filename", zipName)
+            .put("unzip", outcome.kind.name.lowercase())
+            .put("extracted", outcome.movedFiles.size)
+            .put("message", outcome.message)
+        return newFixedLengthResponse(Response.Status.OK, "application/json", json.toString())
+    }
+
+    /**
+     * 电视端 Toast 提示（解压结果需在人能看到电视时告知）。
+     * 服务器跑在 NanoHTTPD 工作线程，Toast 必须回主线程；应用不在前台时静默失败即可。
+     */
+    private fun toastOnTv(message: String) {
+        mainHandler.post {
+            runCatching { Toast.makeText(appContext, message, Toast.LENGTH_LONG).show() }
         }
     }
 
