@@ -20,9 +20,9 @@ import java.util.concurrent.Executors
  * 服务器智能保活策略引擎（单一状态机）。
  *
  * 信号源：
- * - 屏幕开关（SCREEN_OFF/ON 广播，由 ServerService 转发）
+ * - 屏幕开关（SCREEN_OFF/ON 广播，由 ServerService 转发；亮屏解除智能模式休眠）
  * - 播放状态（PlayerActivity 上报，播放中暂停服务器防"边播边传卡顿"；在途上传顺延至传完才停）
- * - 上传页可见性（MainScreen 上报，省电模式离开页面即停）
+ * - 上传页可见性（MainScreen 上报，省电模式离开页面即停；回到上传页解除智能模式休眠）
  * - 上传活动（UploadBus 事件，重置空闲计时）
  * - 手动唤醒（上传页按钮）
  *
@@ -152,10 +152,11 @@ object ServerController {
         evaluate()
     }
 
-    /** 屏幕开关（ServerService 广播转发） */
+    /** 屏幕开关（ServerService 广播转发）。屏幕点亮 = 用户回到电视前 → 解除智能模式休眠（亮屏即唤醒） */
     fun setScreenOn(on: Boolean) {
         if (screenOn == on) return
         screenOn = on
+        if (on && hibernated) hibernated = false
         evaluate()
     }
 
@@ -166,11 +167,13 @@ object ServerController {
         evaluate()
     }
 
-    /** 上传页可见性（MainScreen 上报；省电模式离开页面即停） */
+    /** 上传页可见性（MainScreen 上报；省电模式离开页面即停）。
+     *  回到上传页 / 打开 App = 用户要使用服务器 → 解除智能模式休眠（进上传页即唤醒） */
     fun setUploadPageVisible(visible: Boolean) {
         if (uploadPageVisible == visible) return
         uploadPageVisible = visible
         if (!visible) manualWake = false
+        if (visible && hibernated) hibernated = false
         evaluate()
     }
 

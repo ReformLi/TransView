@@ -102,7 +102,7 @@ class ServerService : Service() {
             text = getString(R.string.notif_text)
         } else if (hibernated) {
             title = "文件服务器已休眠"
-            text = "智能模式：15 分钟无上传自动休眠，在「上传」页点击唤醒"
+            text = "智能模式：15 分钟无上传自动休眠，亮屏或打开应用自动唤醒"
         } else if (mode == ServerMode.POWER_SAVER) {
             title = "文件服务器已停止"
             text = "省电模式：在「上传」页点击启动"
