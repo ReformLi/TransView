@@ -80,15 +80,16 @@ class SyncManager private constructor(context: Context) {
      */
     suspend fun sync(): SyncResult = syncMutex.withLock {
         val startAt = System.currentTimeMillis()
-        // 对账开始前重检存储状态：U盘插拔广播（去抖 2s）可能与本轮对账竞争，以最新状态为准。
-        // 首选U盘且U盘拔出 → degraded=true：本轮跳过「同步外部删除」（防误删，见类注释）。
+        // 对账开始前重检存储状态：外接盘插拔广播（去抖 2s）可能与本轮对账竞争，以最新状态为准。
+        // 首选是外接盘但当前不在位 → degraded=true：本轮跳过「同步外部删除」（防误删，见类注释）。
         // 重检含文件系统探测（列卷 + canWrite），包进 IO——调用方（前台服务）可能在主线程。
-        val degraded = withContext(Dispatchers.IO) { FileLocations.refresh().degraded }
+        val storageState = withContext(Dispatchers.IO) { FileLocations.refresh() }
+        val degraded = storageState.degraded
         _syncState.value = SyncState.Running("正在清理临时文件")
 
         // 0. 清理解压工作区残留（断电 / 强杀后可能留下半个工作目录）。
-        //    两个沙盒（内部存储 + 在位U盘）的临时目录都兜底清理——上一模式留下的残留
-        //    也要清，谁在位清谁。跳过最近仍在写入的工作区：手动对账可能撞上正在进行的
+        //    全部在位卷沙盒的临时目录都兜底清理——上一模式留下的残留也要清，谁在位清谁。
+        //    跳过最近仍在写入的工作区：手动对账可能撞上正在进行的
         //    解压（或多台手机并发），一刀清掉会把在途压缩包连同已解出的文件一起误删；
         //    这些工作区在空闲 10 分钟后会被下一轮对账兜底清掉。
         withContext(Dispatchers.IO) {
@@ -114,12 +115,14 @@ class SyncManager private constructor(context: Context) {
         }
 
         // 2. 同步外部删除（防"有索引无文件"）。
-        //    降级模式（首选U盘但已拔出）绝对禁止执行：U盘的历史记录此刻全部"物理不存在"，
-        //    执行等于把U盘全部索引连同播放历史清空。记录保留，媒体库展示侧按活动沙盒过滤，
-        //    U盘插回后原样生效。
+        //    降级模式（首选外接盘但已拔出）绝对禁止执行：外接盘的历史记录此刻全部"物理不存在"，
+        //    执行等于把该盘全部索引连同播放历史清空。记录保留，媒体库展示侧按活动沙盒过滤，
+        //    外接盘插回后原样生效。
         var deletedMissing = 0
         if (degraded) {
-            _syncState.value = SyncState.Running("U盘已断开，跳过删除核对（历史记录已保留）")
+            _syncState.value = SyncState.Running(
+                "${storageState.preferredLabel}已断开，跳过删除核对（历史记录已保留）"
+            )
         } else {
             _syncState.value = SyncState.Running("正在核对已有索引")
             val dbPaths = mediaRepository.getAllPaths()

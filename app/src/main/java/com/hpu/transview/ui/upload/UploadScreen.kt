@@ -216,7 +216,8 @@ fun UploadScreen(
             token = token,
             storageLabel = storage.activeLabel,
             storageFreeBytes = storageFreeBytes,
-            storageDegraded = storage.degraded
+            // 降级时显示断开的外接盘盘名（如「SanDisk」）
+            storageDegradedLabel = if (storage.degraded) storage.preferredLabel else null
         )
 
         // ——— 右侧：上传记录（可滚动） ———
@@ -386,7 +387,7 @@ private fun ServerPanel(
     token: String?,
     storageLabel: String,
     storageFreeBytes: Long,
-    storageDegraded: Boolean
+    storageDegradedLabel: String?
 ) {
     Surface(
         modifier = modifier,
@@ -523,9 +524,9 @@ private fun ServerPanel(
                 // 重复一行只会挤掉二维码的可用高度。省下的空间由上面的 weight(1f) 自动给二维码。
 
                 Spacer(Modifier.height(4.dp))
-                // 活动存储状态（U盘拔出自动降级/插回恢复）：一行 bodySmall（~16dp），
+                // 活动存储状态（外接盘拔出自动降级/插回恢复）：一行 bodySmall（~16dp），
                 // 超出的高度同样由 weight(1f) 的二维码吸收
-                StorageStatusRow(storageLabel, storageFreeBytes, storageDegraded)
+                StorageStatusRow(storageLabel, storageFreeBytes, storageDegradedLabel)
             }
         } else {
             // ——— 未运行：状态 + 唤醒/启动 ———
@@ -559,7 +560,7 @@ private fun ServerPanel(
                 )
                 Spacer(Modifier.height(8.dp))
                 // 未运行时同样展示活动存储（降级警示不能因为服务器暂停而不可见）
-                StorageStatusRow(storageLabel, storageFreeBytes, storageDegraded)
+                StorageStatusRow(storageLabel, storageFreeBytes, storageDegradedLabel)
                 Spacer(Modifier.height(26.dp))
                 if (mode == ServerMode.POWER_SAVER) {
                     TvButton("启动服务器") { ServerController.wake() }
@@ -573,9 +574,12 @@ private fun ServerPanel(
 
 // ————————————————— 记录行 —————————————————
 
-/** 存储状态行：正常=「存储：U盘 (14.5 GB 可用)」；降级=追加红色「⚠️ U盘已断开」 */
+/**
+ * 存储状态行：正常=「存储：盘名 (14.5 GB 可用)」；降级（degradedLabel 非空）=追加红色
+ * 「⚠️ 盘名已断开」（如「⚠️ SanDisk已断开」）。
+ */
 @Composable
-private fun StorageStatusRow(label: String, freeBytes: Long, degraded: Boolean) {
+private fun StorageStatusRow(label: String, freeBytes: Long, degradedLabel: String?) {
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Center,
@@ -588,10 +592,10 @@ private fun StorageStatusRow(label: String, freeBytes: Long, degraded: Boolean) 
             color = OnDarkDim,
             textAlign = TextAlign.Center
         )
-        if (degraded) {
+        if (degradedLabel != null) {
             Spacer(Modifier.width(8.dp))
             Text(
-                "⚠️ U盘已断开",
+                "⚠️ ${degradedLabel}已断开",
                 style = MaterialTheme.typography.bodySmall,
                 color = DangerRed
             )

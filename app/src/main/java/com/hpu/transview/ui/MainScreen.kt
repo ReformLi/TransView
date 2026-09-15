@@ -123,17 +123,21 @@ fun MainScreen() {
         ServerController.setUploadPageVisible(selected == MainTab.UPLOAD)
     }
 
-    // ——— U盘插拔全局提示（Toast）———
+    // ——— 外接盘插拔全局提示（Toast）———
     // 运行期降级/恢复事件来自 ServerService 的插拔广播（去抖重检后发出）；MainScreen 常驻
     // 组合，在这里统一弹 Toast 最简单。App 启动首次检测与设置页主动切换不发事件，
     // 故不会开机误弹。
     LaunchedEffect(Unit) {
         FileLocations.storageEvents.collect { event ->
             when (event) {
-                StorageEvent.UsbDetached ->
-                    Toast.makeText(context, "U盘已断开，已自动切换到内部存储", Toast.LENGTH_LONG).show()
-                StorageEvent.UsbAttached ->
-                    Toast.makeText(context, "U盘已恢复，正在使用U盘", Toast.LENGTH_LONG).show()
+                is StorageEvent.UsbDetached ->
+                    Toast.makeText(
+                        context, "「${event.label}」已断开，已自动切换到内部存储", Toast.LENGTH_LONG
+                    ).show()
+                is StorageEvent.UsbAttached ->
+                    Toast.makeText(
+                        context, "「${event.label}」已恢复，正在使用", Toast.LENGTH_LONG
+                    ).show()
             }
         }
     }

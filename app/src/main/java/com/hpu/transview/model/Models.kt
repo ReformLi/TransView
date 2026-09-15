@@ -66,11 +66,6 @@ enum class ServerMode(val label: String, val desc: String) {
     POWER_SAVER("省电模式", "仅在上传页手动点击启动，离开上传页自动停止")
 }
 
-/** 存储位置（用户在设置里选择的首选存储） */
-enum class StorageLocation(val label: String) {
-    /** 设备内部存储：始终可用，是降级模式的兜底落点 */
-    INTERNAL("内部存储"),
-
-    /** 外接 U 盘：可用时为活动存储；拔出时自动降级到内部存储 */
-    USB("U盘")
-}
+// 存储位置不再用固定枚举：设置页的可选存储按「当前在位卷」动态检测（FileLocations.scanVolumes），
+// 无外接盘时只有「内部存储」，有外接盘（U盘/SD卡）时按卷标（盘名）列出全部可选卷。
+// 首选存储按卷根路径持久化（SettingsStore.preferredStoragePath），不再依赖枚举。

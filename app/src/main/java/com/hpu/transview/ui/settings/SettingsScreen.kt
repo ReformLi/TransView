@@ -55,7 +55,6 @@ import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.model.AspectRatio
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.SortOrder
-import com.hpu.transview.model.StorageLocation
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.OptionRow
@@ -776,19 +775,34 @@ fun SettingsScreen(
                         SettingGroup.STORAGE -> {
                             SettingRow(
                                 "${g.title}:0", "存储位置",
-                                if (storageState.degraded) "内部存储（降级）" else storageState.activeLabel
+                                if (storageState.degraded) {
+                                    "内部存储（${storageState.preferredLabel}已断开）"
+                                } else {
+                                    storageState.activeLabel
+                                }
                             ) {
+                                // 可选存储 = 当前在位的全部卷（动态检测）：无外接盘时只有「内部存储」，
+                                // 有外接盘（U盘/SD卡）时按盘名（卷标）列出全部可选卷
+                                val options = storageState.volumes
+                                val selectedIdx = options.indexOfFirst {
+                                    it.root.absolutePath == storageState.preferredRoot
+                                }.coerceAtLeast(0)
                                 openChoice("${g.title}:0", ChoiceState(
                                     "存储位置",
-                                    StorageLocation.entries.map { it.label },
-                                    StorageLocation.entries.indexOf(storageState.preferred),
-                                    descriptions = listOf(
-                                        "始终可用；拔出U盘时的自动兜底落点",
-                                        "优先写入U盘；拔出时自动降级到内部存储（上传不中断），插回自动恢复"
-                                    )
+                                    options.map { it.label },
+                                    selectedIdx,
+                                    descriptions = options.map { vol ->
+                                        if (vol.isRemovable) {
+                                            "优先写入「${vol.label}」；拔出时自动降级到内部存储（上传不中断），插回自动恢复"
+                                        } else {
+                                            "始终可用；外接盘拔出时的自动兜底落点"
+                                        }
+                                    }
                                 ) { i ->
-                                    val loc = StorageLocation.entries[i]
-                                    SettingsStore.preferredStorage = loc
+                                    val vol = options[i]
+                                    // 首选存储按卷根路径 + 盘名一并持久化（盘名供降级提示显示）
+                                    SettingsStore.preferredStoragePath = vol.root.absolutePath
+                                    SettingsStore.preferredStorageLabel = vol.label
                                     scope.launch {
                                         // 立即重检活动存储（含文件系统探测，IO 线程；可能降级/恢复），
                                         // StateFlow 推送本行 value 与「当前存储」条目自动刷新
@@ -796,16 +810,16 @@ fun SettingsScreen(
                                         // 媒体库内容可能随活动存储切换，重新对账（互斥，正在同步则跳过）
                                         runCatching { syncManager.sync() }
                                         val msg = when {
-                                            loc == StorageLocation.INTERNAL -> "已切换为内部存储"
-                                            newState.activeIsUsb -> "已切换为U盘存储"
-                                            else -> "未检测到U盘，暂用内部存储（降级模式）"
+                                            !vol.isRemovable -> "已切换为内部存储"
+                                            newState.activeIsRemovable -> "已切换为「${vol.label}」"
+                                            else -> "未检测到「${vol.label}」，暂用内部存储（降级模式）"
                                         }
                                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                     }
                                 })
                             }
                             // 当前实际使用的路径与状态（纯信息展示，不可操作）：
-                            // 正常模式（U盘）/ 降级模式（U盘已拔出）随插拔自动变化
+                            // 正常模式（盘名）/ 降级模式（盘名已断开）随插拔自动变化
                             AboutEntry(
                                 "${g.title}:1", "当前存储",
                                 value = storageState.modeLabel,
@@ -840,7 +854,9 @@ fun SettingsScreen(
                                 scope.launch {
                                     val r = syncManager.sync()
                                     // 降级模式跳过了「同步外部删除」（防误删），提示里注明
-                                    val extra = if (r.degraded) "\n（U盘已断开，跳过删除核对，历史记录已保留）" else ""
+                                    val extra = if (r.degraded) {
+                                        "\n（${FileLocations.storageState.value.preferredLabel}已断开，跳过删除核对，历史记录已保留）"
+                                    } else ""
                                     Toast.makeText(
                                         context,
                                         "对账完成：新增 ${r.inserted}，更新 ${r.updated}，" +

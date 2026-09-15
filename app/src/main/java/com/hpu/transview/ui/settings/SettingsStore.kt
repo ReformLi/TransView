@@ -1,9 +1,9 @@
 package com.hpu.transview.ui.settings
 
 import android.content.Context
+import android.os.Environment
 import com.hpu.transview.model.AspectRatio
 import com.hpu.transview.model.SortOrder
-import com.hpu.transview.model.StorageLocation
 import com.hpu.transview.util.Constants
 
 /**
@@ -103,15 +103,37 @@ object SettingsStore {
 
     // ——— 存储与数据 ———
 
+    /** 内部存储卷根路径（默认首选）：/storage/emulated/0 */
+    private val internalVolumePath: String
+        get() = Environment.getExternalStorageDirectory().absolutePath
+
     /**
-     * 首选存储位置（默认内部存储）。已接入 FileLocations 的活动存储判定：
-     * - INTERNAL：活动存储恒为内部存储；
-     * - USB：U盘可用时活动存储=U盘，拔出时自动降级为内部存储（降级状态不持久化，
-     *   每次检测时按「首选 + U盘实际在位情况」实时推导，U盘插回即自动恢复）。
+     * 首选存储卷根路径（默认内部存储）。已接入 FileLocations 的活动存储判定：
+     * 首选卷在位 → 活动存储=首选卷；首选是外接盘但当前不在位 → 活动存储自动降级为
+     * 内部存储（降级状态不持久化，每次检测按「首选路径 + 当前在位卷」实时推导，
+     * 外接盘插回即自动恢复）。
+     *
+     * 存储格式：卷根绝对路径（如 /storage/emulated/0、/storage/XXXX-XXXX）。
+     * 兼容旧版本存过的固定枚举名：INTERNAL → 内部卷；USB → 无法映射到具体卷，回落内部
+     * （用户重新在设置里选择即可）。
      */
-    var preferredStorage: StorageLocation
-        get() = prefs()?.getString("preferred_storage", StorageLocation.INTERNAL.name)
-            ?.let { runCatching { StorageLocation.valueOf(it) }.getOrNull() }
-            ?: StorageLocation.INTERNAL
-        set(v) { prefs()?.edit()?.putString("preferred_storage", v.name)?.apply() }
+    var preferredStoragePath: String
+        get() {
+            val raw = prefs()?.getString("preferred_storage", null)
+                ?: return internalVolumePath
+            return when (raw) {
+                "INTERNAL" -> internalVolumePath   // 旧枚举名：回落内部
+                "USB" -> internalVolumePath        // 旧枚举名：无法确定具体盘，回落内部
+                else -> raw                        // 新格式：卷根绝对路径
+            }
+        }
+        set(v) { prefs()?.edit()?.putString("preferred_storage", v)?.apply() }
+
+    /**
+     * 首选存储卷名（盘名/卷标，如「内部存储」「SanDisk」）。切换首选存储时与路径一并写入，
+     * 供降级提示（「{卷名}已断开」）在首选卷不在位时仍能显示盘名；旧版本无此字段时回落「内部存储」。
+     */
+    var preferredStorageLabel: String
+        get() = prefs()?.getString("preferred_storage_label", "内部存储") ?: "内部存储"
+        set(v) { prefs()?.edit()?.putString("preferred_storage_label", v)?.apply() }
 }
