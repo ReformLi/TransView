@@ -53,6 +53,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -264,8 +265,21 @@ fun LibraryScreen(
     }
 
     // ——— 文件夹内文件总数（含子层级） ———
-    val countInFolder: (String) -> Int = { folderPath ->
-        dbItems?.count { it.parentFolder == folderPath || it.parentFolder.startsWith("$folderPath/") } ?: 0
+    // 一次性预计算成 map：dbItems 变化时 O(n·深度) 算好每个文件夹的子孙文件数，
+    // 避免滚动时每个目录卡入场都全表扫一遍 dbItems（原 countInFolder 是 O(目录数×全表行数)，
+    // 文件多时每滑入一张目录卡都卡一下）。map 键为文件夹绝对路径。
+    val childCountMap = remember(dbItems) {
+        val counts = mutableMapOf<String, Int>()
+        dbItems?.forEach { item ->
+            var p = item.parentFolder
+            while (p.isNotEmpty()) {
+                counts[p] = (counts[p] ?: 0) + 1
+                val idx = p.lastIndexOf('/')
+                if (idx <= 0) break
+                p = p.substring(0, idx)
+            }
+        }
+        counts
     }
 
     // ——— 焦点定位：先滚动到目标项，再由卡片自身请求焦点 ———
@@ -517,7 +531,7 @@ fun LibraryScreen(
                     val gridIndex = index + if (atRoot) 0 else 1
                     MediaCard(
                         entry = entry,
-                        childCount = if (entry.isDirectory) countInFolder(entry.path) else 0,
+                        childCount = if (entry.isDirectory) childCountMap[entry.path] ?: 0 else 0,
                         progress = progressMap[entry.path],
                         // FOCUS_FIRST 只命中第一个条目（进入子目录后焦点一次落点，不经过 UpCard）
                         autoFocus = pendingFocusPath == entry.path ||
@@ -841,6 +855,7 @@ private fun MediaCard(
                 .background(MaterialTheme.colorScheme.background),
             contentAlignment = Alignment.Center
         ) {
+            val thumbBg = MaterialTheme.colorScheme.background
             when {
                 entry.isDirectory -> TypeBadge(
                     isDirectory = true, isVideo = false, isImage = false, iconSize = 52.dp
@@ -850,6 +865,9 @@ private fun MediaCard(
                     model = entry.toUri(),
                     contentDescription = entry.name,
                     contentScale = ContentScale.Crop,
+                    // 占位/失败均用卡片底色瞬时填充，避免解码前的空白闪烁（避免被误读为卡顿）
+                    placeholder = ColorPainter(thumbBg),
+                    error = ColorPainter(thumbBg),
                     modifier = Modifier.fillMaxSize()
                 )
                 else -> TypeBadge(

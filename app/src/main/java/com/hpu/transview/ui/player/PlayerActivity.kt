@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -60,6 +61,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -818,6 +820,29 @@ class PlayerActivity : ComponentActivity() {
         return true
     }
 
+    /**
+     * 触屏「点视频画面」的交互入口（与遥控器按键两套入口互不干扰）：
+     * - 续播弹窗在场 → 忽略（交给弹窗自身返回）；
+     * - 控制栏隐藏（含残留子状态）→ 恢复整条控制栏并清掉残留的子状态；
+     * - 设置面板开着 → 关面板；
+     * - 子弹框（倍速/比例）开着 → 关子弹框；
+     * - 否则 → 切换控制栏显隐。
+     * 注意：控制栏与设置面板的「操作区」会吸收自身区域的点击，只有点视频画面才会走到这里。
+     */
+    private fun onSurfaceTap() {
+        lastInteractionTick++
+        if (showResumeDialog) return
+        if (!overlayVisible) {
+            inlineSelector = InlineSelector.NONE
+            showSettingsPanel = false
+            overlayVisible = true
+            return
+        }
+        if (showSettingsPanel) { showSettingsPanel = false; return }
+        if (inlineSelector != InlineSelector.NONE) { inlineSelector = InlineSelector.NONE; return }
+        overlayVisible = false
+    }
+
     // ————— Compose UI —————
 
     @Composable
@@ -983,7 +1008,11 @@ class PlayerActivity : ComponentActivity() {
                         resizeMode = resizeModeOf(aspect)
                     }.also { playerView = it }
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    // 触屏适配：点视频画面（控制栏以外区域）切换控制栏 / 关闭子弹框与设置面板。
+                    // 控制栏等「操作区」会自行吸收点击（见 PlayerOverlay / 设置面板），不会落到这里。
+                    .pointerInput(Unit) { detectTapGestures { onSurfaceTap() } }
             )
 
             // 暂停后常驻的中央图标（无背景）：暂停后一直显示，恢复播放即淡出。
@@ -1033,7 +1062,10 @@ class PlayerActivity : ComponentActivity() {
                 visible = showSettingsPanel,
                 enter = fadeIn(tween(180)) + slideInHorizontally(tween(220)) { it / 2 },
                 exit = fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { it / 2 },
-                modifier = Modifier.align(Alignment.CenterEnd)
+                // 触屏适配：设置面板区域吸收点击（命中面板空白时不当作「点画面」去切控制栏）
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .pointerInput(Unit) { detectTapGestures { /* 面板区：吸收，无动作 */ } }
             ) {
                 SettingsPanel(panelFocus)
             }
@@ -1141,6 +1173,9 @@ class PlayerActivity : ComponentActivity() {
                 .background(
                     Brush.verticalGradient(listOf(Color.Transparent, Color(0xF2000000)))
                 )
+                // 触屏适配：控制栏「操作区」吸收空白区点击，不触发视频画面的切换逻辑
+                // （子弹框/按钮本身是更深的命中目标，仍会先消费点击）。
+                .pointerInput(Unit) { detectTapGestures { /* 空白区：吸收，无动作 */ } }
                 .padding(horizontal = 48.dp, vertical = 30.dp)
         ) {
             // ——— 内联选择器（倍速/比例）：时间轴上方横排胶囊 ———
@@ -1225,7 +1260,8 @@ class PlayerActivity : ComponentActivity() {
                     text = if (speed == 1.0f) "倍速" else "${speed}x",
                     modifier = Modifier.focusRequester(speedBtnFocus)
                 ) {
-                    inlineSelector = InlineSelector.SPEED
+                    // 触屏切换式：已展开倍速框则收起，否则展开（遥控器仍可用返回键关）
+                    inlineSelector = if (inlineSelector == InlineSelector.SPEED) InlineSelector.NONE else InlineSelector.SPEED
                     lastInteractionTick++
                 }
 
@@ -1236,7 +1272,7 @@ class PlayerActivity : ComponentActivity() {
                     text = if (aspect == AspectRatio.ORIGINAL) "比例" else aspect.label,
                     modifier = Modifier.focusRequester(aspectBtnFocus)
                 ) {
-                    inlineSelector = InlineSelector.ASPECT
+                    inlineSelector = if (inlineSelector == InlineSelector.ASPECT) InlineSelector.NONE else InlineSelector.ASPECT
                     lastInteractionTick++
                 }
 
@@ -1247,7 +1283,8 @@ class PlayerActivity : ComponentActivity() {
                     label = "音轨与字幕",
                     modifier = Modifier.focusRequester(settingsBtnFocus)
                 ) {
-                    showSettingsPanel = true
+                    // 触屏切换式：已展开设置面板则收起，否则展开
+                    showSettingsPanel = !showSettingsPanel
                     lastInteractionTick++
                 }
 

@@ -45,6 +45,11 @@ class TransViewApp : Application(), ImageLoaderFactory {
                     .maxSizePercent(0.25)
                     .build()
             }
-            .crossfade(true)
+            // 限制并发解码数：滚动时若图片/视频帧解码全速并发，CPU 被占满会掉帧；
+            // 限到 2 路既不会卡主线程，缩略图也能陆续补齐（已解码的走内存缓存，回滚不重解）。
+            .dispatcher(Dispatchers.IO.limitedParallelism(2))
+            // 关闭 crossfade：列表快速滚动时每张新图的淡入过渡在低端盒子上会造成可见卡顿，
+            // 改为占位色瞬时切换，视觉更跟手（与「上传页」纯文本列表的丝滑观感一致）。
+            .crossfade(false)
             .build()
 }

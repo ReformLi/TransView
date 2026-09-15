@@ -10,6 +10,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -44,6 +46,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -81,6 +84,7 @@ class ImageViewerActivity : ComponentActivity() {
         private const val THUMB_GAP = 12            // 缩略图水平间距 dp（左右各 6）
         private const val STRIP_HPAD = 24           // 轮播条容器水平内边距 dp
         private const val STRIP_VPAD = 14           // 轮播条容器垂直内边距 dp
+        private const val SWIPE_THRESHOLD = 80f     // 触屏左右滑动切图的最小位移 px
     }
 
     private var images: List<MediaRef> = emptyList()
@@ -241,6 +245,72 @@ class ImageViewerActivity : ComponentActivity() {
                     .fillMaxSize()
                     .focusRequester(rootFocus)
                     .focusable()
+                    .pointerInput(Unit) {
+                        // 触屏映射（遥控器行为不变，两套入口独立）：
+                        // 单击左/右 1/3 屏 = 遥控器左/右键；居中单击 = 切顶栏；轮播开着时单击先收轮播；
+                        // 放大态下左/右单击或滑动改为平移；双击 = 中键缩放 1x↔2x
+                        val wPx = with(density) { screenW.toPx() }
+                        detectTapGestures(
+                            onTap = { off ->
+                                lastInteractionTick++
+                                if (carouselVisible) {
+                                    hideCarousel()
+                                    return@detectTapGestures
+                                }
+                                if (off.x < wPx / 3f) {
+                                    if (scale > 1f) {
+                                        offset = Offset(
+                                            (offset.x - 120f).coerceIn(-maxOffsetX, maxOffsetX),
+                                            offset.y
+                                        )
+                                    } else {
+                                        switchImage(-1)
+                                    }
+                                } else if (off.x > wPx * 2f / 3f) {
+                                    if (scale > 1f) {
+                                        offset = Offset(
+                                            (offset.x + 120f).coerceIn(-maxOffsetX, maxOffsetX),
+                                            offset.y
+                                        )
+                                    } else {
+                                        switchImage(1)
+                                    }
+                                } else {
+                                    overlayVisible = !overlayVisible
+                                }
+                            },
+                            onDoubleTap = {
+                                lastInteractionTick++
+                                zoomTo(if (scale > 1f) 1f else 2f)
+                            }
+                        )
+                    }
+                    .pointerInput(Unit) {
+                        // 左右滑 = 遥控器左右键；放大态滑动改为平移
+                        var acc = 0f
+                        detectHorizontalDragGestures(
+                            onDragStart = { acc = 0f },
+                            onHorizontalDrag = { change, amount ->
+                                if (scale > 1f) {
+                                    offset = Offset(
+                                        (offset.x + amount).coerceIn(-maxOffsetX, maxOffsetX),
+                                        offset.y
+                                    )
+                                } else {
+                                    acc += amount
+                                }
+                                change.consume()
+                            },
+                            onDragEnd = {
+                                if (scale <= 1f) {
+                                    when {
+                                        acc > SWIPE_THRESHOLD -> switchImage(-1)
+                                        acc < -SWIPE_THRESHOLD -> switchImage(1)
+                                    }
+                                }
+                            }
+                        )
+                    }
                     .onPreviewKeyEvent { event ->
                         if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                         lastInteractionTick++
