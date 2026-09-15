@@ -1,5 +1,7 @@
 package com.hpu.transview.ui
 
+import android.os.SystemClock
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,6 +26,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -45,6 +48,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.dp
@@ -78,6 +82,12 @@ fun MainScreen() {
     var contentFocusTicket by remember { mutableIntStateOf(0) }
     // 「设置」标签按 ↓ 进入设置页的首个左侧分组，由 SettingsScreen 消费
     var settingsFocusTicket by remember { mutableIntStateOf(0) }
+
+    // ——— 返回键退出：焦点在非「上传」标签时返回先回「上传」（默认最左标签，作为退出前的"家"位置）；
+    // ——— 焦点在「上传」标签上按返回弹提示，2 秒内再按才真正退出（对齐手机端双击返回习惯）———
+    val context = LocalContext.current
+    var topBarFocused by remember { mutableStateOf(false) }
+    var lastBackTime by remember { mutableLongStateOf(0L) }
 
     // 触摸锚定计数：内容区被点按一次自增一次（见内容区 Box 的 focusable/pointerInput 注释）。
     // tap 手势期间 Compose 会清空焦点，立即 requestFocus 会被随后的清空覆盖（实测：立即请求时
@@ -128,11 +138,41 @@ fun MainScreen() {
         }
     }
 
-    // 返回键：先交给内容区（媒体库在子目录时返回上一级，它注册的 BackHandler 优先级更高），
-    // 内容区不处理时回到顶部导航栏。
+    // 返回键把焦点送回「上传」标签（选中态由标签 onFocusChanged 自动跟随），带帧门控重试。
+    val focusUploadTab: () -> Unit = {
+        scope.launch {
+            repeat(10) {
+                if (tabFocusRequesters[MainTab.UPLOAD.ordinal].requestFocusNextFrame()) return@launch
+                delay(16)
+            }
+        }
+    }
+
+    // 返回键分层：① 内容区（媒体库在子目录时返回上一级，它注册的 BackHandler 优先级更高）→
+    // ② 焦点在顶部标签栏：非「上传」标签先回「上传」（退出前的"家"位置）；
+    //    在「上传」标签上按返回弹提示，2 秒内再按才真正退出（只关界面，服务器服务照常运行）；
+    // ③ 焦点在内容区根目录 → 回当前选中标签。
     // 必须用 BackHandler 而非 Modifier.onKeyEvent —— onKeyEvent 只在焦点路径上才收得到事件，
     // 从播放页返回后内容区焦点为空时会漏掉返回键，Activity 被系统直接 finish（表现为「返回键退出 App」）。
-    BackHandler { focusSelectedTab() }
+    BackHandler {
+        android.util.Log.d("EXITDBG", "BACK topBar=$topBarFocused settings=$showSettings selected=$selected lastBack=$lastBackTime now=${SystemClock.uptimeMillis()}")
+        when {
+            // 焦点在媒体标签（非「上传」）→ 先回「上传」
+            topBarFocused && !showSettings && selected != MainTab.UPLOAD -> focusUploadTab()
+            // 焦点在「上传」标签 → 双击返回退出（2 秒窗口，离开上传标签即取消确认）
+            topBarFocused && !showSettings && selected == MainTab.UPLOAD -> {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastBackTime <= 2000L) {
+                    (context.findActivity())?.finish()
+                } else {
+                    lastBackTime = now
+                    Toast.makeText(context, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show()
+                }
+            }
+            // 其余（焦点在内容区等）→ 回当前选中标签（原行为）
+            else -> focusSelectedTab()
+        }
+    }
 
     Column(
         Modifier
@@ -143,7 +183,14 @@ fun MainScreen() {
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 40.dp, vertical = 20.dp),
+                .padding(horizontal = 40.dp, vertical = 20.dp)
+                // 跟踪「焦点是否在标签栏」：返回键据此区分「标签上的返回（回上传/退出）」与
+                // 「内容区的返回（回选中标签）」。hasFocus 含子树（四个媒体标签 + 设置标签）。
+                // 焦点离开标签栏（进入内容区 / 设置页）→ 取消未完成的「再按一次退出」确认。
+                .onFocusChanged { state ->
+                    topBarFocused = state.hasFocus
+                    if (!state.hasFocus) lastBackTime = 0L
+                },
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
@@ -162,6 +209,10 @@ fun MainScreen() {
                         .focusRequester(tabFocusRequesters[index])
                         .onFocusChanged { state ->
                             if (state.isFocused) {
+                                // 切到非「上传」标签 → 取消未完成的「再按一次退出」确认
+                                //（双击窗口只在焦点持续停留在「上传」标签时累计）
+                                if (tab != MainTab.UPLOAD) lastBackTime = 0L
+                                android.util.Log.d("EXITDBG", "tabFocus ${tab.title} isFocused reset(${tab != MainTab.UPLOAD}) lastBackTime=$lastBackTime")
                                 // 退出设置页必须**无条件**执行，不能塞进 `tab != selected` 条件里：
                                 // 从「设置」切回「先前停留的那个标签」时 selected 本来就没变，条件不成立
                                 // → showSettings 停在 true，内容区继续显示设置页
@@ -327,4 +378,11 @@ private fun ServerStatusBadge() {
             color = OnDarkDim
         )
     }
+}
+
+/** 从任意 Context 向上找到宿主 Activity（返回键退出时 finish 用） */
+private tailrec fun android.content.Context.findActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

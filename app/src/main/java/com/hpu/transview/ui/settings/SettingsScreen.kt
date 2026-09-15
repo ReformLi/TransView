@@ -285,12 +285,24 @@ fun SettingsScreen(
         if (i >= 0) i else 0
     }
 
-    BackHandler { onExit() }
+    // 返回键分层：焦点在设置内容区（左侧分组/右侧详情）时先回到顶部「设置」标签（设置页
+    // 保持打开，焦点移回标签）；焦点在「设置」标签上时再退出设置页、回到主界面。与媒体页
+    //「内容区 → 标签 → 退出」的层级一致（用户实测：内容区直接返回会跳到「其他」标签）。
+    BackHandler {
+        if (contentFocused) onFocusTabs() else onExit()
+    }
 
+    // 消费过的「↓ 进入内容」票据：记录已处理的值。与媒体库 consumedFocusTicket 同一模式——
+    // 设置页关闭后再次打开时，残留的旧票据若仍 >0，会让下面的 LaunchedEffect 在初始组合
+    // 阶段就把焦点投进「服务器与网络」（用户实测：设置页退出后从「其他」右键回到「设置」
+    // 标签会直接跳进内容区）。
+    var consumedFocusTicket by remember { mutableIntStateOf(focusTicket) }
     // 设置标签按 ↓ 时进入内容区并聚焦首个分组（与媒体页「标签按↓进首行」一致）；
     // 进入页面默认焦点保持在顶部「设置」标签上，不在这里抢焦点。
     LaunchedEffect(focusTicket) {
-        if (focusTicket > 0) groupFocusers[0].requestFocusNextFrame()
+        if (focusTicket == consumedFocusTicket) return@LaunchedEffect
+        consumedFocusTicket = focusTicket
+        groupFocusers[0].requestFocusNextFrame()
     }
 
     // ————— 局部可调用组件（共享上面状态，避免大量传参） —————
@@ -484,6 +496,16 @@ fun SettingsScreen(
             // 跟踪「焦点是否在本内容区」：hasFocus 含子树（左侧分组/右侧详情）。
             // 顶部「设置」标签持有焦点时本 Row 无焦点 → contentFocused=false → 左侧分组不显示高亮。
             .onFocusChanged { contentFocused = it.hasFocus }
+            // 返回键必须先在这里拦截：系统派发 Back 时会先清空内容区焦点，等 BackHandler
+            // 再判断 contentFocused 已变成 false（实测：Back 一按下 hasFocus 立刻翻转）。
+            // 焦点在内容区时按 Back → 回到顶部「设置」标签（设置页保持打开）；
+            // 焦点在「设置」标签时本 Row 不在焦点路径上 → 该事件回落到下面的 BackHandler。
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.Back) {
+                    onFocusTabs()
+                    true
+                } else false
+            }
     ) {
         // 左侧分组
         Column(
