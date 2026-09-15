@@ -30,6 +30,14 @@ object SettingsStore {
 
     fun init(context: Context) {
         if (appContext == null) appContext = context.applicationContext
+        // 一次性清理 v1.12/v1.13 的 SAF 相关键（v1.14 已彻底移除 SAF，留着只会误导排查）
+        runCatching {
+            prefs()?.edit()
+                ?.remove("saf_tree_uri")
+                ?.remove("saf_tree_label")
+                ?.remove("manual_storage_path")
+                ?.apply()
+        }
     }
 
     private fun prefs(): android.content.SharedPreferences? =
@@ -108,30 +116,31 @@ object SettingsStore {
         get() = Environment.getExternalStorageDirectory().absolutePath
 
     /**
-     * 首选存储卷根路径（默认内部存储）。已接入 FileLocations 的活动存储判定：
-     * 首选卷在位 → 活动存储=首选卷；首选是外接盘但当前不在位 → 活动存储自动降级为
-     * 内部存储（降级状态不持久化，每次检测按「首选路径 + 当前在位卷」实时推导，
-     * 外接盘插回即自动恢复）。
+     * 首选存储路径（默认内部存储）。已接入 FileLocations 的活动存储判定：
+     * 首选卷可用 → 活动存储=首选卷；首选是外接盘但当前不可用（已拔出）→ 活动存储自动降级为
+     * 内部存储（降级状态不持久化，每次检测按「首选路径 + 当前可用卷」实时推导，插回即自动恢复）。
      *
-     * 存储格式：卷根绝对路径（如 /storage/emulated/0、/storage/XXXX-XXXX）。
-     * 兼容旧版本存过的固定枚举名：INTERNAL → 内部卷；USB → 无法映射到具体卷，回落内部
-     * （用户重新在设置里选择即可）。
+     * 存的是**卷根绝对路径**（如 `/storage/emulated/0`、`/storage/XXXX-XXXX`）。兼容旧版本写法：
+     * - `INTERNAL` / `USB`（v1.1 的固定枚举名）→ 回落内部存储；
+     * - 非 `/` 开头的值（v1.12/v1.13 的 SAF 目录树 `content://…`）→ v1.14 已移除 SAF，
+     *   回落内部存储并**就地改写**，避免首选长期指向一个永远不可用的路径而卡在降级态。
      */
     var preferredStoragePath: String
         get() {
-            val raw = prefs()?.getString("preferred_storage", null)
-                ?: return internalVolumePath
-            return when (raw) {
-                "INTERNAL" -> internalVolumePath   // 旧枚举名：回落内部
-                "USB" -> internalVolumePath        // 旧枚举名：无法确定具体盘，回落内部
-                else -> raw                        // 新格式：卷根绝对路径
+            val raw = prefs()?.getString("preferred_storage", null) ?: return internalVolumePath
+            val resolved = when {
+                raw == "INTERNAL" || raw == "USB" -> internalVolumePath
+                !raw.startsWith("/") -> internalVolumePath
+                else -> raw
             }
+            if (resolved != raw) prefs()?.edit()?.putString("preferred_storage", resolved)?.apply()
+            return resolved
         }
         set(v) { prefs()?.edit()?.putString("preferred_storage", v)?.apply() }
 
     /**
-     * 首选存储卷名（盘名/卷标，如「内部存储」「SanDisk」）。切换首选存储时与路径一并写入，
-     * 供降级提示（「{卷名}已断开」）在首选卷不在位时仍能显示盘名；旧版本无此字段时回落「内部存储」。
+     * 首选存储卷名（盘名/卷标，如「内部存储」「SanDisk」「0000-0000」）。切换首选存储时
+     * 与路径一并写入，供降级提示（「{卷名}已断开」）在首选卷不在位时仍能显示盘名。
      */
     var preferredStorageLabel: String
         get() = prefs()?.getString("preferred_storage_label", "内部存储") ?: "内部存储"

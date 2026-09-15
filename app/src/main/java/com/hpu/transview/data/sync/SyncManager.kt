@@ -4,9 +4,11 @@ import android.content.Context
 import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.MediaType
 import com.hpu.transview.data.UploadRecordRepository
+import com.hpu.transview.model.Category
 import com.hpu.transview.model.UploadState
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.UploadBus
+import com.hpu.transview.storage.StorageFile
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import kotlinx.coroutines.Dispatchers
@@ -16,7 +18,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /** 一次对账的结果统计 */
@@ -59,6 +60,12 @@ sealed interface SyncState {
  *
  * 完成后经 syncState StateFlow 通知 UI；由 App 启动（Application）、U盘插拔（ServerService
  * 去抖重检后）与手动刷新触发。
+ *
+ * ## 存储抽象（v1.14，纯 File）
+ * 遍历（[FileUtils.listAllMediaFiles] → [IStorage.listFiles]）与存在性判定
+ * （[FileLocations.existsForPath]）全部走活动存储的抽象接口（内部存储与 U 盘同为 `java.io.File`）。
+ * 核心不变式：**「读不到」绝不等于「被删了」** —— 路径所属卷当前不可见（U 盘已拔出）时，
+ * 存在性一律判为「存在」，绝不删索引。
  */
 class SyncManager private constructor(context: Context) {
 
@@ -81,14 +88,16 @@ class SyncManager private constructor(context: Context) {
     suspend fun sync(): SyncResult = syncMutex.withLock {
         val startAt = System.currentTimeMillis()
         // 对账开始前重检存储状态：外接盘插拔广播（去抖 2s）可能与本轮对账竞争，以最新状态为准。
-        // 首选是外接盘但当前不在位 → degraded=true：本轮跳过「同步外部删除」（防误删，见类注释）。
-        // 重检含文件系统探测（列卷 + canWrite），包进 IO——调用方（前台服务）可能在主线程。
+        // 首选是外接盘但当前不可用（已拔出 / 写探针失败）→ degraded=true：本轮跳过「同步外部删除」
+        // （防误删，见类注释）。重检含文件系统扫描与写探针，包进 IO——调用方可能在主线程。
         val storageState = withContext(Dispatchers.IO) { FileLocations.refresh() }
         val degraded = storageState.degraded
+        val storage = storageState.activeStorage
         _syncState.value = SyncState.Running("正在清理临时文件")
 
         // 0. 清理解压工作区残留（断电 / 强杀后可能留下半个工作目录）。
-        //    全部在位卷沙盒的临时目录都兜底清理——上一模式留下的残留也要清，谁在位清谁。
+        //    全部 File 卷沙盒的临时目录都兜底清理——上一模式留下的残留也要清，谁在位清谁。
+        //    v1.14 起解压工作区恒在活动沙盒内（见 FileLocations.tempUnzipDir）。
         //    跳过最近仍在写入的工作区：手动对账可能撞上正在进行的
         //    解压（或多台手机并发），一刀清掉会把在途压缩包连同已解出的文件一起误删；
         //    这些工作区在空闲 10 分钟后会被下一轮对账兜底清掉。
@@ -108,16 +117,29 @@ class SyncManager private constructor(context: Context) {
             uploadRecordRepository.reapZombieRunning()
         }
 
-        // 1. 清理空文件夹（只扫活动沙盒）
+        // 1. 清理空文件夹（只扫活动存储的三个分类目录）
         _syncState.value = SyncState.Running("正在清理空文件夹")
         val removedFolders = withContext(Dispatchers.IO) {
-            FileLocations.allRoots().sumOf { FileUtils.cleanEmptyFolders(it) }
+            Category.entries.sumOf { storage.cleanEmptyFolders(FileLocations.categoryRelative(it)) }
+        }
+
+        // 1.5 清理 v1.12/v1.13 SAF 时代遗留的 `content://` 索引（v1.14 已彻底移除 SAF）：
+        //     这类记录指向的文档树已永久不可达（existsForPath 对 content:// 恒返回 false），
+        //     留着只会让媒体库出现「点不开」的僵尸卡片。**与降级无关**：任何状态下都清，
+        //     所以放在降级判断之前。
+        val safLegacy = withContext(Dispatchers.IO) {
+            mediaRepository.getAllPaths().filter { it.startsWith("content://") }
+        }
+        if (safLegacy.isNotEmpty()) {
+            withContext(Dispatchers.IO) { mediaRepository.deleteByPaths(safLegacy) }
         }
 
         // 2. 同步外部删除（防"有索引无文件"）。
-        //    降级模式（首选外接盘但已拔出）绝对禁止执行：外接盘的历史记录此刻全部"物理不存在"，
+        //    降级模式（首选外接盘但当前不可用）绝对禁止执行：外接盘的历史记录此刻全部"物理不存在"，
         //    执行等于把该盘全部索引连同播放历史清空。记录保留，媒体库展示侧按活动沙盒过滤，
         //    外接盘插回后原样生效。
+        //    存在性判定经 FileLocations.existsForPath：只有该路径所属的卷**当前可用**时才做真实
+        //    探测 —— 「读不到」绝不等于「被删了」。
         var deletedMissing = 0
         if (degraded) {
             _syncState.value = SyncState.Running(
@@ -127,13 +149,13 @@ class SyncManager private constructor(context: Context) {
             _syncState.value = SyncState.Running("正在核对已有索引")
             val dbPaths = mediaRepository.getAllPaths()
             val missing = withContext(Dispatchers.IO) {
-                dbPaths.filter { path -> !File(path).exists() }
+                dbPaths.filter { path -> !FileLocations.existsForPath(path) }
             }
             mediaRepository.deleteByPaths(missing)
             deletedMissing = missing.size
         }
 
-        // 3. 同步新增 / 变更（防"有文件无索引"；只扫活动沙盒）
+        // 3. 同步新增 / 变更（防"有文件无索引"；只扫活动存储）
         _syncState.value = SyncState.Running("正在扫描媒体文件")
         data class DbInfo(val fileSize: Long, val lastModified: Long, val parentFolder: String)
         val dbIndex: Map<String, DbInfo> = withContext(Dispatchers.IO) {
@@ -147,12 +169,12 @@ class SyncManager private constructor(context: Context) {
         var inserted = 0
         var updated = 0
         for (file in physicalFiles) {
-            val path = file.absolutePath
+            val path = file.path
             val existing = dbIndex[path]
             val changed = existing == null ||
-                existing.fileSize != file.length() ||
-                existing.lastModified != file.lastModified() ||
-                existing.parentFolder != (file.parentFile?.absolutePath ?: "")
+                existing.fileSize != file.size ||
+                existing.lastModified != file.lastModified ||
+                existing.parentFolder != file.parentPath
             if (changed) {
                 upsertFile(file)
                 if (existing == null) inserted++ else updated++
@@ -175,36 +197,36 @@ class SyncManager private constructor(context: Context) {
     }
 
     /**
-     * 上报物理文件已丢失（播放器 FileNotFoundException 兜底）：删索引并触发 UI 刷新。
+     * 上报物理文件已丢失（播放器起播失败兜底）：删索引并触发 UI 刷新。
      *
-     * 防误删：仅当路径位于任一已知沙盒（内部存储 / 在位U盘）内才允许删除——
-     * 正在播放U盘视频时拔出U盘会触发播放错误，此刻U盘路径已不在任何沙盒内，
-     * 若照删会连同播放历史（外键级联）一起清空；U盘插回后记录应原样恢复。
+     * 防误删：仅当路径属于本 App 管理的沙盒（内部存储或某块在位 U 盘上的 TransView）才允许删除
+     * —— 正在播放 U 盘视频时拔出 U 盘会
+     * 触发播放错误，此刻该路径已不在任何可达沙盒内，若照删会连同播放历史（外键级联）一起清空；
+     * U 盘插回后记录应原样恢复。
      */
     suspend fun reportMissingFile(path: String): Boolean =
         withContext(Dispatchers.IO) {
-            val file = File(path)
-            if (!FileLocations.isInsideSandbox(file)) return@withContext false
+            if (!FileLocations.isManagedPath(path)) return@withContext false
             durationCache.remove(path)
             mediaRepository.deleteByPath(path)
         }.also {
             // Room 的 observeByType Flow 会自动推送，UI 监听即可刷新
         }
 
-    private suspend fun upsertFile(file: File) {
-        val type = MediaType.fromFile(file)
+    private suspend fun upsertFile(file: StorageFile) {
+        val type = MediaType.fromFileName(file.name)
         val duration = if (type == MediaType.VIDEO) {
-            durationCache.getOrPut(file.absolutePath) {
-                FileUtils.extractVideoDuration(file)
+            durationCache.getOrPut(file.path) {
+                FileUtils.extractVideoDuration(appContext, file.path)
             }
         } else 0L
         mediaRepository.upsert(
-            filePath = file.absolutePath,
+            filePath = file.path,
             fileName = file.name,
             mediaType = type,
-            parentFolder = file.parentFile?.absolutePath ?: "",
-            fileSize = file.length(),
-            lastModified = file.lastModified(),
+            parentFolder = file.parentPath,
+            fileSize = file.size,
+            lastModified = file.lastModified,
             duration = duration
         )
     }

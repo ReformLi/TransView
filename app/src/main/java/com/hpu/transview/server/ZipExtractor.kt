@@ -43,13 +43,13 @@ class ZipExtractor(private val context: Context) {
     /**
      * @param kind        结果类别
      * @param movedFiles  已归位到分类目录的文件（供媒体索引入库）
-     * @param keptZipPath 原压缩包被保留时的最终路径；解压成功（原包已删除）时为 null
+     * @param keptZip     原压缩包被保留时的落盘结果；解压成功（原包已删除）时为 null
      * @param message     面向用户的提示（网页端 toast + 电视端 Toast），必定非空
      */
     data class Outcome(
         val kind: Kind,
-        val movedFiles: List<File>,
-        val keptZipPath: String?,
+        val movedFiles: List<UploadStorage.Saved>,
+        val keptZip: UploadStorage.Saved?,
         val message: String
     )
 
@@ -95,7 +95,12 @@ class ZipExtractor(private val context: Context) {
                 val kept = keepArchive(archive)
                 return Outcome(Kind.FAILED, emptyList(), kept, "压缩包无法解析" + keptTail(kept))
             }
-            val available = runCatching { workspace.usableSpace }.getOrDefault(0L)
+            // 空间校验用的是**活动存储**的可用空间（U 盘与内部存储统一走 File.usableSpace）。
+            // 解压工作区虽然落在内部存储，但最终归位目标是活动存储，
+            // 按目标盘的空间判断才有意义。取不到时退回工作区所在卷。
+            val available = runCatching { FileLocations.activeStorageOf(context).getUsableSpace() }
+                .getOrDefault(0L)
+                .takeIf { it > 0 } ?: runCatching { workspace.usableSpace }.getOrDefault(0L)
             val needed = (estimate.bytes * SPACE_FACTOR).toLong()
             if (available <= 0 || needed > available) {
                 val kept = keepArchive(archive)
@@ -131,8 +136,10 @@ class ZipExtractor(private val context: Context) {
             }
 
             // ——— 3. 按压缩包内目录结构归位到分类目录 ———
+            // 注意：归位走 UploadStorage.save → 活动存储（同卷 rename、跨卷 copy + delete）。
+            // 工作区始终是本地 File（[FileLocations.tempUnzipDir]），归位到 U 盘时跨卷拷贝。
             val destBase = destRoot.canonicalPath + File.separator
-            val moved = ArrayList<File>(report.files.size)
+            val moved = ArrayList<UploadStorage.Saved>(report.files.size)
             for (file in report.files) {
                 val relDir = runCatching {
                     val parent = file.parentFile ?: return@runCatching ""
@@ -294,13 +301,11 @@ class ZipExtractor(private val context: Context) {
     // ————————————————— 文件搬运 / 兜底 —————————————————
 
     /**
-     * 把压缩包搬进 Downloads（「其他」分类的家）并返回最终路径。
+     * 把压缩包搬进 Downloads（「其他」分类的家）并返回落盘结果。
      * 同名时经 [UploadStorage.save] 自动加 (1)(2) 后缀，不会覆盖已有文件。
      */
-    private fun keepArchive(archive: File): String? =
-        storage.save(archive, archive.name, "", Category.OTHER)
-            .map { it.absolutePath }
-            .getOrElse { null }
+    private fun keepArchive(archive: File): UploadStorage.Saved? =
+        storage.save(archive, archive.name, "", Category.OTHER).getOrNull()
 
     /**
      * 移动文件。工作区与分类目录同在 /sdcard 同一卷，`renameTo` 即为改名（零拷贝）；
@@ -334,8 +339,8 @@ class ZipExtractor(private val context: Context) {
     }
 
     /** 提示语尾巴：按「原包到底有没有被保住」如实措辞，不能一律说「已保留」 */
-    private fun keptTail(keptPath: String?): String =
-        if (keptPath != null) "，已保留原压缩包" else "，且原压缩包未能保留"
+    private fun keptTail(kept: UploadStorage.Saved?): String =
+        if (kept != null) "，已保留原压缩包" else "，且原压缩包未能保留"
 
     private companion object {
         /** 流式缓冲区 64KiB：解压全程内存占用与之同量级（远低于 20MB 要求） */

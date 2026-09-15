@@ -3,57 +3,85 @@ package com.hpu.transview.server
 import android.content.Context
 import android.media.MediaScannerConnection
 import com.hpu.transview.model.Category
+import com.hpu.transview.storage.FileStorage
 import com.hpu.transview.util.FileLocations
 import java.io.File
 import java.io.IOException
 
 /**
- * 上传文件的落盘规则（落点始终跟随 FileLocations 的**活动存储**：首选外接盘且在位时写入该盘沙盒；
- * 降级模式（首选盘已拔出）自动写入内部存储沙盒，上传不中断；插回后恢复写所选盘）：
- * - 分类根目录：视频→Movies 图片→Pictures 其他→Download
+ * 上传文件的落盘规则（落点始终跟随 [FileLocations.activeStorage] 的**活动存储**：
+ * 首选外接盘且可用时写入该盘沙盒；降级模式（首选盘已拔出）自动写入内部存储沙盒，
+ * 上传不中断；插回后恢复写所选盘）：
+ * - 分类根目录：视频→Movies 图片→Pictures 其他→Downloads
  * - 文件夹上传：按 relativePath 重建层级，同名文件夹自动合并
  * - 同名文件：追加 (1)(2)… 后缀，绝不覆盖已有文件
+ *
+ * ## 落盘方式（v1.14）
+ * 存储只有 [FileStorage] 一种实现（纯 `java.io.File`），落盘统一走
+ * [FileStorage.moveFileInto]：NanoHTTPD 的临时文件与沙盒同卷时 `renameTo` 零拷贝改名，
+ * 跨卷（临时文件在内部存储、目标在 U 盘）退化为 64KiB 流式 copy + delete。
+ * 不再有任何 `ContentResolver` / `content://` 分支。
+ *
+ * 落盘结果统一为 [Saved]（存储身份 + 名称 + 父节点 + 尺寸 + 修改时间），
+ * 供媒体索引入库 —— 数据库里 `filePath` 即 [Saved.path]（绝对路径）。
  */
 class UploadStorage(private val context: Context) {
 
-    /** 保存并返回最终落盘的目标文件（供媒体索引入库） */
-    fun save(tempFile: File, rawName: String, rawRelPath: String, category: Category): Result<File> {
+    /** 一次成功落盘的结果描述 */
+    data class Saved(
+        val name: String,
+        /** 存储身份：绝对路径（= 数据库 filePath） */
+        val path: String,
+        /** 父节点身份（= 数据库 parentFolder） */
+        val parentPath: String,
+        val size: Long,
+        val lastModified: Long
+    )
+
+    /** 保存并返回最终落盘结果（供媒体索引入库） */
+    fun save(tempFile: File, rawName: String, rawRelPath: String, category: Category): Result<Saved> {
         return runCatching {
-            val name = sanitizeFileName(rawName)
+            // v1.14：存储只有 FileStorage 一种实现，直接用它（拿到同卷零拷贝改名的能力）
+            val storage = FileLocations.activeStorageOf(context) as FileStorage
+            val name0 = sanitizeFileName(rawName)
             val segments = sanitizeRelativePath(rawRelPath)
-            // 活动媒体根（FileLocations.getMediaRootDir 的分类子目录）：降级模式=内部存储，正常=首选存储
-            var dir = FileLocations.root(category)
-            for (seg in segments) {
-                dir = File(dir, seg)
-                if (!dir.exists() && !dir.mkdirs()) throw IOException("无法创建文件夹：$seg")
+            val relDir = buildString {
+                append(FileLocations.categoryRelative(category))
+                segments.forEach { append('/').append(it) }
             }
-            var target = File(dir, name)
-            if (target.exists()) target = uniqueTarget(dir, name)
-            // 落盘搬运用 renameTo（临时目录与沙盒同在 /sdcard 卷上，即零拷贝改名）；
-            // 跨文件系统失败时退化为 copy + delete。
-            // 刻意不用 java.nio.file.Files.move/copy：那套 API 要求 API 26+，而本工程
-            // minSdk 是 21（低版本会抛 NoClassDefFoundError，全部上传表现为「保存失败」），
-            // 与 ZipExtractor.moveInto 同一标准。
-            if (!tempFile.renameTo(target)) {
-                // renameTo 失败的另一可能是目标极小概率已被并发上传占用（检查与搬运之间存在窗口）：
-                // copyTo(overwrite = false) 撞名会抛异常而不是覆盖，这里先换一个不重名的落点再试
-                if (target.exists()) target = uniqueTarget(dir, name)
-                tempFile.copyTo(target, overwrite = false)
-                tempFile.delete()
-            }
-            scanToMediaStore(target)
-            target
+            if (!storage.createDirectory(relDir)) throw IOException("无法创建文件夹：${relDir.substringAfter('/')}")
+
+            // 同名不覆盖：先列出目标目录已有名字，必要时加 (1)(2)… 后缀
+            val used = storage.listFiles(relDir).mapTo(HashSet()) { it.name }
+            val name = if (name0 in used) uniqueName(name0, used) else name0
+            val rel = "$relDir/$name"
+
+            // 同卷零拷贝改名；跨卷退化为流式 copy（moveFileInto 内部已处理）
+            if (!storage.moveFileInto(tempFile, rel)) throw IOException("写入存储失败")
+
+            scanToMediaStore(storage.resolve(rel))
+
+            // 落盘后再列一次拿真实的尺寸/修改时间
+            val entry = storage.listFiles(relDir).firstOrNull { it.name == name }
+            Saved(
+                name = entry?.name ?: name,
+                path = entry?.path ?: storage.nodeFor(rel),
+                parentPath = entry?.parentPath ?: storage.nodeFor(relDir),
+                size = entry?.size ?: 0L,
+                lastModified = entry?.lastModified ?: System.currentTimeMillis()
+            )
         }
     }
 
-    private fun uniqueTarget(dir: File, name: String): File {
+    /** 同名不冲突的名字：`a.mp4` → `a(1).mp4`、`a(2).mp4`… */
+    private fun uniqueName(name: String, used: Set<String>): String {
         val dot = name.lastIndexOf('.')
         val base = if (dot > 0) name.substring(0, dot) else name
         val ext = if (dot > 0) name.substring(dot) else ""
         var i = 1
         while (true) {
-            val candidate = File(dir, "$base($i)$ext")
-            if (!candidate.exists()) return candidate
+            val candidate = "$base($i)$ext"
+            if (candidate !in used) return candidate
             i++
         }
     }
@@ -62,7 +90,7 @@ class UploadStorage(private val context: Context) {
         try {
             MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
         } catch (_: Exception) {
-            // 扫描失败不影响上传结果
+            // 扫描失败不影响上传结果（媒体库索引由 TransHttpServer / SyncManager 另行维护）
         }
     }
 
@@ -88,7 +116,8 @@ class UploadStorage(private val context: Context) {
                 .split('/', '\\')
                 .map { it.trim() }
                 .filter { seg ->
-                    seg.isNotEmpty() && seg != "." && seg != ".." && !seg.startsWith('.') && seg.length <= 100
+                    seg.isNotEmpty() && seg != "." && seg != ".." && !seg.startsWith('.') &&
+                        seg.length <= 100 && !seg.contains(':')
                 }
                 .take(8)
     }

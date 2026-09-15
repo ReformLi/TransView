@@ -65,7 +65,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
-import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -80,13 +79,16 @@ import androidx.media3.ui.PlayerView
 import com.hpu.transview.data.PlaybackRepository
 import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.model.AspectRatio
+import com.hpu.transview.model.MediaRef
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.OptionRow
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
+import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
-import com.hpu.transview.util.isVideoFile
+import com.hpu.transview.util.mediaUri
+import com.hpu.transview.util.nameIsVideoFile
 import com.hpu.transview.util.naturalCompare
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -96,7 +98,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.File
 
 /**
  * 视频播放器（v1.10 时间轴优先控制栏，对齐 Netflix / tvOS 交互习惯）：
@@ -178,7 +179,8 @@ class PlayerActivity : ComponentActivity() {
     lateinit var player: ExoPlayer
         private set
     private lateinit var repository: PlaybackRepository
-    private var playlist: List<File> = emptyList()
+    /** 同目录连播列表。元素是 [MediaRef]（path 恒为本地绝对路径） */
+    private var playlist: List<MediaRef> = emptyList()
     private var currentIndex = 0
 
     // —— Compose 状态 ——
@@ -257,7 +259,7 @@ class PlayerActivity : ComponentActivity() {
     private var thumbRetrieverPath: String? = null
     private var thumbReqSeq = 0
 
-    private val currentFile: File? get() = playlist.getOrNull(currentIndex)
+    private val currentFile: MediaRef? get() = playlist.getOrNull(currentIndex)
     private val hasNext: Boolean get() = currentIndex + 1 < playlist.size
     private val hasPrev: Boolean get() = currentIndex > 0
 
@@ -280,8 +282,8 @@ class PlayerActivity : ComponentActivity() {
                 if (file != null) {
                     // 先挂「已看完」守卫再异步清库：clear 与周期性 saveProgress 是两次
                     // 顺序不保证的异步写，不拦的话 100% 进度记录可能被重新写回
-                    finishedPaths += file.absolutePath
-                    lifecycleScope.launch { repository.clear(file.absolutePath) }
+                    finishedPaths += file.path
+                    lifecycleScope.launch { repository.clear(file.path) }
                 }
                 ended = true
                 overlayVisible = true
@@ -303,16 +305,17 @@ class PlayerActivity : ComponentActivity() {
                 // 离开结束态也意味着预告卡（若还在倒计时）作废——用户已经自己行动了。
                 ended = false
                 hideNextCard()
-                currentFile?.let { finishedPaths.remove(it.absolutePath) }
+                currentFile?.let { finishedPaths.remove(it.path) }
             }
         }
 
         override fun onPlayerError(error: PlaybackException) {
             val file = currentFile
-            if (file != null && !file.exists()) {
-                // 文件被外部删除（FileNotFoundException 兜底）：删索引并提示，UI 经 Room Flow 自动刷新
+            if (file != null && !FileLocations.existsForPath(file.path)) {
+                // 文件被外部删除（FileNotFoundException / 文档 URI 失效兜底）：删索引并提示，
+                // UI 经 Room Flow 自动刷新
                 lifecycleScope.launch {
-                    SyncManager.getInstance(this@PlayerActivity).reportMissingFile(file.absolutePath)
+                    SyncManager.getInstance(this@PlayerActivity).reportMissingFile(file.path)
                 }
                 Toast.makeText(this@PlayerActivity, "文件已丢失，已从列表移除", Toast.LENGTH_LONG).show()
             } else {
@@ -328,8 +331,7 @@ class PlayerActivity : ComponentActivity() {
         SettingsStore.init(this) // 读取设置页「播放设置」四项（App 启动时已 init，这里兜底）
 
         val path = intent.getStringExtra(EXTRA_PATH)
-        val file = if (path != null) File(path) else null
-        if (file == null || !file.isFile) {
+        if (path == null || !FileLocations.existsForPath(path)) {
             // 入口即发现文件丢失：上报对账引擎清理索引（残留记录随之移除）
             if (path != null) {
                 lifecycleScope.launch {
@@ -342,12 +344,14 @@ class PlayerActivity : ComponentActivity() {
         }
 
         repository = PlaybackRepository(this)
-        playlist = file.parentFile
-            ?.listFiles()
-            ?.filter { it.isFile && it.isVideoFile() }
-            ?.sortedWith { a, b -> naturalCompare(a.name, b.name) }
-            ?: listOf(file)
-        currentIndex = playlist.indexOfFirst { it.absolutePath == file.absolutePath }.takeIf { it >= 0 } ?: 0
+        // 同目录连播列表：走活动存储的「兄弟条目」（v1.14 恒为列目录），
+        // 对 U 盘与内部存储同样成立（不依赖 File.parentFile，故不会退化成单集播放）
+        playlist = FileLocations.siblings(path)
+            .filter { !it.isDirectory && nameIsVideoFile(it.name) }
+            .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+            .map { MediaRef(it.path, it.name) }
+            .ifEmpty { listOf(MediaRef(path, path.substringAfterLast('/'))) }
+        currentIndex = playlist.indexOfFirst { it.path == path }.takeIf { it >= 0 } ?: 0
         postResult()
 
         player = ExoPlayer.Builder(this).build()
@@ -369,7 +373,7 @@ class PlayerActivity : ComponentActivity() {
 
         // 续播判断
         lifecycleScope.launch {
-            val history = repository.get(file.absolutePath)
+            val history = repository.get(path)
             if (history != null && history.position > 10_000 &&
                 (history.duration <= 0 || history.position < history.duration * 95 / 100)
             ) {
@@ -398,7 +402,7 @@ class PlayerActivity : ComponentActivity() {
      */
     private fun postResult() {
         currentFile?.let {
-            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT_PATH, it.absolutePath))
+            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT_PATH, it.path))
         }
     }
 
@@ -422,33 +426,38 @@ class PlayerActivity : ComponentActivity() {
 
     // ————— 播放控制 —————
 
-    private fun findSubtitleFiles(video: File): List<MediaItem.SubtitleConfiguration> {
+    /**
+     * 找出同名的外挂字幕（srt/ass/ssa/vtt）。
+     *
+     * 走活动存储的兄弟条目（v1.14 恒为列目录）。字幕轨以 `file://` URI 交给 ExoPlayer 读取，
+     * 与视频同源，同样可用。
+     */
+    private fun findSubtitleFiles(video: MediaRef): List<MediaItem.SubtitleConfiguration> {
         val base = video.nameWithoutExtension
-        return video.parentFile
-            ?.listFiles()
-            ?.filter {
-                it.isFile && it.nameWithoutExtension.equals(base, ignoreCase = true) &&
-                    it.extension.lowercase() in setOf("srt", "ass", "ssa", "vtt")
+        return FileLocations.siblings(video.path)
+            .filter {
+                !it.isDirectory && it.nameWithoutExtension.equals(base, ignoreCase = true) &&
+                    it.extension in setOf("srt", "ass", "ssa", "vtt")
             }
-            ?.map { f ->
-                val mime = when (f.extension.lowercase()) {
+            .map { f ->
+                val mime = when (f.extension) {
                     "srt" -> MimeTypes.APPLICATION_SUBRIP
                     "vtt" -> MimeTypes.TEXT_VTT
                     else -> MimeTypes.APPLICATION_SS
                 }
-                MediaItem.SubtitleConfiguration.Builder(f.toUri())
+                MediaItem.SubtitleConfiguration.Builder(mediaUri(f.path))
                     .setMimeType(mime)
                     .setLanguage(f.extension)
                     .build()
             }
-            ?: emptyList()
     }
 
     private fun prepareItem(index: Int) {
         val file = playlist.getOrNull(index) ?: return
         currentTitle = file.name
+        // file:///绝对路径 由 ExoPlayer 的 DefaultDataSource 直接播（原生支持，开销最小）
         val item = MediaItem.Builder()
-            .setUri(file.toUri())
+            .setUri(mediaUri(file.path))
             .setSubtitleConfigurations(findSubtitleFiles(file))
             .build()
         player.setMediaItem(item)
@@ -479,12 +488,12 @@ class PlayerActivity : ComponentActivity() {
     private fun saveProgress() {
         val file = currentFile ?: return
         // 已看完待清历史的文件不再回写进度（见 finishedPaths 注释）
-        if (file.absolutePath in finishedPaths) return
+        if (file.path in finishedPaths) return
         val pos = player.currentPosition
         val dur = player.duration
         if (dur > 0 && pos > 1000) {
             lifecycleScope.launch {
-                repository.save(file.absolutePath, file.name, pos, dur)
+                repository.save(file.path, file.name, pos, dur)
             }
         }
     }
@@ -510,7 +519,7 @@ class PlayerActivity : ComponentActivity() {
             // 播完状态下按播放键 = 重播：解除「已看完」守卫，此后正常记录新进度。
             // 重播意味着放弃预告卡倒计时（否则会边重播边被倒计时切走）
             hideNextCard()
-            currentFile?.let { finishedPaths.remove(it.absolutePath) }
+            currentFile?.let { finishedPaths.remove(it.path) }
             ended = false
             player.seekTo(0)
             player.play()
@@ -563,9 +572,9 @@ class PlayerActivity : ComponentActivity() {
     private fun thumbBucket(ms: Long): Long = ms / 10_000L * 10_000L
 
     /** 请求当前快进位置的预览帧（seq 守卫：慢速解码完成后，只有最新请求才能上屏） */
-    private fun requestScrubThumb(file: File, atMs: Long) {
+    private fun requestScrubThumb(file: MediaRef, atMs: Long) {
         val bucket = thumbBucket(atMs)
-        val key = "${file.absolutePath}#$bucket"
+        val key = "${file.path}#$bucket"
         thumbCache[key]?.let { cached ->
             scrubThumb = cached
             return
@@ -573,7 +582,7 @@ class PlayerActivity : ComponentActivity() {
         scrubThumb = null // 占位（避免显示错误位置的旧帧）
         val seq = ++thumbReqSeq
         lifecycleScope.launch {
-            val bmp = loadThumb(file.absolutePath, bucket)
+            val bmp = loadThumb(file.path, bucket)
             if (seq == thumbReqSeq) scrubThumb = bmp
         }
     }
@@ -591,8 +600,8 @@ class PlayerActivity : ComponentActivity() {
                     thumbCache[key]?.let { return@runCatching it }
                     if (thumbRetrieverPath != path) {
                         thumbRetriever?.release()
-                        val retriever = MediaMetadataRetriever()
-                        retriever.setDataSource(path)
+                        // 绝对路径版本 setDataSource(path)，比 URI 版本更快、也不依赖 ContentResolver
+                        val retriever = FileUtils.retrieverFor(this@PlayerActivity, path)
                         thumbRetriever = retriever
                         thumbRetrieverPath = path
                     }
@@ -622,7 +631,7 @@ class PlayerActivity : ComponentActivity() {
         nextThumb = null
         // 预告卡封面：取下一集开头附近的帧（不必等它，加载完成自然出现）
         playlist.getOrNull(currentIndex + 1)?.let { next ->
-            lifecycleScope.launch { nextThumb = loadThumb(next.absolutePath, 5_000L) }
+            lifecycleScope.launch { nextThumb = loadThumb(next.path, 5_000L) }
         }
     }
 

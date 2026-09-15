@@ -1,7 +1,35 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.10　日期：2026-09-14
+> 版本：v1.14　日期：2026-09-15
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.14 变更：**彻底移除 SAF，U 盘改用直接文件路径（File API）**——真机（Vidda 电视）实测系统的 SAF 授权框架
+> （`ACTION_OPEN_DOCUMENT_TREE`）被屏蔽、**授权根本不可能成功**；而用第三方文件管理器验证，U 盘物理路径
+> `/storage/0000-0000` **实际可读可写**。结论是问题不在权限、而在「系统不上报存储卷」，于是回到纯 `java.io.File`：
+> ① `FileLocations.getWritableDevices()` **重写为「多来源枚举候选卷根 + 写探针」**——`/storage` 的**目录项**在
+> Android 11+ 对第三方应用一律不可读（`listFiles()` 恒 null，API 36 实测；但**已知路径照样可读写**），故候选来自
+> ①StorageManager 的 `getDirectory()` ②卷 uuid 推导的 `/storage/<uuid>` 与 `/mnt/media_rw/<uuid>`
+> ③`getExternalFilesDirs` 反推卷根 ④`/proc/mounts` 挂载点；再逐个做写探针（建+删 `.transview_write_test`），
+> 通过才列出（§3.17）；② `SafStorage` 删除，`IStorage` 收敛为**唯一实现 `FileStorage`**，`StorageFile.path`
+> **恒为绝对路径**；上传走 `FileOutputStream`，播放/看图/缩略图一律 `file://`（ExoPlayer / Coil 原生支持、不走 IPC）；
+> ③ 设置页删除「添加 U 盘（需授权）」与「手动指定 U 盘路径」两行及其全部 SAF 代码（连带删 `androidx.documentfile`
+> 依赖），**存储位置**直接列出自动扫描出的可写设备（副标题带「可用 / 共」，选中即写
+> `SettingsStore.preferredStoragePath` + 对账）；④ 降级/恢复与防误删不变式**完全保留**；⑤ 对账新增步骤 **1.5**
+> 清理 v1.12/v1.13 遗留的 `content://` 索引（§3.17.1）。
+> v1.13 变更：**SAF 授权兼容性兜底 + 手动指定 U 盘路径 + 崩溃日志落盘**——真机「点『添加 U 盘（需授权）』白框一闪、
+> App 被弹回桌面」。① 授权启动链路全面加固：双渠道预探测（`resolveActivity` + `queryIntentActivities`，识别
+> `frameworkpackagestubs` 占位 Stub）、自定义精简 Intent 契约 `SafeOpenDocumentTree`（去掉 `EXTRA_INITIAL_URI` /
+> `PERSISTABLE` 标志）、`ActivityNotFoundException`/`SecurityException`/`Throwable` 三级 try-catch、**授权动作推迟到
+> 弹框销毁之后**（避开 Dialog window 与 `startActivity` 的 token 竞态）、忙碌锁 + 5s 超时解锁（§3.17）；② 新增
+> **手动指定路径**兜底（`FileLocations.tryManualPath`，以 `java.io.File` 直连用户手填的挂载点，自带候选挂载点扫描，
+> 见 §3.17.1）；③ 新增 `CrashLogger`（未捕获异常落盘 `TransView/Downloads/crash_log.txt`，不吞异常，见 §3.18）。
+> v1.12 变更：**存储抽象层 + SAF 支持物理隔离的 U 盘**——新增 `storage/` 包（`IStorage` 接口 +
+> `FileStorage`（`java.io.File`）/ `SafStorage`（SAF 文档树）双实现），上传落盘 / 媒体库 / 对账 / 播放全部改为
+> 依赖 `IStorage`；设置 →「存储与数据」→ 存储位置新增「添加 U 盘（需授权）」（`ACTION_OPEN_DOCUMENT_TREE` +
+> 持久化授权），解决「U 盘挂在 `/mnt/media_rw` 仅 root 可见、`StorageVolume.getDirectory()` 返回 null」的电视
+> 完全无法读写 U 盘的问题；`media_items.filePath/parentFolder` 兼容存 `content://` 文档 URI（§3.17）。
+> v1.11 变更：**存储诊断日志导出**（设置 → 存储与数据 → 导出存储诊断日志）——一键把「外接盘插了却不出现在存储位置」
+> 的整条判定链路写成 txt（六渠道扫描 + 逐目录写探针 + 沙盒落点检查 + 逐卷排除原因），落盘
+> `TransView/Downloads/storage_diagnosis.txt`（与「其他」分类同路径，对账后可 App 内打开、U 盘模式下可拷出）（§3.16）。
 > v1.10 变更：**播放器交互重做——时间轴优先控制栏（§3.4 全节重写）**——① 控制栏三段结构（内联选择器 → 时间轴 → 按钮行），唤出时焦点落时间轴；② 倍速 / 画面比例改横排胶囊 `SelectorPill` 内联选择器、音轨 / 字幕改右侧滑入 `SettingsPanel`（删除 SpeedDialog / AspectDialog / TrackDialog 与 `anyDialogVisible`）；③ 时间轴可聚焦 + 左右拖动 + 上下换轨 / 边缘同向收起（`focusZone` 纵向轨道状态机）；④ 快进 / 快退反馈升级为缩略图预览卡（`loadThumb`：MediaMetadataRetriever + Mutex 串行 + 10s 分桶缓存 48 帧 + seq 守卫）；⑤ 播完自动连播前先弹下一集预告卡（5 秒倒计时，可立即播放 / 取消）。
 > v1.9 变更：**移除「上传与解压」设置组**——`SettingGroup.UPLOAD` 枚举、设置页 UI、`SettingsStore.autoUnzipZip/keepOriginalZip` 两键全部删除；压缩包解压改为固定行为：视频/图片分类 `.zip` 恒解压（`TransHttpServer` 触发条件去掉开关）、解压成功即删原包（`ZipExtractor` 第 4 步固定，失败路径仍一律保留）；设置页回归五分组（§3.9 / §3.14）。
 > v1.8.1 变更：**死数据治理**——① 僵尸「上传中」记录：进程被杀后 DB 残留的 RUNNING 记录永久卡在「上传中 xx%」，对账新增 0.5 步 `reapZombieRunning()` 统一标失败（仅在服务器未运行或本进程无在途上传时执行，防误伤活记录，§3.8）；② upload_records 表无限增长：insert 后自动裁剪只留最近 500 条（UI 最多显示 200，200 名之外为纯死数据，§3.8）；③ 删除无调用方的死 DAO 方法（MediaItemDao.getById/count、PlaybackHistoryDao.getPositionByPath）；④ 盘点报告：`addedTime`/`updatedTime` 为无读取方的预留字段（保留，成本可忽略）、`UploadStateCode.WAITING` 为无写入方的防御状态（保留 UI 映射）、`fallbackToDestructiveMigration` 发布 v3 起必须换正式迁移。
@@ -30,18 +58,27 @@ minSdk 21（Android 5.0+ TV/盒子），targetSdk 36。
 
 ```
 com.hpu.transview
-├── TransViewApp.kt            应用入口（Coil 配置；启动即触发数据库-文件对账）
+├── TransViewApp.kt            应用入口（Coil 配置；崩溃日志安装；启动即触发数据库-文件对账）
 ├── MainActivity.kt            主界面入口 + 权限门
+├── storage/                   存储抽象层（v1.14：收敛为纯 File 单实现）
+│   ├── IStorage.kt            IStorage 接口 + StorageFile（name/path/relativePath/parentPath/size/mtime）
+│   │                          path = 存储身份，v1.14 起**恒为绝对路径**（如 /storage/0000-0000/TransView/…），
+│   │                          同时就是 media_items.filePath/parentFolder 的取值
+│   └── FileStorage.kt         **唯一实现**（内部存储与 U 盘同样处理）；resolve() 逐段过滤 .. 防越界；
+│                              moveFileInto() 同卷 renameTo 零拷贝、跨卷 copyTo+delete
 ├── model/                     纯数据模型（枚举/数据类，无依赖）
-│   └── Models.kt              MainTab / Category / SortOrder / FileEntry /
+│   └── Models.kt              MainTab / Category / SortOrder / FileEntry / MediaRef（v1.12，替代裸 File）/
 │                              ServerMode / AspectRatio（v1.4 设置页画面比例）
 ├── util/                      无状态工具
-│   ├── FileUtils.kt           FileLocations（专属沙盒 /sdcard/TransView，越界断言）、
-│   │                          文件树遍历、空文件夹递归清理、物理删除、时长提取、
-│   │                          目录列举/排序、自然比较、格式化、MIME、外部打开
+│   ├── FileUtils.kt           FileLocations（活动存储 / getWritableDevices 多来源枚举+写探针 / 降级恢复 /
+│   │                          越界断言 / mediaUri 恒 file://）、
+│   │                          文件树遍历、空文件夹递归清理、时长提取、
+│   │                          目录列举/排序、自然比较、格式化、MIME、mediaUri、外部打开
 │   ├── NetUtils.kt            本机 IP 探测、存储权限统一入口（StoragePermission，含写探针）
 │   ├── IntentUtils.kt         安全启动 Activity（隐式 Intent 显式化，规避 ROM hook NPE）
 │   ├── QrCode.kt              ZXing 二维码生成
+│   ├── StorageDiagnosis.kt    存储诊断日志导出（六渠道扫描 + 写探针 + 逐卷排除原因，落盘 Downloads/）
+│   ├── CrashLogger.kt         未捕获异常落盘 Downloads/crash_log.txt（v1.13；不吞异常、不二次崩溃、128KB 轮转）
 │   └── Constants.kt(并入NetUtils) 默认端口 DEFAULT_PORT=2333、预设端口列表 ALLOWED_PORTS、上传路径
 ├── server/                    网络接收层（不依赖 UI）
 │   ├── TransHttpServer.kt     NanoHTTPD：上传页/访问码校验/上传接口；记录入 Room + 计数流回写进度
@@ -101,10 +138,12 @@ com.hpu.transview
 5. 落盘成功后更新记录状态（成功/失败 + 100%），并在后台协程**立即写入 media_items 索引**（视频经 MediaMetadataRetriever 提时长），`UploadBus` 同时发事件驱动媒体库自动刷新与保活空闲计时；`MediaScannerConnection.scanFile` 通知系统媒体库。
 
 ### 3.2 存储策略与权限
-- **专属沙盒目录（v1.2）**：App 全部存储收在 `/sdcard/TransView/`（Movies / Pictures / Downloads 三个子目录），上传落盘、媒体库扫描、清理删除均只在此沙盒内进行，不触碰系统公共目录（防误扫垃圾文件/越界误删）。`FileLocations.isInsideSandbox`（canonicalPath 前缀断言）是所有破坏性操作（删文件/清空目录/向上删空目录）的前置防线。
+- **专属沙盒目录（v1.2）**：App 全部存储收在 `<活动存储>/TransView/`（Movies / Pictures / Downloads 三个子目录），上传落盘、媒体库扫描、清理删除均只在此沙盒内进行，不触碰系统公共目录（防误扫垃圾文件/越界误删）。`FileLocations.isInsideSandbox`（canonicalPath 前缀断言）与 `IStorage` 的 `resolve()`/`safeSegments()` 是破坏性操作的前置防线。
+- **活动存储（v1.14）**：沙盒所在卷由「设置 → 存储与数据 → 存储位置」决定（内部存储 / 自动扫描出的可写外接盘），运行时由 `FileLocations.activeStorage: IStorage` 暴露；首选卷写探针失败或已拔出即自动降级到内部存储并广播事件，插回自动恢复。数据层、服务器层、UI 层一律经 `IStorage` 读写，细节见 §3.17。
 - API 30+：`MANAGE_EXTERNAL_STORAGE`，引导用户到系统授权页，`onResume` 复检。
-  正式授权未通过时做**写探针**（在沙盒 `/sdcard/TransView/Movies` 建删临时文件）：部分模拟器/ROM（如 MuMu）不强制分区存储但无授权入口，实测可写即放行；真实设备无授权时探测必然失败，行为不变。
+  正式授权未通过时做**写探针**（在沙盒 `Movies` 目录建删临时文件）：部分模拟器/ROM（如 MuMu）不强制分区存储但无授权入口，实测可写即放行；真实设备无授权时探测必然失败，行为不变。
 - API 21–29：运行时 `WRITE_EXTERNAL_STORAGE` + `requestLegacyExternalStorage`。
+- **可移动卷的发现策略（v1.14）**：`MANAGE_EXTERNAL_STORAGE` 已能让 App 读写 U 盘，但**发现**它并不容易——电视 ROM 的 `StorageVolume.getDirectory()` 常为 null，而 `/storage` 的目录项在 Android 11+ 对第三方应用一律不可读。故改为多来源枚举候选卷根 + 写探针（§3.17）。
 - 授权页跳转与「其他」文件打开统一走 `IntentUtils.startSafely`：把隐式 Intent 解析成显式组件再启动，规避部分 ROM hook `Instrumentation` 后对 null component 的 NPE（症状：按钮点了没反应）。
 - 用户主动往沙盒目录拷文件（U 盘等）属预期行为：启动/手动刷新对账会正常扫描入库展示。
 
@@ -307,7 +346,11 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 
 **媒体库 DB 驱动**（LibraryScreen）：文件列表来自 `MediaRepository.observeByCategory` Room Flow（上传入库/对账/删除均实时刷新，无需手动 re-list）；文件夹层级来自文件系统（DB 不索引文件夹）；视频时长优先取 DB 索引，缺失回退 MediaMetadataRetriever。`media_items.parentFolder` 存**父目录绝对路径**。
 
-**文件操作规范**：全程 `java.io.File`，禁用 SAF/DocumentFile。
+**文件操作规范**（v1.14 修订）：读写沙盒一律经 **`IStorage`**（`FileLocations.activeStorage`），
+**不再直接 `java.io.File`**。`java.io.File` 只保留在三处：`FileStorage` 内部实现、
+「必须落到本地 File」的场景（存储权限写探针、解压工作区）、以及 `getWritableDevices()` 的卷扫描。
+接口本身保留是为了让上传落盘 / 媒体库 / 对账 / 播放共用一组语义；但 v1.14 起**只有 `FileStorage` 一个实现**，
+`StorageFile.path` 恒为绝对路径，`kindLabel` 恒为 `File`，细节见 §3.17。
 
 ### 3.9 设置页（v1.4，SettingsScreen + SettingsStore）
 
@@ -521,6 +564,146 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
   `xhr.onerror` 里先探一次 `/verify`：403 → 走失效流程；200 → 按真实连接失败提示；探针失败 → 维持原有「服务器可能已休眠」提示。
   不这样做的话，服务器重启后用户永远看不到「请重新输入访问码」。
   （注意 `finishOne` 定义在 `uploadNext` 内部，`probeAuth` 在 IIFE 作用域，须由调用方把收尾回调传进去。）
+
+### 3.16 存储诊断日志导出（v1.11）
+
+**要解决的问题**：电视上没有终端、也看不到 logcat；外接 U 盘/SD 卡插着却不出现在「设置 → 存储与数据 → 存储位置」
+里时，用户在电视上**无法自助取证**。这一项把判定链路的全部原始证据写成一个 txt，用文件管理器打开、
+或拷到 U 盘拿到电脑上看。
+
+**落盘位置**：`FileLocations.root(Category.OTHER)` → `TransView/Downloads/storage_diagnosis.txt`。
+刻意与「其他」分类**同路径**：该目录在 `FileUtils.listAllMediaFiles()`（对账扫描范围）内，导出后设置页顺手触发
+一次 `SyncManager.sync()`，新文件即被索引进 `media_items` → 「其他」页直接可见可打开；U 盘模式下它天然落在
+U 盘上，**拔下来插电脑就能看**——这正是排障所需的取数通路。
+
+**实现**（`util/StorageDiagnosis.kt`，全程 `Dispatchers.IO`）：`export()` 先 `FileLocations.refresh()` 把存储状态
+刷成最新（用户点这一项的本意就是「现在立刻看」），`mkdirs()` 后用
+`BufferedWriter(OutputStreamWriter(FileOutputStream(file, false), UTF_8))` **逐行覆盖写**（不追加、不先在内存拼全文）；
+各渠道内部异常单独捕获并写进文件，**互不中断**。
+
+日志章节：
+
+| 章节 | 内容 | 回答的问题 |
+|:--|:--|:--|
+| 头部 | 导出时间 / 设备型号 / Android 版本与 API / 包名版本 minSdk targetSdk | 版本前提（minSdk 21 与平台 API 的差异） |
+| 渠道 A | `StorageManager.getStorageVolumes()` 逐卷：uuid、description、`getDirectory()`、反射 `getPath()`、isRemovable、isPrimary、state | 系统视角到底上报了哪些卷 |
+| 渠道 B | `/storage` 逐子目录 `exists/canRead/canWrite`（标注 emulated/self/encrypted）+ **`/proc/mounts` 兜底** | 路径对 App 是否可见、卷挂在哪、什么文件系统 |
+| 渠道 C | `/mnt`、`/mnt/usb`、`/mnt/media_rw` 逐子目录同上 | 原始挂载点（`/mnt/media_rw/XXXX-XXXX` 常为 0700 root-only） |
+| 渠道 D | `getExternalFilesDirs(null)` 各槽位 + 反推卷根 | 零权限方案（`Android/data/<包名>/files`）是否可用 |
+| 渠道 E | `SECONDARY_STORAGE` / `EXTERNAL_STORAGE` / `EMULATED_STORAGE_TARGET` 原始值 | 旧系统（≤6.0）信号 |
+| 写探针 | 每个候选目录创建并删除 `.transview_write_test`，失败带异常类与 `EACCES` 标注 | **路径可见 ≠ 可写**（最常见的卡点） |
+| 沙盒落点 | 各卷根下 `TransView/` 的 exists/canRead/canWrite + mkdirs + 写探针 | App 能否把沙盒建在这块盘上 |
+| 最终结果 | `FileLocations.storageState.volumes`（= 设置页「存储位置」列表）+ 活动/首选存储 + 可用/总量；无外接卷时写「未检测到任何外部存储设备」 | 用户实际能看到什么 |
+| 判定说明 | 逐卷复演 `scanVolumes` 的过滤规则（isPrimary / isRemovable / directory==null / isDirectory / canWrite），写明**被哪一条闸门排除** | 设置页为什么"静默看不见它" |
+
+**两个关键设计点**：
+
+* **渠道 B 的 `/proc/mounts` 兜底不可省**：Android 11+ 起第三方应用**列不出 `/storage` 根目录**
+  （`listFiles()` 返回 null，模拟器 API 36 实测即如此），若渠道 B 在这时 `return`，真机上这一节就是空白。
+  `/proc/mounts` 世界可读，能直接给出 `… /mnt/media_rw/0000-0000 vfat /dev/block/vold/public:253,80`
+  这类证据——「U 盘已被系统挂载、但 App 读不到」的结论就靠它。实现上必须是
+  `if (children == null) { … } else { … }` 结构，**不能提前 return**（初版正是踩了这个坑，日志里整段缺失）。
+* **写探针是沙盒约定的一次性例外**：会对 `/sdcard` 根等沙盒外目录创建一次 `.transview_write_test` 再删除
+  （隐藏文件、写后即删）。不做这一步就无法区分"路径可见"与"路径可写"，而这恰是本功能要回答的核心问题。
+
+**失败路径**：目标目录建不出来 / 卷不可写 → `export()` 抛异常 → 设置页
+`Toast「导出失败：<异常类>: <message>」`；成功则提示**绝对路径**（比固定文案更有用：U 盘模式下路径不是
+`/storage/emulated/0/...`）。
+
+### 3.17 存储卷发现与纯 File 存储抽象（v1.14）
+
+**要解决的问题**：一部分 Android TV/盒子的 ROM 把 U 盘挂到 `/mnt/media_rw/XXXX-XXXX`（`0700`，仅 root 可读），
+`StorageVolume.getDirectory()` 因此返回 `null`。v1.12/v1.13 曾据此引入 SAF（`ACTION_OPEN_DOCUMENT_TREE` +
+文档树读写）作为唯一通路，并为「拉起系统选择器」补了六道防护。但**真机（Vidda 电视）实测**：系统把 SAF 的
+目录选择器彻底屏蔽，**授权根本不可能成功**；而用第三方文件管理器验证，U 盘物理路径 `/storage/0000-0000`
+**实际可读可写**。结论是——问题不在权限，而在**系统不上报存储卷**。v1.14 因此**彻底移除 SAF**，
+回到纯 `java.io.File`。
+
+#### 3.17.1 卷发现：多来源枚举 + 写探针（`FileLocations.getWritableDevices`）
+
+**踩过的坑（API 36 实测）**：最初的实现是「直接扫 `/storage/` 子目录」——**行不通**。
+Android 11+ 起第三方应用（即便已获 `MANAGE_EXTERNAL_STORAGE`）**读不到 `/storage` 的目录项**，
+`File("/storage").listFiles()` 恒返回 `null`（日志实录：`扫描 /storage：-1 项 [读取失败]`）。
+但**已知路径照样可读写**。所以策略改为「**先枚举候选卷根，再逐个写探针**」。
+
+候选来源**四路合并、路径去重**（任一路失败不影响其它）：
+
+| # | 来源 | 说明 |
+|---|---|---|
+| ① | `StorageManager.storageVolumes` 的 `getDirectory()` | API 30+；**电视 ROM 常返回 null** |
+| ② | 卷 `uuid` 拼 `/storage/<uuid>`、`/mnt/media_rw/<uuid>` | `getDirectory()` 为 null 时的兜底；Vidda 正是「不上报目录但路径可读写」 |
+| ③ | `Context.getExternalFilesDirs(null)` 去掉 `/Android/data/<pkg>/files` 后缀反推 | **不需要任何权限**，且能发现系统承认的每块可移动卷——**最稳的一路** |
+| ④ | `/proc/mounts`（退化 `/proc/self/mounts`）的 `/mnt/media_rw/<id>`、`/storage/<id>` | 挂载表是 ROM 唯一藏不掉的证据 |
+
+之后对每个候选做**写探针**（`probeWritable`：卷根建 `.transview_write_test` 再立即删除）——这是唯一可靠的判据：
+`File.canWrite()` 在部分 ROM 上对可移动卷**恒返回 false** 而实际能写；反向「`listFiles()` 非空」也不能证明可写。
+候选先过 `isDirectory` 过滤（卷已卸载时该路径不存在 → 跳过），探针通过才进 `volumes`。
+盘名取 `StorageManager` 的卷描述（按 UUID 匹配），取不到则显示 `U盘 (卷ID)`；**内部存储恒为第一项**。
+
+> **调试**：每轮扫描逐候选打 `StorageDebug`（候选卷根列表 / `canRead` / `canWrite` / `listFiles` 数 / 写探针结果），
+> `adb logcat -s StorageDebug` 一眼看出卡在哪一步。
+
+#### 3.17.2 存储抽象：收敛为单一 File 实现
+
+| 类型 | 职责 | 实现要点 |
+|---|---|---|
+| `IStorage` | 抽象接口 | 两套寻址：**节点**（`nodeFor/relativeOf/parentNode/listChildren/deleteNode/writeNode`，身份即 `StorageFile.path`）与**相对沙盒根的相对路径**（`listFiles/writeFile/deleteFile`，供上传落盘/遍历/对账） |
+| `FileStorage` | **唯一实现** | 纯 `java.io.File`；`resolve()` 逐段过滤 `..`/`.`/绝对路径，天然不越界；`moveFileInto()` 同卷 `renameTo` 零拷贝、跨卷 `copyTo`+`delete` |
+
+`SafStorage` 与 `androidx.documentfile` 依赖已删除；`IStorage.isSaf` 字段删除，`kindLabel` 恒为 `File`。
+
+**节点寻址仍是关键**：`StorageFile.path` 既是「存储身份」又是 `media_items.filePath/parentFolder` 的取值，
+v1.14 起**恒为绝对路径**（如 `/storage/0000-0000/TransView/Movies/a.mp4`）。UI 导航（进目录/返回上级/删除）、
+对账比对、播放器取源全都用这一个字符串 —— 单个实现下更是零分支。
+
+**URI 形态**：`mediaUri(path)` 恒返回 `Uri.fromFile(...)`（`file:///storage/…`）。ExoPlayer 的 `DefaultDataSource`
+与 Coil 都原生支持，且**不走 `ContentResolver`、无 IPC**，比 `content://` 更快更稳。
+`MediaMetadataRetriever` 用 `setDataSource(path)`（绝对路径版本比 URI 版本更快）。
+唯一例外是**「其他」文件的外部打开**：Android 7+ 不允许直接暴露 `file://`，仍走 `FileProvider`。
+
+#### 3.17.3 降级与恢复（与前版一致，未改动）
+
+`FileLocations.refresh()` 按 `SettingsStore.preferredStoragePath`（**卷根绝对路径**）在本次扫描出的卷里选
+**活动存储**；首选卷不在位 → 活动存储降级为内部存储（**数据库记录全部保留**，媒体库按活动存储的
+`parentFolder` 过滤展示），插回自动恢复。列表里「首选但当前不在位」的卷以 `盘名（已断开）` 出现且**不可选**，
+是降级模式在设置页里的可视证据。
+
+**防误删不变式**：`existsForPath()` 对「所属卷当前不可见」的路径**一律判存在**（「读不到 ≠ 被删了」），
+只有卷可用时才做真实探测。否则 U 盘一拔，对账的「同步外部删除」会把整盘索引清空。
+
+#### 3.17.4 移除项与历史数据清理
+
+* **入口移除**：「添加 U 盘（需授权）」（v1.12）与「手动指定 U 盘路径」（v1.13）两行及其全部代码删除。
+* **设置键清理**：`SettingsStore.init()` 一次性删除 `saf_tree_uri` / `saf_tree_label` / `manual_storage_path`；
+  `preferredStoragePath` 读到**非 `/` 开头**的值（旧的 `content://` 文档树 URI）一律回落内部存储并**就地改写**。
+* **索引清理**：`SyncManager.sync()` 新增步骤 **1.5**——删除 `media_items` 中 `filePath` 以 `content://`
+  开头的记录（文档树已永久不可达，留着只会变成点不开的僵尸卡片）。**与降级无关**：任何状态都清，
+  故放在降级判断**之前**。
+### 3.18 崩溃日志落盘（v1.13）
+
+`CrashLogger`（`TransViewApp.onCreate` 最先安装）接管 `Thread.setDefaultUncaughtExceptionHandler`，
+把时间 / 线程 / 版本 / 设备 / 异常与完整堆栈追加到 `TransView/Downloads/crash_log.txt`，再**原样委托**
+给原处理器（不吞异常，Logcat 与系统崩溃上报不变）。三条硬约束：① 全部 IO 包 `runCatching`；
+② 不触碰 `FileLocations` / Room 等（可能正是崩溃源头或依赖初始化顺序），落点直接用 `Environment` 拼内部存储
+沙盒（崩溃可能正因为那块 U 盘）；③ 超 128KB 轮转为 `crash_log.old.txt`。文件与「其他」分类同目录 →
+重启对账后可在 App 内打开，也可拷到电脑。定位真机「白框闪退」就靠它。
+
+**v1.14 已验证（模拟器 API 36，第二卷 `/storage/0000-0000` 等价于 U 盘）**：卷扫描逐候选日志
+（`/storage/0000-0000` 写探针=true、`/mnt/media_rw/0000-0000` 写探针=false 被正确排除）→ 设置页
+「存储位置」列出 `SDCARD (0000-0000)` 并显示「可用 509.9MB / 共 510.0MB」→ 选中后
+`preferred_storage=/storage/0000-0000` 落盘、当前存储切为 U 盘 → 上传（`/verify` 200 / 错误码 403 /
+无 token 403 / 带 token 200）按分类落到 `/storage/0000-0000/TransView/{Movies,Pictures,Downloads}`，
+内部存储未被写入 → `media_items` 存绝对路径、`content://` 残留 0 → 媒体库按活动存储过滤展示 →
+ExoPlayer 用 `file://` 播放 U 盘视频（MediaCodec 正常解码，无异常）→ `sm unmount` 卷后重启：降级模式
+（上传页「⚠️ …已断开」、设置页「降级模式（…），正在使用内部存储」、断开的卷不可选、47 条上传记录全保留）
+→ `sm mount` 插回后自动恢复（上传页显示 `SDCARD (0000-0000) (509.9MB 可用)`）→ 删文件后对账把索引一并清掉
+（55→52 行，`integrity_check=ok`）。
+
+**未验证项（诚实记录）**：**Vidda 真机未复验**。本机模拟器上 `getDirectory()` 与 `getExternalFilesDirs`
+都可用，而 Vidda 的 `getDirectory()` 返回 null —— 那条路径靠「来源 ②（uuid 推导）+ 来源 ④（`/proc/mounts`）」
+兜底，逻辑上覆盖，但**需要在真机上确认**（若真机仍发现不了，看 `StorageDebug` 日志里候选卷根列表缺了哪一条即可定位）。
+另：模拟器的第二卷是 FUSE 挂载、`canWrite=true`，而 Vidda 上 `canWrite` 大概率为 false —— 写探针正是为这种情况准备的，
+但目前只在「探针=false 时被正确排除」这一侧得到验证。
 
 ## 4. 构建与运行
 

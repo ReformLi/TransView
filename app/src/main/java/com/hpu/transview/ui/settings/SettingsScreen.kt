@@ -68,6 +68,7 @@ import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
+import com.hpu.transview.util.StorageDiagnosis
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -160,8 +161,7 @@ private fun speedLabel(speed: Float): String = when (speed) {
     else -> "1.0x"
 }
 
-/**
- * 设置子页面：左侧分组 + 右侧详情，占据内容区（顶部导航栏保持不变）。
+/** 设置子页面：左侧分组 + 右侧详情，占据内容区（顶部导航栏保持不变）。
  *
  * 焦点规范（与媒体库/上传页一致，电视端）：
  * - 页面打开（设置标签聚焦）时焦点保持在顶部「设置」标签上；按 ↓ 才进入左侧第一个分组。
@@ -220,7 +220,7 @@ fun SettingsScreen(
     // （可聚焦节点在滚动容器内会带上 bring-into-view 行为）。
     val aboutScrollState = rememberScrollState()
 
-    // 两个弹框状态（同一时刻最多开一个）
+    // 三个弹框状态（同一时刻最多开一个）
     var choiceState by remember { mutableStateOf<ChoiceState?>(null) }
     var confirmState by remember { mutableStateOf<ConfirmState?>(null) }
 
@@ -259,6 +259,7 @@ fun SettingsScreen(
     val playbackRepo = remember { PlaybackRepository(context) }
     val syncManager = remember { SyncManager.getInstance(context) }
 
+
     // 右侧每行的焦点入口（goToDetail 触发后请求当前分组第一行）
     val backToGroups: () -> Unit = { runCatching { groupFocusers[selectedGroupIndex].requestFocus() } }
     val goToDetail: (Int) -> Unit = { i ->
@@ -286,6 +287,7 @@ fun SettingsScreen(
 
     val openChoice: (String, ChoiceState) -> Unit = { key, s -> pendingFocusReturn = key; choiceState = s }
     val openConfirm: (String, ConfirmState) -> Unit = { key, s -> pendingFocusReturn = key; confirmState = s }
+
 
     val pickIndex = { list: List<String>, current: String ->
         val i = list.indexOf(current)
@@ -368,6 +370,9 @@ fun SettingsScreen(
         focusKey: String,
         label: String,
         value: String,
+        /** 禁用态：**仍可聚焦**（理由同 TvButton —— 正持有焦点的节点突然不可聚焦会把页面切走），
+         *  只是不响应确定/右键并按灰色渲染值文本。用于「正在等待系统授权界面」期间锁住入口。 */
+        enabled: Boolean = true,
         onClick: () -> Unit
     ) {
         val requester = remember(focusKey) { FocusRequester() }
@@ -399,7 +404,7 @@ fun SettingsScreen(
                 // clickable 必须在 onPreviewKeyEvent 之前：与媒体库网格项一致，
                 // clickable 会让元素可聚焦并处理 Enter/Center 激活，onPreviewKeyEvent
                 // 放在它之后可以拦截方向键（Left/Right/Up）而不影响点击激活
-                .clickable(onClick = onClick)
+                .clickable { if (enabled) onClick() }
                 .onPreviewKeyEvent { event ->
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
@@ -407,7 +412,7 @@ fun SettingsScreen(
                         Key.DirectionLeft -> { backToGroups(); true }
                         // 右键即「进入该项选值」：调出选值/确认/信息弹框（与遥控器确认键一致）；
                         // 同时因行内容已撑满右侧宽，按右也顺带防止环绕到右上角「设置」/标签
-                        Key.DirectionRight -> { onClick(); true }
+                        Key.DirectionRight -> { if (enabled) onClick(); true }
                         // 每组的首行按上 → 回到顶部「设置」标签（与媒体页内容区按上回标签一致）
                         Key.DirectionUp -> { if (topEdge) onFocusTabs(); topEdge }
                         else -> false
@@ -425,7 +430,8 @@ fun SettingsScreen(
                 Text(
                     value,
                     style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.primary
+                    color = if (enabled) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                 )
                 Spacer(Modifier.width(8.dp))
                 Text("▸", style = MaterialTheme.typography.bodyLarge, color = OnDarkDim)
@@ -808,30 +814,45 @@ fun SettingsScreen(
                                     storageState.activeLabel
                                 }
                             ) {
-                                // 可选存储 = 当前在位的全部卷（动态检测）：无外接盘时只有「内部存储」，
-                                // 有外接盘（U盘/SD卡）时按盘名（卷标）列出全部可选卷
+                                // 可选存储 = 扫描出的**可写设备**（内部存储恒在首位，U 盘/SD 卡按挂载点列出）。
+                                // 每项副标题带上「可用 / 共」容量，一眼能分辨是哪块盘；
+                                // 「首选但已拔出」的盘也会列出（标「已断开」，不可选），
+                                // 让用户看得到自己选过的盘为什么不见了。
                                 val options = storageState.volumes
                                 val selectedIdx = options.indexOfFirst {
-                                    it.root.absolutePath == storageState.preferredRoot
+                                    it.id == storageState.preferredRoot
                                 }.coerceAtLeast(0)
                                 openChoice("${g.title}:0", ChoiceState(
                                     "存储位置",
-                                    options.map { it.label },
+                                    options.map {
+                                        if (it.available) it.label else "${it.label}（已断开）"
+                                    },
                                     selectedIdx,
                                     descriptions = options.map { vol ->
-                                        if (vol.isRemovable) {
-                                            "优先写入「${vol.label}」；拔出时自动降级到内部存储（上传不中断），插回自动恢复"
+                                        val space = if (vol.totalBytes > 0) {
+                                            "可用 ${FileUtils.formatSize(vol.usableBytes)} / " +
+                                                "共 ${FileUtils.formatSize(vol.totalBytes)}"
                                         } else {
-                                            "始终可用；外接盘拔出时的自动兜底落点"
+                                            "容量未知"
+                                        }
+                                        when {
+                                            !vol.available ->
+                                                "${vol.displayPath}（已拔出，插回后自动恢复）"
+                                            vol.isRemovable ->
+                                                "$space；优先写入「${vol.label}」；拔出时自动降级到内部存储（上传不中断），插回自动恢复"
+                                            else ->
+                                                "$space；始终可用；外接盘拔出时的自动兜底落点"
                                         }
                                     }
                                 ) { i ->
                                     val vol = options[i]
+                                    // 「已断开」的占位项不可选（弹框里仍列出，仅作展示）
+                                    if (!vol.available) return@ChoiceState
                                     // 首选存储按卷根路径 + 盘名一并持久化（盘名供降级提示显示）
-                                    SettingsStore.preferredStoragePath = vol.root.absolutePath
+                                    SettingsStore.preferredStoragePath = vol.id
                                     SettingsStore.preferredStorageLabel = vol.label
                                     scope.launch {
-                                        // 立即重检活动存储（含文件系统探测，IO 线程；可能降级/恢复），
+                                        // 立即重检活动存储（含写探针，IO 线程；可能降级/恢复），
                                         // StateFlow 推送本行 value 与「当前存储」条目自动刷新
                                         val newState = withContext(Dispatchers.IO) { FileLocations.refresh() }
                                         // 媒体库内容可能随活动存储切换，重新对账（互斥，正在同步则跳过）
@@ -850,15 +871,44 @@ fun SettingsScreen(
                             AboutEntry(
                                 "${g.title}:1", "当前存储",
                                 value = storageState.modeLabel,
-                                body = storageState.activeRoot.absolutePath
+                                body = storageState.activeStorage.getRootPath()
                             )
                             SettingRow(
                                 "${g.title}:2", "存储空间占用",
                                 if (storageComputing) "…" else storageLabel,
                                 onClick = refreshStorage
                             )
-                            SettingRow("${g.title}:3", "清空上传记录", "仅清记录") {
-                                openConfirm("${g.title}:3", ConfirmState(
+                            // 存储诊断日志导出：电视上没有终端、看不到 logcat，外接盘"插了却不出现"
+                            // 时无法定位；这里把整条判定链路的证据写成 txt（落在「其他」分类目录，
+                            // 对账后可在 App 内打开，U 盘模式下也能拔下来插电脑看）。
+                            SettingRow("${g.title}:3", "导出存储诊断日志", "写入文件") {
+                                scope.launch {
+                                    val r = withContext(Dispatchers.IO) {
+                                        runCatching { StorageDiagnosis.export(context) }
+                                    }
+                                    r.fold(
+                                        onSuccess = { f ->
+                                            // 立刻对账一次：新 txt 经 SyncManager 索引进 media_items 后
+                                            // 才会出现在「其他」分类里（"与「其他」同路径"的意义所在）
+                                            runCatching { syncManager.sync() }
+                                            Toast.makeText(
+                                                context,
+                                                "诊断日志已导出到 ${f.absolutePath}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        },
+                                        onFailure = { e ->
+                                            Toast.makeText(
+                                                context,
+                                                "导出失败：${e.javaClass.simpleName}: ${e.message}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    )
+                                }
+                            }
+                            SettingRow("${g.title}:4", "清空上传记录", "仅清记录") {
+                                openConfirm("${g.title}:4", ConfirmState(
                                     "清空上传记录",
                                     "确定清空全部上传记录吗？\n仅删除历史日志，本地文件将全部保留。",
                                     "全部清空"
@@ -867,8 +917,8 @@ fun SettingsScreen(
                                     Toast.makeText(context, "已清空上传记录，本地文件已保留", Toast.LENGTH_SHORT).show()
                                 })
                             }
-                            SettingRow("${g.title}:4", "清空播放历史", "清空历史") {
-                                openConfirm("${g.title}:4", ConfirmState(
+                            SettingRow("${g.title}:5", "清空播放历史", "清空历史") {
+                                openConfirm("${g.title}:5", ConfirmState(
                                     "清空播放历史",
                                     "确定清空全部播放历史吗？\n仅删除播放进度记录，已上传的视频/图片不受影响。",
                                     "全部清空"
@@ -877,7 +927,7 @@ fun SettingsScreen(
                                     Toast.makeText(context, "已清空播放历史", Toast.LENGTH_SHORT).show()
                                 })
                             }
-                            SettingRow("${g.title}:5", "手动触发对账", "刷新媒体库") {
+                            SettingRow("${g.title}:6", "手动触发对账", "刷新媒体库") {
                                 scope.launch {
                                     val r = syncManager.sync()
                                     // 降级模式跳过了「同步外部删除」（防误删），提示里注明
@@ -981,4 +1031,5 @@ fun SettingsScreen(
             }
         }
     }
+
 }

@@ -133,18 +133,24 @@ fun OptionRow(
     text: String,
     selected: Boolean,
     modifier: Modifier = Modifier,
+    /** 禁用态：**仍可聚焦**（理由同 [TvButton]），只是不响应点击并按灰色渲染 */
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Box(
         modifier = modifier
             .tvFocus(cornerRadius = 8)
-            .clickable { onClick() }
+            .clickable { if (enabled) onClick() }
             .padding(horizontal = 16.dp, vertical = 10.dp)
     ) {
         Text(
             text = (if (selected) "● " else "○ ") + text,
             style = MaterialTheme.typography.bodyLarge,
-            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+            color = when {
+                !enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                selected -> MaterialTheme.colorScheme.primary
+                else -> MaterialTheme.colorScheme.onSurface
+            }
         )
     }
 }

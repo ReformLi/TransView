@@ -65,7 +65,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.zIndex
-import androidx.core.net.toUri
 import coil.compose.AsyncImage
 import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.PlaybackRepository
@@ -76,6 +75,8 @@ import com.hpu.transview.model.FileEntry
 import com.hpu.transview.model.SortOrder
 import com.hpu.transview.model.UploadState
 import com.hpu.transview.server.UploadBus
+import com.hpu.transview.storage.IStorage
+import com.hpu.transview.storage.StorageFile
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.TypeBadge
 import com.hpu.transview.ui.common.requestFocusNextFrame
@@ -88,12 +89,12 @@ import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.isImageFile
 import com.hpu.transview.util.isVideoFile
+import com.hpu.transview.util.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 // 网格列数由「设置 → 界面设置 → 网格列数」决定（4/5/6），见 LibraryScreen 内 gridColumns。
 // 电视端一律多列网格，严禁单列列表。
@@ -147,14 +148,18 @@ fun LibraryScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    // 根目录跟随**活动存储**：U盘拔出（降级）→ 切到内部存储沙盒；插回（恢复）→ 切回U盘沙盒。
-    // activeRoot 作 remember key，插拔广播驱动 FileLocations.refresh() 后本页自动重组：
-    // root / currentDir 一并重置——旧沙盒的子目录在新模式下已不可达，保留只会显示空目录树；
+    // ——— 活动存储（v1.14 恒为 FileStorage / 纯 java.io.File），统一经 IStorage ———
+    // 根节点跟随**活动存储**：U盘拔出（降级）→ 切到内部存储沙盒；插回（恢复）→ 切回U盘沙盒。
+    // activeKey 作 remember key，插拔广播 / 设置页切换驱动 FileLocations.refresh() 后本页自动重组：
+    // root / currentDir 一并重置——旧存储下的子目录在新模式下已不可达，保留只会显示空目录树；
     // 文件列表按 parentFolder == currentDir 过滤（Room 全库记录），天然只显示当前活动
-    // 沙盒的内容，另一块存储的记录保留在库中不展示（降级模式"历史记录已保留"即此实现）。
+    // 存储的内容，另一块存储的记录保留在库中不展示（降级模式"历史记录已保留"即此实现）。
     val storageState by FileLocations.storageState.collectAsState()
-    val root = remember(category, storageState.activeRoot) { FileLocations.root(category) }
-    var currentDir by remember(category, storageState.activeRoot) { mutableStateOf(root) }
+    val storage = storageState.activeStorage
+    val rootPath = remember(category, storageState.activeKey) {
+        storage.nodeFor(FileLocations.categoryRelative(category))
+    }
+    var currentDir by remember(category, storageState.activeKey) { mutableStateOf(rootPath) }
     // 排序初值取「设置 → 界面设置 → 默认排序方式」；之后用工具条「排序」按钮做的调整只作用于
     // 本次浏览（切标签/进设置页都会重建本页组合，回到默认值）。rememberSaveable 以 category.name
     // 为键，保证三个分类各自独立、互不串味。
@@ -195,20 +200,19 @@ fun LibraryScreen(
     // 用户就没法继续按 → 切到下一个标签了。
     var consumedFocusTicket by remember(category) { mutableIntStateOf(focusGridTicket) }
 
-    val atRoot = currentDir == root
+    val atRoot = currentDir == rootPath
 
-    // ——— 文件夹列表来自文件系统（DB 不索引文件夹） ———
+    // ——— 文件夹列表来自活动存储（DB 不索引文件夹） ———
     var dirRefreshKey by remember { mutableStateOf(0) }
     var dirEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     // 目录列表的「归属戳」：记录 dirEntries 是为哪个目录加载的。切目录后的第一帧里
     // dirEntries 还是旧目录的数据，据此判断加载是否完成（避免 FOCUS_FIRST 误判空目录）。
-    var dirEntriesStamp by remember { mutableStateOf<File?>(null) }
-    LaunchedEffect(currentDir, dirRefreshKey) {
+    var dirEntriesStamp by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(currentDir, dirRefreshKey, storageState.activeKey) {
         dirEntries = withContext(Dispatchers.IO) {
-            currentDir.listFiles()
-                ?.filter { it.isDirectory && !it.name.startsWith(".") }
-                ?.map { FileEntry(it, it.name, true, 0L, it.lastModified()) }
-                ?: emptyList()
+            storage.listChildren(currentDir)
+                .filter { it.isDirectory && !it.name.startsWith(".") }
+                .map { it.toFileEntry() }
         }
         dirEntriesStamp = currentDir
     }
@@ -218,7 +222,7 @@ fun LibraryScreen(
     val dbItems by mediaRepo.observeByCategory(category).collectAsState(initial = null)
     val fileEntries = remember(dbItems, currentDir) {
         val items = dbItems ?: return@remember emptyList()
-        items.filter { it.parentFolder == currentDir.absolutePath }
+        items.filter { it.parentFolder == currentDir }
             .map { it.toFileEntry() }
     }
 
@@ -255,7 +259,7 @@ fun LibraryScreen(
     // 必须按 parent 同步过滤掉，否则网格会先闪一帧旧目录内容，且 FOCUS_FIRST
     // 会错误命中旧卡片（该卡片下一帧即被移出组合，焦点会失控回退）。
     val entries = remember(dirEntries, fileEntries, sortOrder, currentDir) {
-        dirEntries.filter { it.file.parentFile == currentDir }.sortedWith(cmp) +
+        dirEntries.filter { it.parentPath == currentDir }.sortedWith(cmp) +
             fileEntries.sortedWith(cmp)
     }
 
@@ -285,7 +289,7 @@ fun LibraryScreen(
             }
             return@LaunchedEffect
         }
-        val index = entries.indexOfFirst { it.file.absolutePath == target }
+        val index = entries.indexOfFirst { it.path == target }
         if (index >= 0) {
             val upOffset = if (atRoot) 0 else 1
             runCatching { gridState.scrollToItem(index + upOffset) }
@@ -329,12 +333,13 @@ fun LibraryScreen(
         val offset = if (atRoot) 0 else 1
         val firstVisible = gridState.firstVisibleItemIndex
         val target = if (!atRoot && firstVisible == 0) FOCUS_UP
-        else entries.getOrNull(firstVisible - offset)?.file?.absolutePath
+        else entries.getOrNull(firstVisible - offset)?.path
         // 空目录时网格里没有卡片，退而聚焦本页工具条（页面上唯一可聚焦处）
         if (target != null) pendingFocusPath = target else parkFocusOnToolbarFallback()
     }
 
     // ——— 进入下一级 / 返回上一级 ———
+    // entry.path 是存储身份（绝对路径），直接作为 PlayerActivity / ImageViewerActivity 的 EXTRA_PATH
     val openEntry: (FileEntry) -> Unit = { entry ->
         when {
             entry.isDirectory -> {
@@ -342,21 +347,21 @@ fun LibraryScreen(
                 // gridHasFocus 写成 false，之后再读就丢失了（实测踩过）
                 val hadFocus = gridHasFocus
                 parkFocusSafe()
-                currentDir = entry.file
+                currentDir = entry.path
                 // 仅遥控器路径做焦点还原；touch 点按路径焦点本来就空，无需还原。
                 // 进入子目录后焦点直接落第一个条目（FOCUS_FIRST），不再落「返回上级」：
                 // 用户反馈 UpCard 抢焦点会形成「第一个文件闪一下再跳回上级」的可见两段跳。
                 if (hadFocus) pendingFocusPath = FOCUS_FIRST
             }
-            entry.file.isVideoFile() -> mediaLauncher.launch(
+            entry.isVideoFile() -> mediaLauncher.launch(
                 Intent(context, PlayerActivity::class.java)
-                    .putExtra(PlayerActivity.EXTRA_PATH, entry.file.absolutePath)
+                    .putExtra(PlayerActivity.EXTRA_PATH, entry.path)
             )
-            entry.file.isImageFile() -> mediaLauncher.launch(
+            entry.isImageFile() -> mediaLauncher.launch(
                 Intent(context, ImageViewerActivity::class.java)
-                    .putExtra(ImageViewerActivity.EXTRA_PATH, entry.file.absolutePath)
+                    .putExtra(ImageViewerActivity.EXTRA_PATH, entry.path)
             )
-            else -> FileUtils.openExternal(context, entry.file)
+            else -> FileUtils.openExternal(context, entry.path, entry.name)
         }
     }
 
@@ -366,34 +371,34 @@ fun LibraryScreen(
             val hadFocus = gridHasFocus
             parkFocusSafe()
             val leaving = currentDir
-            currentDir = leaving.parentFile ?: root
+            currentDir = storage.parentNode(leaving) ?: rootPath
             // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过
-            if (hadFocus) pendingFocusPath = leaving.absolutePath
+            if (hadFocus) pendingFocusPath = leaving
         }
     }
 
     // ——— 删除：先物理删除，成功后才删 Room 索引，焦点移到下一个卡片 ———
     val performDelete: (FileEntry) -> Unit = { entry ->
         val visible = entries
-        val index = visible.indexOfFirst { it.file.absolutePath == entry.file.absolutePath }
+        val index = visible.indexOfFirst { it.path == entry.path }
         val nextPath = when {
             index < 0 -> null
-            index + 1 < visible.size -> visible[index + 1].file.absolutePath
-            index - 1 >= 0 -> visible[index - 1].file.absolutePath
+            index + 1 < visible.size -> visible[index + 1].path
+            index - 1 >= 0 -> visible[index - 1].path
             !atRoot -> FOCUS_UP
             else -> null
         }
         pendingDelete = null
         scope.launch {
             val physicalOk = withContext(Dispatchers.IO) {
-                FileUtils.deletePhysicalFile(entry.file)
+                runCatching { storage.deleteNode(entry.path) }.getOrDefault(false)
             }
             if (physicalOk) {
                 // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走。
                 // hadFocus 先捕获（原因同 openEntry：park 会同步移动焦点使 gridHasFocus 变 false）
                 val hadFocus = gridHasFocus
                 parkFocusSafe()
-                mediaRepo.deleteByPath(entry.file.absolutePath)
+                mediaRepo.deleteByPath(entry.path)
                 // touch 路径跳过焦点还原（见 openEntry 注释）
                 if (hadFocus) pendingFocusPath = nextPath
                 dirRefreshKey++ // 父目录可能被连带清空
@@ -438,7 +443,7 @@ fun LibraryScreen(
             .padding(horizontal = 40.dp)
     ) {
         LibraryTopBar(
-            crumb = buildCrumb(category, root, currentDir),
+            crumb = buildCrumb(category, currentDir, storage),
             sortOrder = sortOrder,
             syncing = syncing,
             // 工具条上按「上键」→ 顶部导航栏的当前分类标签（视频页 → 「视频」标签）
@@ -507,15 +512,15 @@ fun LibraryScreen(
                         )
                     }
                 }
-                itemsIndexed(entries, key = { _, it -> it.file.absolutePath }) { index, entry ->
+                itemsIndexed(entries, key = { _, it -> it.path }) { index, entry ->
                     // 卡片在网格中的绝对位置（子目录里前面多一张「返回上级」卡片）
                     val gridIndex = index + if (atRoot) 0 else 1
                     MediaCard(
                         entry = entry,
-                        childCount = if (entry.isDirectory) countInFolder(entry.file.absolutePath) else 0,
-                        progress = progressMap[entry.file.absolutePath],
+                        childCount = if (entry.isDirectory) countInFolder(entry.path) else 0,
+                        progress = progressMap[entry.path],
                         // FOCUS_FIRST 只命中第一个条目（进入子目录后焦点一次落点，不经过 UpCard）
-                        autoFocus = pendingFocusPath == entry.file.absolutePath ||
+                        autoFocus = pendingFocusPath == entry.path ||
                             (pendingFocusPath == FOCUS_FIRST && index == 0),
                         onAutoFocused = { pendingFocusPath = null; focusParking = false },
                         onOpen = { openEntry(entry) },
@@ -661,8 +666,13 @@ private fun LibraryTopBar(
     }
 }
 
-/** 面包屑：分类名 > 子文件夹…（如「视频 > 甄嬛传」） */
-private fun buildCrumb(category: Category, root: File, currentDir: File): String = buildString {
+/**
+ * 面包屑：分类名 > 子文件夹…（如「视频 > 甄嬛传」）。
+ *
+ * 用 IStorage.relativeOf 求相对路径再按 `/` 拆段 —— 拼接只依赖存储抽象，
+ * 不直接对字符串做 removePrefix/split。
+ */
+private fun buildCrumb(category: Category, currentDir: String, storage: IStorage): String = buildString {
     append(
         when (category) {
             Category.VIDEO -> "视频"
@@ -670,7 +680,7 @@ private fun buildCrumb(category: Category, root: File, currentDir: File): String
             Category.OTHER -> "其他"
         }
     )
-    currentDir.absolutePath.removePrefix(root.absolutePath)
+    storage.relativeOf(currentDir).orEmpty()
         .split('/')
         .filter { it.isNotEmpty() }
         .forEach { append(" > ").append(it) }
@@ -679,8 +689,8 @@ private fun buildCrumb(category: Category, root: File, currentDir: File): String
 /** 菜单键主操作文案：文件夹→进入，视频→播放，图片→查看，其他→打开 */
 private fun primaryActionLabel(entry: FileEntry): String = when {
     entry.isDirectory -> "进入"
-    entry.file.isVideoFile() -> "播放"
-    entry.file.isImageFile() -> "查看"
+    entry.isVideoFile() -> "播放"
+    entry.isImageFile() -> "查看"
     else -> "打开"
 }
 
@@ -835,8 +845,9 @@ private fun MediaCard(
                 entry.isDirectory -> TypeBadge(
                     isDirectory = true, isVideo = false, isImage = false, iconSize = 52.dp
                 )
-                entry.file.isVideoFile() || entry.file.isImageFile() -> AsyncImage(
-                    model = entry.file.toUri(),
+                entry.isVideoFile() || entry.isImageFile() -> AsyncImage(
+                    // file:// URI，Coil 直接加载
+                    model = entry.toUri(),
                     contentDescription = entry.name,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -1025,7 +1036,7 @@ private fun UpCard(
 /** 卡片副标题：文件夹=文件数；视频=时长·大小；其余=大小 */
 private fun subtitleOf(entry: FileEntry, childCount: Int): String = when {
     entry.isDirectory -> "$childCount 个文件"
-    entry.file.isVideoFile() && entry.duration > 0 ->
+    entry.isVideoFile() && entry.duration > 0 ->
         "${FileUtils.formatDuration(entry.duration)} · ${FileUtils.formatSize(entry.size)}"
     else -> FileUtils.formatSize(entry.size)
 }
@@ -1061,10 +1072,21 @@ private fun EmptyHint() {
 }
 
 private fun MediaItemEntity.toFileEntry(): FileEntry = FileEntry(
-    file = File(filePath),
+    path = filePath,
     name = fileName,
     isDirectory = false,
     size = fileSize,
     lastModified = lastModified,
-    duration = duration
+    duration = duration,
+    parentPath = parentFolder
+)
+
+/** 存储条目（目录或文件）→ 媒体库卡片数据 */
+private fun StorageFile.toFileEntry(): FileEntry = FileEntry(
+    path = path,
+    name = name,
+    isDirectory = isDirectory,
+    size = size,
+    lastModified = lastModified,
+    parentPath = parentPath
 )

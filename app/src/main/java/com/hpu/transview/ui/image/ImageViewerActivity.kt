@@ -49,14 +49,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import coil.compose.AsyncImage
+import com.hpu.transview.model.MediaRef
 import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.theme.PrimaryBlue
 import com.hpu.transview.ui.theme.TransViewTheme
-import com.hpu.transview.util.isImageFile
+import com.hpu.transview.util.FileLocations
+import com.hpu.transview.util.nameIsImageFile
 import com.hpu.transview.util.naturalCompare
-import androidx.core.net.toUri
+import com.hpu.transview.util.toUri
 import kotlinx.coroutines.flow.first
-import java.io.File
 import kotlin.math.roundToInt
 
 /**
@@ -82,7 +83,7 @@ class ImageViewerActivity : ComponentActivity() {
         private const val STRIP_VPAD = 14           // 轮播条容器垂直内边距 dp
     }
 
-    private var images: List<File> = emptyList()
+    private var images: List<MediaRef> = emptyList()
     private var startIndex = 0
 
     // —— Compose 状态 ——
@@ -103,20 +104,19 @@ class ImageViewerActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val path = intent.getStringExtra(EXTRA_PATH)
-        val file = if (path != null) File(path) else null
-        if (file == null || !file.isFile) {
+        if (path == null || !FileLocations.existsForPath(path)) {
             Toast.makeText(this, "文件不存在", Toast.LENGTH_SHORT).show()
             finish()
             return
         }
 
-        // 仅同目录图片参与切换（自然排序）
-        images = file.parentFile
-            ?.listFiles()
-            ?.filter { it.isFile && it.isImageFile() }
-            ?.sortedWith { a, b -> naturalCompare(a.name, b.name) }
-            ?: listOf(file)
-        startIndex = images.indexOfFirst { it.absolutePath == file.absolutePath }.takeIf { it >= 0 } ?: 0
+        // 仅同目录图片参与切换（自然排序）；走活动存储的兄弟条目（v1.14 恒为本地 File）
+        images = FileLocations.siblings(path)
+            .filter { !it.isDirectory && nameIsImageFile(it.name) }
+            .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+            .map { MediaRef(it.path, it.name) }
+            .ifEmpty { listOf(MediaRef(path, path.substringAfterLast('/'))) }
+        startIndex = images.indexOfFirst { it.path == path }.takeIf { it >= 0 } ?: 0
         index = startIndex
         cursorIndex = startIndex
         postResult()
@@ -135,7 +135,7 @@ class ImageViewerActivity : ComponentActivity() {
      */
     private fun postResult() {
         images.getOrNull(index)?.let {
-            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT_PATH, it.absolutePath))
+            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT_PATH, it.path))
         }
     }
 

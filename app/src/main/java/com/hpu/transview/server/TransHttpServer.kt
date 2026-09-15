@@ -327,7 +327,7 @@ class TransHttpServer(
         outcome.movedFiles.forEach { indexMediaAsync(it) }
         // 解压失败 / 空间不足 / 未找到目标文件时保留到 Downloads 的原压缩包也要立即入库，
         // 否则「其他」页要等下次对账才看得到（媒体库由 Room 驱动，不读目录）
-        outcome.keptZipPath?.let { path -> indexMediaAsync(File(path)) }
+        outcome.keptZip?.let { indexMediaAsync(it) }
         toastOnTv(outcome.message)
 
         val json = JSONObject()
@@ -375,19 +375,22 @@ class TransHttpServer(
         }
     }
 
-    /** 落盘成功后立即建媒体索引（视频时长后台提取，不阻塞响应） */
-    private fun indexMediaAsync(file: File) {
+    /** 落盘成功后立即建媒体索引（视频时长后台提取，不阻塞响应）。
+     *  [saved] 来自 UploadStorage，`path` 恒为绝对路径，时长提取走 `setDataSource(path)`。 */
+    private fun indexMediaAsync(saved: UploadStorage.Saved) {
         bgScope.launch {
             runCatching {
-                val type = MediaType.fromFile(file)
-                val duration = if (type == MediaType.VIDEO) FileUtils.extractVideoDuration(file) else 0L
+                val type = MediaType.fromFileName(saved.name)
+                val duration = if (type == MediaType.VIDEO) {
+                    FileUtils.extractVideoDuration(appContext, saved.path)
+                } else 0L
                 mediaRepository.upsert(
-                    filePath = file.absolutePath,
-                    fileName = file.name,
+                    filePath = saved.path,
+                    fileName = saved.name,
                     mediaType = type,
-                    parentFolder = file.parentFile?.absolutePath ?: "",
-                    fileSize = file.length(),
-                    lastModified = file.lastModified(),
+                    parentFolder = saved.parentPath,
+                    fileSize = saved.size,
+                    lastModified = saved.lastModified,
                     duration = duration
                 )
             }

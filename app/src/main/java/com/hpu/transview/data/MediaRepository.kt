@@ -5,8 +5,8 @@ import com.hpu.transview.data.db.AppDatabase
 import com.hpu.transview.data.db.MediaItemDao
 import com.hpu.transview.data.db.MediaItemEntity
 import com.hpu.transview.model.Category
-import com.hpu.transview.util.isImageFile
-import com.hpu.transview.util.isVideoFile
+import com.hpu.transview.util.nameIsImageFile
+import com.hpu.transview.util.nameIsVideoFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -30,11 +30,13 @@ object MediaType {
         else -> Category.OTHER
     }
 
-    fun fromFile(file: File): Int = when {
-        file.isVideoFile() -> VIDEO
-        file.isImageFile() -> IMAGE
+    fun fromFileName(name: String): Int = when {
+        nameIsVideoFile(name) -> VIDEO
+        nameIsImageFile(name) -> IMAGE
         else -> OTHER
     }
+
+    fun fromFile(file: File): Int = fromFileName(file.name)
 }
 
 /** 媒体索引仓储：UI / SyncManager / 播放器与 Room 的唯一通道 */

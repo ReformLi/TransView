@@ -7,6 +7,7 @@ import coil.decode.VideoFrameDecoder
 import coil.memory.MemoryCache
 import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.ui.settings.SettingsStore
+import com.hpu.transview.util.CrashLogger
 import com.hpu.transview.util.FileLocations
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +21,9 @@ class TransViewApp : Application(), ImageLoaderFactory {
 
     override fun onCreate() {
         super.onCreate()
+        // 崩溃日志落盘：电视端拿不到 logcat，「一闪就退出」只能靠这份文件定位。
+        // 放在最前面，越早装越不会漏掉启动期的崩溃。
+        runCatching { CrashLogger.install(this) }
         // 设置项存储尽早初始化：端口 / 设备名 / 开机自启等配置在后台拉起（BootReceiver）
         // 与服务器启动时都要读取，不能依赖某个页面先组合（幂等，重复调用无副作用）
         SettingsStore.init(this)
