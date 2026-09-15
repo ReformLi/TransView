@@ -8,7 +8,8 @@ import java.io.File
 import java.io.IOException
 
 /**
- * 上传文件的落盘规则：
+ * 上传文件的落盘规则（落点始终跟随 FileLocations 的**活动存储**：首选U盘且在位时写入U盘沙盒；
+ * 降级模式（U盘拔出）自动写入内部存储沙盒，上传不中断；U盘插回后恢复写U盘）：
  * - 分类根目录：视频→Movies 图片→Pictures 其他→Download
  * - 文件夹上传：按 relativePath 重建层级，同名文件夹自动合并
  * - 同名文件：追加 (1)(2)… 后缀，绝不覆盖已有文件
@@ -20,6 +21,7 @@ class UploadStorage(private val context: Context) {
         return runCatching {
             val name = sanitizeFileName(rawName)
             val segments = sanitizeRelativePath(rawRelPath)
+            // 活动媒体根（FileLocations.getMediaRootDir 的分类子目录）：降级模式=内部存储，正常=首选存储
             var dir = FileLocations.root(category)
             for (seg in segments) {
                 dir = File(dir, seg)

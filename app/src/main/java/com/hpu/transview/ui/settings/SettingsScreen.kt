@@ -55,6 +55,7 @@ import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.model.AspectRatio
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.SortOrder
+import com.hpu.transview.model.StorageLocation
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.OptionRow
@@ -198,6 +199,10 @@ fun SettingsScreen(
     // ——— 「界面设置」两项（已接线）的界面显示值 ———
     var gridColumnsValue by remember { mutableIntStateOf(SettingsStore.gridColumns) }
     var defaultSortValue by remember { mutableStateOf(SettingsStore.defaultSort) }
+
+    // ——— 存储位置（首选存储）：切换后经 FileLocations.refresh() 立即推导活动存储，
+    // ——— StateFlow 驱动本行 value 与下方「当前存储」信息条目自动刷新 ———
+    val storageState by FileLocations.storageState.collectAsState()
 
     var selectedGroupIndex by remember { mutableIntStateOf(0) }
     // 焦点是否在设置页内容区（左侧分组/右侧详情）。顶部「设置」标签持有焦点时为 false ——
@@ -770,12 +775,49 @@ fun SettingsScreen(
 
                         SettingGroup.STORAGE -> {
                             SettingRow(
-                                "${g.title}:0", "存储空间占用",
+                                "${g.title}:0", "存储位置",
+                                if (storageState.degraded) "内部存储（降级）" else storageState.activeLabel
+                            ) {
+                                openChoice("${g.title}:0", ChoiceState(
+                                    "存储位置",
+                                    StorageLocation.entries.map { it.label },
+                                    StorageLocation.entries.indexOf(storageState.preferred),
+                                    descriptions = listOf(
+                                        "始终可用；拔出U盘时的自动兜底落点",
+                                        "优先写入U盘；拔出时自动降级到内部存储（上传不中断），插回自动恢复"
+                                    )
+                                ) { i ->
+                                    val loc = StorageLocation.entries[i]
+                                    SettingsStore.preferredStorage = loc
+                                    scope.launch {
+                                        // 立即重检活动存储（含文件系统探测，IO 线程；可能降级/恢复），
+                                        // StateFlow 推送本行 value 与「当前存储」条目自动刷新
+                                        val newState = withContext(Dispatchers.IO) { FileLocations.refresh() }
+                                        // 媒体库内容可能随活动存储切换，重新对账（互斥，正在同步则跳过）
+                                        runCatching { syncManager.sync() }
+                                        val msg = when {
+                                            loc == StorageLocation.INTERNAL -> "已切换为内部存储"
+                                            newState.activeIsUsb -> "已切换为U盘存储"
+                                            else -> "未检测到U盘，暂用内部存储（降级模式）"
+                                        }
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    }
+                                })
+                            }
+                            // 当前实际使用的路径与状态（纯信息展示，不可操作）：
+                            // 正常模式（U盘）/ 降级模式（U盘已拔出）随插拔自动变化
+                            AboutEntry(
+                                "${g.title}:1", "当前存储",
+                                value = storageState.modeLabel,
+                                body = storageState.activeRoot.absolutePath
+                            )
+                            SettingRow(
+                                "${g.title}:2", "存储空间占用",
                                 if (storageComputing) "…" else storageLabel,
                                 onClick = refreshStorage
                             )
-                            SettingRow("${g.title}:1", "清空上传记录", "仅清记录") {
-                                openConfirm("${g.title}:1", ConfirmState(
+                            SettingRow("${g.title}:3", "清空上传记录", "仅清记录") {
+                                openConfirm("${g.title}:3", ConfirmState(
                                     "清空上传记录",
                                     "确定清空全部上传记录吗？\n仅删除历史日志，本地文件将全部保留。",
                                     "全部清空"
@@ -784,8 +826,8 @@ fun SettingsScreen(
                                     Toast.makeText(context, "已清空上传记录，本地文件已保留", Toast.LENGTH_SHORT).show()
                                 })
                             }
-                            SettingRow("${g.title}:2", "清空播放历史", "清空历史") {
-                                openConfirm("${g.title}:2", ConfirmState(
+                            SettingRow("${g.title}:4", "清空播放历史", "清空历史") {
+                                openConfirm("${g.title}:4", ConfirmState(
                                     "清空播放历史",
                                     "确定清空全部播放历史吗？\n仅删除播放进度记录，已上传的视频/图片不受影响。",
                                     "全部清空"
@@ -794,13 +836,15 @@ fun SettingsScreen(
                                     Toast.makeText(context, "已清空播放历史", Toast.LENGTH_SHORT).show()
                                 })
                             }
-                            SettingRow("${g.title}:3", "手动触发对账", "刷新媒体库") {
+                            SettingRow("${g.title}:5", "手动触发对账", "刷新媒体库") {
                                 scope.launch {
                                     val r = syncManager.sync()
+                                    // 降级模式跳过了「同步外部删除」（防误删），提示里注明
+                                    val extra = if (r.degraded) "\n（U盘已断开，跳过删除核对，历史记录已保留）" else ""
                                     Toast.makeText(
                                         context,
                                         "对账完成：新增 ${r.inserted}，更新 ${r.updated}，" +
-                                            "清理失效 ${r.deletedMissing}，空文件夹 ${r.removedEmptyFolders}",
+                                            "清理失效 ${r.deletedMissing}，空文件夹 ${r.removedEmptyFolders}$extra",
                                         Toast.LENGTH_LONG
                                     ).show()
                                 }

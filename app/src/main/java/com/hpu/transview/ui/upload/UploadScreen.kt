@@ -82,6 +82,7 @@ import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
+import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.NetUtils
 import com.hpu.transview.util.QrCode
@@ -119,6 +120,14 @@ fun UploadScreen(
     // 访问码：服务器每次启动（含休眠/暂停恢复、改端口重启）轮换。二维码要带上它，
     // 手机扫码即自动通过认证（零输入）；屏幕上同时显示出来，供「手输 IP」的用户照着输入
     val token by ServerBus.token.collectAsState()
+
+    // ——— 活动存储状态（U盘拔出自动降级 / 插回自动恢复，插拔广播驱动）———
+    val storage by FileLocations.storageState.collectAsState()
+    // 可用容量随根目录变化重取（statfs 系统调用，放 IO 线程）；-1 = 尚未取到
+    var storageFreeBytes by remember { mutableStateOf(-1L) }
+    LaunchedEffect(storage.activeRoot) {
+        storageFreeBytes = withContext(Dispatchers.IO) { storage.activeRoot.usableSpace }
+    }
 
     val recordsRepo = remember { UploadRecordRepository(context) }
     val records by recordsRepo.observeRecent().collectAsState(initial = emptyList())
@@ -193,7 +202,7 @@ fun UploadScreen(
             .padding(horizontal = 40.dp, vertical = 18.dp),
         horizontalArrangement = Arrangement.spacedBy(28.dp)
     ) {
-        // ——— 左侧固定区：二维码 + 地址 + 服务器状态 ———
+        // ——— 左侧固定区：二维码 + 地址 + 服务器状态 + 存储状态 ———
         ServerPanel(
             modifier = Modifier
                 .weight(0.9f)
@@ -204,7 +213,10 @@ fun UploadScreen(
             qr = qr,
             ip = ip,
             port = port,
-            token = token
+            token = token,
+            storageLabel = storage.activeLabel,
+            storageFreeBytes = storageFreeBytes,
+            storageDegraded = storage.degraded
         )
 
         // ——— 右侧：上传记录（可滚动） ———
@@ -371,7 +383,10 @@ private fun ServerPanel(
     qr: Bitmap?,
     ip: String?,
     port: Int,
-    token: String?
+    token: String?,
+    storageLabel: String,
+    storageFreeBytes: Long,
+    storageDegraded: Boolean
 ) {
     Surface(
         modifier = modifier,
@@ -506,6 +521,11 @@ private fun ServerPanel(
                 )
                 // 这里不再重复「当前模式」：顶部状态区（服务器运行中 · 极速模式）已经显示，
                 // 重复一行只会挤掉二维码的可用高度。省下的空间由上面的 weight(1f) 自动给二维码。
+
+                Spacer(Modifier.height(4.dp))
+                // 活动存储状态（U盘拔出自动降级/插回恢复）：一行 bodySmall（~16dp），
+                // 超出的高度同样由 weight(1f) 的二维码吸收
+                StorageStatusRow(storageLabel, storageFreeBytes, storageDegraded)
             }
         } else {
             // ——— 未运行：状态 + 唤醒/启动 ———
@@ -537,6 +557,9 @@ private fun ServerPanel(
                     color = OnDarkDim,
                     textAlign = TextAlign.Center
                 )
+                Spacer(Modifier.height(8.dp))
+                // 未运行时同样展示活动存储（降级警示不能因为服务器暂停而不可见）
+                StorageStatusRow(storageLabel, storageFreeBytes, storageDegraded)
                 Spacer(Modifier.height(26.dp))
                 if (mode == ServerMode.POWER_SAVER) {
                     TvButton("启动服务器") { ServerController.wake() }
@@ -549,6 +572,32 @@ private fun ServerPanel(
 }
 
 // ————————————————— 记录行 —————————————————
+
+/** 存储状态行：正常=「存储：U盘 (14.5 GB 可用)」；降级=追加红色「⚠️ U盘已断开」 */
+@Composable
+private fun StorageStatusRow(label: String, freeBytes: Long, degraded: Boolean) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            if (freeBytes >= 0) "存储：$label (${FileUtils.formatSize(freeBytes)} 可用)"
+            else "存储：$label",
+            style = MaterialTheme.typography.bodySmall,
+            color = OnDarkDim,
+            textAlign = TextAlign.Center
+        )
+        if (degraded) {
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "⚠️ U盘已断开",
+                style = MaterialTheme.typography.bodySmall,
+                color = DangerRed
+            )
+        }
+    }
+}
 
 /** 状态码 → 显示文案 */
 private fun stateLabel(state: Int): String = when (state) {

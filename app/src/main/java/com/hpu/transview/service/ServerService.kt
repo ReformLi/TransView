@@ -10,25 +10,32 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.hpu.transview.MainActivity
 import com.hpu.transview.R
+import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.util.FileLocations
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 前台服务：作为 ServerController（智能保活策略引擎）的常驻宿主。
  * - 接收 SCREEN_OFF/ON 广播并转发给策略引擎
+ * - 接收 U盘插拔广播（去抖）→ 重检活动存储（降级/恢复）→ 重新对账
  * - 通知文案随服务器状态联动（运行中/已暂停/已休眠/已停止），点击回到 App
  */
 class ServerService : Service() {
@@ -44,6 +51,39 @@ class ServerService : Service() {
                 Intent.ACTION_SCREEN_OFF -> ServerController.setScreenOn(false)
                 Intent.ACTION_SCREEN_ON -> ServerController.setScreenOn(true)
             }
+        }
+    }
+
+    /**
+     * U盘插拔监听：ATTACHED/DETACHED 广播只作触发信号，去抖后统一重检
+     * [FileLocations]（活动存储降级/恢复），再重新对账媒体库。
+     */
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                UsbManager.ACTION_USB_DEVICE_ATTACHED,
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> scheduleUsbRefresh()
+            }
+        }
+    }
+
+    /** 去抖任务句柄：插拔瞬间系统会连发多个广播，只保留最后一次 */
+    private var usbRefreshJob: Job? = null
+
+    /**
+     * 去抖重检（2 秒收口）：
+     * - 插入时U盘卷（/storage/XXXX-XXXX）挂载完成需要时间，立即检测会漏；
+     * - 拔出时多个广播连续到达，收口成一次；
+     * - 活动存储切换（降级/恢复）后媒体库内容随之变化，需要重新对账
+     *   （SyncManager 内部按当前活动存储决定是否跳过「同步外部删除」，互斥防重入）。
+     */
+    private fun scheduleUsbRefresh() {
+        usbRefreshJob?.cancel()
+        usbRefreshJob = scope.launch {
+            delay(USB_REFRESH_DEBOUNCE_MS)
+            // 重检含文件系统探测（/storage 列卷 + canWrite），放 IO 线程
+            withContext(Dispatchers.IO) { FileLocations.refresh() }
+            runCatching { SyncManager.getInstance(applicationContext).sync() }
         }
     }
 
@@ -69,6 +109,17 @@ class ServerService : Service() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(screenReceiver, filter)
         }
+        // U盘插拔广播（系统广播，NOT_EXPORTED 亦可接收）：降级/恢复的运行期触发源
+        val usbFilter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbReceiver, usbFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbReceiver, usbFilter)
+        }
         ServerController.init(this)
         // 服务器状态 → 通知文案联动
         scope.launch {
@@ -84,8 +135,10 @@ class ServerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        usbRefreshJob?.cancel()
         if (foregroundReady) {
             runCatching { unregisterReceiver(screenReceiver) }
+            runCatching { unregisterReceiver(usbReceiver) }
             ServerController.release()
         }
         scope.cancel()
@@ -169,6 +222,9 @@ class ServerService : Service() {
         private const val TAG = "ServerService"
         const val CHANNEL_ID = "file_server"
         const val NOTIFICATION_ID = 1001
+
+        /** U盘插拔重检去抖窗口：等U盘卷挂载稳定，也收口连续广播 */
+        private const val USB_REFRESH_DEBOUNCE_MS = 2_000L
 
         fun start(context: Context) {
             androidx.core.content.ContextCompat.startForegroundService(

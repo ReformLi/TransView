@@ -3,6 +3,7 @@ package com.hpu.transview.ui.settings
 import android.content.Context
 import com.hpu.transview.model.AspectRatio
 import com.hpu.transview.model.SortOrder
+import com.hpu.transview.model.StorageLocation
 import com.hpu.transview.util.Constants
 
 /**
@@ -99,4 +100,18 @@ object SettingsStore {
             ?.let { runCatching { SortOrder.valueOf(it) }.getOrNull() }
             ?: SortOrder.NAME_ASC
         set(v) { prefs()?.edit()?.putString("default_sort", v.name)?.apply() }
+
+    // ——— 存储与数据 ———
+
+    /**
+     * 首选存储位置（默认内部存储）。已接入 FileLocations 的活动存储判定：
+     * - INTERNAL：活动存储恒为内部存储；
+     * - USB：U盘可用时活动存储=U盘，拔出时自动降级为内部存储（降级状态不持久化，
+     *   每次检测时按「首选 + U盘实际在位情况」实时推导，U盘插回即自动恢复）。
+     */
+    var preferredStorage: StorageLocation
+        get() = prefs()?.getString("preferred_storage", StorageLocation.INTERNAL.name)
+            ?.let { runCatching { StorageLocation.valueOf(it) }.getOrNull() }
+            ?: StorageLocation.INTERNAL
+        set(v) { prefs()?.edit()?.putString("preferred_storage", v.name)?.apply() }
 }

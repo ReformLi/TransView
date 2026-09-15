@@ -9,22 +9,164 @@ import androidx.core.content.FileProvider
 import com.hpu.transview.model.Category
 import com.hpu.transview.model.FileEntry
 import com.hpu.transview.model.SortOrder
+import com.hpu.transview.model.StorageLocation
+import com.hpu.transview.ui.settings.SettingsStore
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * 专属沙盒目录策略：App 的全部存储收在 /sdcard/TransView/ 内，
- * 严禁读写/扫描系统公共目录（Movies/Pictures/Download 等），防误扫系统垃圾文件与越界删除。
+ * 专属沙盒目录策略：App 的全部存储收在沙盒目录（内部存储为 /sdcard/TransView，U盘为
+ * /storage/XXXX-XXXX/TransView）内，严禁读写/扫描系统公共目录（Movies/Pictures/Download 等），
+ * 防误扫系统垃圾文件与越界删除。
+ *
+ * ## 首选存储与活动存储（自动降级与恢复）
+ * - **首选存储**（[SettingsStore.preferredStorage]）：用户在设置里手动选择的存储位置，默认内部存储。
+ * - **活动存储**（[StorageState.activeRoot]）：当前实际用于读写的沙盒根。
+ *   首选U盘且U盘在位 → 活动=U盘（正常模式）；首选U盘但U盘拔出 → 活动自动降级为内部存储
+ *   （降级模式，历史记录全部保留）；U盘插回 → 自动恢复为U盘。
+ * - 上传/解压/媒体库浏览/对账等全部读写路径都经 [sandboxRoot]（=活动存储）自动跟随切换，
+ *   降级期间的上传直接写入内部存储沙盒，不中断。
+ *
+ * 状态变化经 [storageState] StateFlow 推送 UI；运行期降级/恢复经 [storageEvents] 通知
+ * （MainScreen 收集后 Toast 提示）。重检触发点：App 启动（TransViewApp）、U盘插拔广播
+ * （ServerService 转发，带去抖）、设置页切换首选存储、每次对账开始前（SyncManager）。
  */
 object FileLocations {
 
-    /** 沙盒总根：/sdcard/TransView */
-    val sandboxRoot: File
-        get() = File(Environment.getExternalStorageDirectory(), "TransView")
+    /** 沙盒目录名（内部存储与U盘上同构：/TransView） */
+    private const val SANDBOX_DIR_NAME = "TransView"
 
-    /** 各分类根目录（均在沙盒内），首次访问自动创建 */
+    /** U盘卷目录名特征：形如 XXXX-XXXX（FAT/exFAT 卷 label 的 mount id） */
+    private val USB_VOLUME_REGEX = Regex("\\d{4}-\\d{4}")
+
+    /** 当前存储状态快照（不可变；[refresh] 时整体替换） */
+    data class StorageState(
+        /** 用户首选存储（设置项持久化） */
+        val preferred: StorageLocation,
+        /** 活动沙盒根（实际读写位置） */
+        val activeRoot: File,
+        /** 活动存储是否U盘 */
+        val activeIsUsb: Boolean,
+        /** 当前检测到的U盘沙盒根（null=无U盘或不可写） */
+        val usbRoot: File?
+    ) {
+        /** 降级模式：首选U盘但U盘不可用，正在使用内部存储 */
+        val degraded: Boolean get() = preferred == StorageLocation.USB && !activeIsUsb
+
+        /** 状态文案（设置页「当前存储状态」用） */
+        val modeLabel: String
+            get() = when {
+                degraded -> "降级模式（U盘已拔出）"
+                activeIsUsb -> "正常模式（U盘）"
+                else -> "正常模式（内部存储）"
+            }
+
+        /** 活动存储名（上传页状态行用） */
+        val activeLabel: String get() = if (activeIsUsb) "U盘" else "内部存储"
+    }
+
+    /** 运行期存储切换事件（一次性，UI 收集后 Toast；设置页主动切换不产生事件，由设置页自行提示） */
+    sealed interface StorageEvent {
+        /** U盘拔出：活动存储已自动降级为内部存储 */
+        data object UsbDetached : StorageEvent
+
+        /** U盘插回：活动存储已自动恢复为U盘 */
+        data object UsbAttached : StorageEvent
+    }
+
+    /** 内部存储沙盒根：/sdcard/TransView（降级模式与默认模式的落点） */
+    val internalRoot: File
+        get() = File(Environment.getExternalStorageDirectory(), SANDBOX_DIR_NAME)
+
+    /** 初始快照：按「首选=内部存储」推导，首次 [refresh]/[init] 前的兜底（防御性默认） */
+    @Volatile
+    private var state: StorageState =
+        StorageState(StorageLocation.INTERNAL, internalRoot, activeIsUsb = false, usbRoot = null)
+
+    @Volatile
+    private var initialized = false
+
+    private val _storageState = MutableStateFlow(state)
+    val storageState: StateFlow<StorageState> = _storageState.asStateFlow()
+
+    private val _storageEvents = MutableSharedFlow<StorageEvent>(extraBufferCapacity = 8)
+    val storageEvents: SharedFlow<StorageEvent> = _storageEvents.asSharedFlow()
+
+    /** App 启动时调用（TransViewApp.onCreate，须在 SettingsStore.init 之后）：做首次状态检测 */
+    fun init(context: Context) = refresh()
+
+    /**
+     * 获取当前活动媒体根目录（沙盒根）。上传落盘（UploadStorage）、解压、媒体库浏览
+     * 等全部读写都基于它：首选U盘且在位 → /storage/XXXX-XXXX/TransView；否则内部存储沙盒。
+     * 降级模式下返回内部存储沙盒目录（自动创建），确保上传不中断。
+     */
+    fun getMediaRootDir(context: Context): File {
+        ensureRefreshed()
+        return state.activeRoot
+    }
+
+    /**
+     * 重新检测存储状态（幂等、线程安全）。触发点：App 启动、U盘插拔广播（去抖后）、
+     * 设置页切换首选存储、对账开始前。状态变化时更新 [storageState] 并按跃迁发出事件：
+     * - U盘正常 → 降级（U盘拔出）：[StorageEvent.UsbDetached]
+     * - 降级 → U盘正常（U盘插回）：[StorageEvent.UsbAttached]
+     * @return 最新的状态快照
+     */
+    @Synchronized
+    fun refresh(): StorageState {
+        val preferred = SettingsStore.preferredStorage
+        val usbRoot = findUsbRoot()
+        val activeIsUsb = preferred == StorageLocation.USB && usbRoot != null
+        val activeRoot = if (activeIsUsb) usbRoot!! else internalRoot
+        // 活动沙盒必须存在且可用：降级进入内部存储 / 首次选中U盘时自动创建沙盒目录
+        runCatching { activeRoot.mkdirs() }
+
+        val previous = state
+        val newState = StorageState(preferred, activeRoot, activeIsUsb, usbRoot)
+        state = newState
+        initialized = true
+        _storageState.value = newState
+
+        // 仅「运行期」的降级/恢复才发事件（首次检测、设置页主动切换不发，避免开机误弹 Toast）
+        if (previous.activeIsUsb && newState.degraded) {
+            _storageEvents.tryEmit(StorageEvent.UsbDetached)
+        } else if (previous.degraded && newState.activeIsUsb) {
+            _storageEvents.tryEmit(StorageEvent.UsbAttached)
+        }
+        return newState
+    }
+
+    /** 首次访问前兜底刷新（正常时序下 TransViewApp.onCreate 已 init 过，这里不会命中） */
+    private fun ensureRefreshed() {
+        if (!initialized) refresh()
+    }
+
+    /**
+     * 检测U盘沙盒根：扫描 /storage 下形如 XXXX-XXXX 的卷目录，取第一个「已挂载且可写」的卷，
+     * 返回其下的 TransView 目录（不要求已存在——选中/激活时由 [refresh] 自动创建）。
+     * 找不到可写卷（无U盘 / 只读 / 未挂载完成）返回 null。
+     */
+    private fun findUsbRoot(): File? = runCatching {
+        val volumes = File("/storage")
+            .listFiles { f -> f.isDirectory && USB_VOLUME_REGEX.matches(f.name) }
+            ?: return null
+        volumes.firstOrNull { it.canWrite() }
+            ?.let { File(it, SANDBOX_DIR_NAME) }
+    }.getOrNull()
+
+    /** 活动沙盒根：/sdcard/TransView 或 /storage/XXXX-XXXX/TransView（所有读写的统一入口） */
+    val sandboxRoot: File
+        get() = state.activeRoot
+
+    /** 各分类根目录（均在活动沙盒内），首次访问自动创建 */
     fun root(category: Category): File =
         File(
             sandboxRoot,
@@ -36,16 +178,26 @@ object FileLocations {
         ).apply { mkdirs() }
 
     /**
-     * 压缩包解压工作区：/sdcard/TransView/.temp_unzip
+     * 压缩包解压工作区：<活动沙盒>/.temp_unzip
      *
      * 上传的 .zip 先落到这里解压，命中分类的文件再搬进分类目录；无论成功失败都会整目录清理。
      * 目录名以 `.` 开头 → 媒体扫描（listMediaFilesRecursively / listEntries）默认跳过隐藏项，
      * 解压中途不会污染媒体库；SyncManager 每次对账还会兜底物理清空（防断电后残留）。
+     * 跟随活动存储：降级期间解压的临时目录在内部存储，对账时两个沙盒的临时目录都会清（见
+     * [allTempUnzipDirs]）。
      */
     val tempUnzipDir: File
         get() = File(sandboxRoot, ".temp_unzip")
 
-    /** 三个分类根目录（对账/清理范围仅限沙盒内） */
+    /** 内部存储与U盘（在位时）两个沙盒的解压临时目录，供对账兜底清理（谁在位清谁） */
+    fun allTempUnzipDirs(): List<File> {
+        val dirs = ArrayList<File>(2)
+        dirs.add(File(internalRoot, ".temp_unzip"))
+        state.usbRoot?.let { dirs.add(File(it, ".temp_unzip")) }
+        return dirs
+    }
+
+    /** 三个分类根目录（对账/清理范围仅限活动沙盒内） */
     fun allRoots(): List<File> = Category.entries.map { root(it) }
 
     /** 判断某目录是否是分类根目录本身（清理空文件夹时不得删除根目录） */
@@ -54,12 +206,19 @@ object FileLocations {
 
     /**
      * 路径安全校验：删除/清理等破坏性操作前必须调用。
-     * 规范化路径必须位于沙盒 /sdcard/TransView 之内，防止越界误删系统文件。
+     * 规范化路径必须位于**任一已知沙盒**（内部存储或U盘的 TransView）之内，
+     * 防止越界误删系统文件。多沙盒判定的原因：降级与恢复会让活动沙盒来回切换，
+     * 只认活动沙盒会拒绝「切到另一块沙盒上仍合法」的清理请求（如对账清理上一模式的
+     * 解压残留），只认固定目录则会在U盘模式漏掉U盘自身的保护。
      */
     fun isInsideSandbox(file: File): Boolean = runCatching {
-        val sandbox = sandboxRoot.canonicalPath + File.separator
-        file.canonicalPath.startsWith(sandbox)
+        val path = file.canonicalPath
+        sandboxRoots().any { root -> path.startsWith(root.canonicalPath + File.separator) }
     }.getOrDefault(false)
+
+    /** 全部已知沙盒根：内部存储 + 检测到的U盘（去重后） */
+    private fun sandboxRoots(): List<File> =
+        listOfNotNull(internalRoot, state.usbRoot).distinctBy { it.absolutePath }
 }
 
 val VIDEO_EXTS = setOf(

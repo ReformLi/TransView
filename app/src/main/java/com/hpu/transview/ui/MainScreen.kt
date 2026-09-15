@@ -63,6 +63,8 @@ import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.upload.UploadScreen
+import com.hpu.transview.util.FileLocations
+import com.hpu.transview.util.FileLocations.StorageEvent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -119,6 +121,21 @@ fun MainScreen() {
     // 省电模式：仅上传页可见时允许服务器运行
     LaunchedEffect(selected) {
         ServerController.setUploadPageVisible(selected == MainTab.UPLOAD)
+    }
+
+    // ——— U盘插拔全局提示（Toast）———
+    // 运行期降级/恢复事件来自 ServerService 的插拔广播（去抖重检后发出）；MainScreen 常驻
+    // 组合，在这里统一弹 Toast 最简单。App 启动首次检测与设置页主动切换不发事件，
+    // 故不会开机误弹。
+    LaunchedEffect(Unit) {
+        FileLocations.storageEvents.collect { event ->
+            when (event) {
+                StorageEvent.UsbDetached ->
+                    Toast.makeText(context, "U盘已断开，已自动切换到内部存储", Toast.LENGTH_LONG).show()
+                StorageEvent.UsbAttached ->
+                    Toast.makeText(context, "U盘已恢复，正在使用U盘", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     // 把焦点送回顶部导航栏「当前选中的标签」：返回键、以及内容区工具条按上键时都用它。

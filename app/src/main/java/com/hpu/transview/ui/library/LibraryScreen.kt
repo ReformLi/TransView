@@ -147,9 +147,14 @@ fun LibraryScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val root = remember(category) { FileLocations.root(category) }
-
-    var currentDir by remember(category) { mutableStateOf(root) }
+    // 根目录跟随**活动存储**：U盘拔出（降级）→ 切到内部存储沙盒；插回（恢复）→ 切回U盘沙盒。
+    // activeRoot 作 remember key，插拔广播驱动 FileLocations.refresh() 后本页自动重组：
+    // root / currentDir 一并重置——旧沙盒的子目录在新模式下已不可达，保留只会显示空目录树；
+    // 文件列表按 parentFolder == currentDir 过滤（Room 全库记录），天然只显示当前活动
+    // 沙盒的内容，另一块存储的记录保留在库中不展示（降级模式"历史记录已保留"即此实现）。
+    val storageState by FileLocations.storageState.collectAsState()
+    val root = remember(category, storageState.activeRoot) { FileLocations.root(category) }
+    var currentDir by remember(category, storageState.activeRoot) { mutableStateOf(root) }
     // 排序初值取「设置 → 界面设置 → 默认排序方式」；之后用工具条「排序」按钮做的调整只作用于
     // 本次浏览（切标签/进设置页都会重建本页组合，回到默认值）。rememberSaveable 以 category.name
     // 为键，保证三个分类各自独立、互不串味。

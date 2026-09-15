@@ -65,3 +65,12 @@ enum class ServerMode(val label: String, val desc: String) {
     /** 省电：仅在上传页手动点击才启动，离开上传页即停止 */
     POWER_SAVER("省电模式", "仅在上传页手动点击启动，离开上传页自动停止")
 }
+
+/** 存储位置（用户在设置里选择的首选存储） */
+enum class StorageLocation(val label: String) {
+    /** 设备内部存储：始终可用，是降级模式的兜底落点 */
+    INTERNAL("内部存储"),
+
+    /** 外接 U 盘：可用时为活动存储；拔出时自动降级到内部存储 */
+    USB("U盘")
+}
