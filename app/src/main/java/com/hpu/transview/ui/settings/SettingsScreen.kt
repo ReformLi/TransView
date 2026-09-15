@@ -124,7 +124,7 @@ private val DEVICE_NAMES = listOf(
 private val SPEED_OPTIONS = listOf("1.0x", "1.25x", "1.5x")
 
 private const val MIT_LICENSE = "MIT License\n\n" +
-    "Copyright (c) 2026 TransView 传视(TransView)\n\n" +
+    "Copyright (c) 2026 TransView 传视\n\n" +
     "Permission is hereby granted, free of charge, to any person obtaining a copy " +
     "of this software and associated documentation files (the \"Software\"), to deal " +
     "in the Software without restriction, including without limitation the rights " +
