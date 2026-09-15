@@ -5,6 +5,8 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,6 +47,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -306,6 +309,11 @@ fun SettingsScreen(
     LaunchedEffect(focusTicket) {
         if (focusTicket == consumedFocusTicket) return@LaunchedEffect
         consumedFocusTicket = focusTicket
+        // 触摸路径防护：触点在分组/条目上时 goToDetail 已把焦点导向所选分组详情
+        //（contentFocused=true），此时票据只是触摸兜底，跳过以免把刚选的分组拉回首个分组
+        //（用户实测：点「关于」焦点与选中瞬间跳回「服务器与网络」）。空处点按 / 标签按↓
+        // 时内容区无焦点（contentFocused=false），票据正常落到首个分组。
+        if (contentFocused) return@LaunchedEffect
         groupFocusers[0].requestFocusNextFrame()
     }
 
@@ -379,6 +387,15 @@ fun SettingsScreen(
                 // 只能观察到「下游」的焦点节点，写在 clickable 之后会观察不到 → 焦点高亮整行不显示
                 // （实测：设置页所有设置行按方向键移动时看不到任何高亮）。
                 .tvFocus()
+                // 触摸点按：把焦点落到本行。MainScreen 的锚点 Press 处理器（Initial 阶段）会先退出
+                // 触摸模式并聚焦锚点，这里 Main 阶段的请求在后、可成功覆盖；这样 150ms 后票据消费
+                // 时看到 contentFocused=true，不会强制把焦点拉回首个分组（与上传页记录行同一机制）。
+                .pointerInput(focusKey) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        requester.requestFocus()
+                    }
+                }
                 // clickable 必须在 onPreviewKeyEvent 之前：与媒体库网格项一致，
                 // clickable 会让元素可聚焦并处理 Enter/Center 激活，onPreviewKeyEvent
                 // 放在它之后可以拦截方向键（Left/Right/Up）而不影响点击激活
@@ -450,6 +467,16 @@ fun SettingsScreen(
                 // 只观察下游焦点节点，写在下游会导致条目聚焦时没有任何视觉反馈。
                 .tvFocus()
                 .focusable()
+                // 触摸点按：把焦点落到本条目。与 SettingRow 同一机制——MainScreen 锚点 Press
+                // 处理器（Initial 阶段）会先退出触摸模式并聚焦锚点，这里 Main 阶段的请求在后、
+                // 可成功覆盖；这样 150ms 后票据消费时 contentFocused=true，不会强制把焦点拉回
+                // 首个分组（实测：点「关于」后点击右侧「声明」等条目会跳回「服务器与网络」）。
+                .pointerInput(focusKey) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        requester.requestFocus()
+                    }
+                }
                 .onPreviewKeyEvent { event ->
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {

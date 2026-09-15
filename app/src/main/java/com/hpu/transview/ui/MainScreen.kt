@@ -111,11 +111,26 @@ fun MainScreen() {
             touchSuppressingTabSwitch = false
             return@LaunchedEffect
         }
-        runCatching { contentAnchor.requestFocus() }
         touchSuppressingTabSwitch = false
-        // 兜底：把焦点票据投给内容区，让焦点继续落到本页第一个可聚焦元素
-        // （记录首行 / 网格首项 / 设置首项）。即使锚点没拿到焦点，这一票也不会切页。
-        if (showSettings) settingsFocusTicket++ else contentFocusTicket++
+        if (showSettings) {
+            // 设置页触摸路径：不抢锚点焦点（触点落在分组/条目上时，点击处理器已把焦点导向
+            // 所选分组，这里再 contentAnchor.requestFocus() 会把内容区焦点清掉，导致下方票据
+            // 消费时 contentFocused 误判为 false）。只投「首个分组」票据，由设置页消费时校验
+            // contentFocused：触点已导向内容则跳过（否则把用户点的「关于」拉回「服务器与网络」），
+            // 空处点按（内容区无焦点）才落到首个分组，方向键不至于卡在锚点上。
+            settingsFocusTicket++
+        } else if (selected == MainTab.UPLOAD) {
+            // 上传页触摸路径：不抢锚点焦点（触点落在记录行上时，行的 Press 处理器已把焦点
+            // 落到该行，这里再 contentAnchor.requestFocus() 会把 listHasFocus 清掉，导致下方
+            // 票据消费时误判为 false）。只投票据，由上传页校验 listHasFocus：触点已导向列表
+            // 则跳过（否则把用户点的行拉回第一行），空处点按（列表无焦点）才落到第一行。
+            contentFocusTicket++
+        } else {
+            runCatching { contentAnchor.requestFocus() }
+            // 兜底：把焦点票据投给内容区，让焦点继续落到本页第一个可聚焦元素
+            // （记录首行 / 网格首项 / 设置首项）。即使锚点没拿到焦点，这一票也不会切页。
+            contentFocusTicket++
+        }
     }
 
     // 省电模式：仅上传页可见时允许服务器运行

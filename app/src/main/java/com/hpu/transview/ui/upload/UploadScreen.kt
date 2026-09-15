@@ -7,6 +7,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -56,6 +58,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -159,6 +162,10 @@ fun UploadScreen(
     LaunchedEffect(focusListTicket) {
         if (focusListTicket == consumedFocusTicket) return@LaunchedEffect
         consumedFocusTicket = focusListTicket
+        // 触摸路径防护：触点在记录行上时，行的 Press 处理器已把焦点落到该行（listHasFocus=true），
+        // 票据只是触摸兜底，跳过以免把用户点的行拉回第一行（与设置页触摸路径同一机制）。
+        // 空处点按 / 标签按↓ 时列表无焦点（listHasFocus=false），票据正常落到第一行。
+        if (listHasFocus) return@LaunchedEffect
         if (records.isNotEmpty()) focusFirstRow = true
     }
 
@@ -651,6 +658,15 @@ private fun UploadRecordRow(
             // 程序化请求会落到行内的「删除」按钮上（实测）。
             .focusRequester(focusRequester)
             .focusable()
+            // 触摸点按：把焦点落到本行。MainScreen 的锚点 Press 处理器（Initial 阶段）会先退出
+            // 触摸模式并聚焦锚点，这里 Main 阶段的请求在后、可成功覆盖；这样 150ms 后票据消费
+            // 时看到 listHasFocus=true，不会强制把焦点拉回第一行（与设置页触摸路径同一机制）。
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    focusRequester.requestFocus()
+                }
+            }
             // 菜单键 / 删除键 → 删除该条记录；第一行按「上键」→ 本页工具条
             // （preview 阶段从祖先到焦点，焦点落在行内「删除」按钮时同样生效）
             .onPreviewKeyEvent { event ->
