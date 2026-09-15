@@ -93,6 +93,11 @@ fun MainScreen() {
     // tap 手势期间 Compose 会清空焦点，立即 requestFocus 会被随后的清空覆盖（实测：立即请求时
     // 目标卡片的 requestFocus 连试 10 次全部失败），所以统一延后一拍再锚定。
     var touchAnchorTick by remember { mutableIntStateOf(0) }
+    // 触摸手势期间的「聚焦即选中」抑制开关：requestFocusFromTouch() 在 touch mode 下执行的是
+    // Compose 焦点搜索，无焦点时从整棵树根部命中第一个可聚焦节点 = 「上传」标签，标签聚焦即选中
+    // → 点一下内容区页面被误切回上传（用户实测）。触摸用户不应因焦点注入而切页，故手势期间
+    // 抑制标签的聚焦选中，仅保留「点按标签」这一直接交互来切页；手势结束后恢复。
+    var touchSuppressingTabSwitch by remember { mutableStateOf(false) }
     val contentAnchor = remember { FocusRequester() }
     val windowInfo = LocalWindowInfo.current
     val rootView = LocalView.current
@@ -100,8 +105,12 @@ fun MainScreen() {
         if (touchAnchorTick == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(150)
         // 点按可能已经打开了播放器 / 图片查看器（本页已退到后台），此时不该抢焦点
-        if (!windowInfo.isWindowFocused) return@LaunchedEffect
+        if (!windowInfo.isWindowFocused) {
+            touchSuppressingTabSwitch = false
+            return@LaunchedEffect
+        }
         runCatching { contentAnchor.requestFocus() }
+        touchSuppressingTabSwitch = false
         // 兜底：把焦点票据投给内容区，让焦点继续落到本页第一个可聚焦元素
         // （记录首行 / 网格首项 / 设置首项）。即使锚点没拿到焦点，这一票也不会切页。
         if (showSettings) settingsFocusTicket++ else contentFocusTicket++
@@ -155,7 +164,6 @@ fun MainScreen() {
     // 必须用 BackHandler 而非 Modifier.onKeyEvent —— onKeyEvent 只在焦点路径上才收得到事件，
     // 从播放页返回后内容区焦点为空时会漏掉返回键，Activity 被系统直接 finish（表现为「返回键退出 App」）。
     BackHandler {
-        android.util.Log.d("EXITDBG", "BACK topBar=$topBarFocused settings=$showSettings selected=$selected lastBack=$lastBackTime now=${SystemClock.uptimeMillis()}")
         when {
             // 焦点在媒体标签（非「上传」）→ 先回「上传」
             topBarFocused && !showSettings && selected != MainTab.UPLOAD -> focusUploadTab()
@@ -208,11 +216,12 @@ fun MainScreen() {
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
                         .onFocusChanged { state ->
-                            if (state.isFocused) {
+                            // 触摸手势期间抑制「聚焦即选中」：requestFocusFromTouch() 的焦点搜索
+                            // 会把焦点注入「上传」标签，不能让它误切页面（见上方 flag 注释）。
+                            if (state.isFocused && !touchSuppressingTabSwitch) {
                                 // 切到非「上传」标签 → 取消未完成的「再按一次退出」确认
                                 //（双击窗口只在焦点持续停留在「上传」标签时累计）
                                 if (tab != MainTab.UPLOAD) lastBackTime = 0L
-                                android.util.Log.d("EXITDBG", "tabFocus ${tab.title} isFocused reset(${tab != MainTab.UPLOAD}) lastBackTime=$lastBackTime")
                                 // 退出设置页必须**无条件**执行，不能塞进 `tab != selected` 条件里：
                                 // 从「设置」切回「先前停留的那个标签」时 selected 本来就没变，条件不成立
                                 // → showSettings 停在 true，内容区继续显示设置页
@@ -233,7 +242,9 @@ fun MainScreen() {
                 onNavigateDown = { settingsFocusTicket++ },
                 modifier = Modifier
                     .focusRequester(settingsFocusRequester)
-                    .onFocusChanged { if (it.isFocused && !showSettings) showSettings = true }
+                    .onFocusChanged {
+                        if (it.isFocused && !showSettings && !touchSuppressingTabSwitch) showSettings = true
+                    }
             ) { showSettings = true }
             Spacer(Modifier.width(20.dp))
             ServerStatusBadge()
@@ -268,8 +279,17 @@ fun MainScreen() {
                         while (true) {
                             val event = awaitPointerEvent(PointerEventPass.Initial)
                             if (event.type == PointerEventType.Press) {
+                                // 抑制 flag 必须先于 requestFocusFromTouch() 置位：该调用（或其后的
+                                // 框架层焦点搜索）会同步把焦点注入「上传」标签，而标签 onFocusChanged
+                                // 是「聚焦即选中」——flag 若晚设，页面会被立刻误切回上传（实测复现）。
+                                // 先置位后，本次焦点注入被抑制，页面保持不动；点按标签仍可正常切页
+                                //（标签 onClick 不走 flag 判断），flag 由下方 LaunchedEffect 复位。
+                                touchSuppressingTabSwitch = true
                                 // 只在 Press 阶段同步调用才来得及（晚了 touch mode 已生效）
                                 rootView.requestFocusFromTouch()
+                                // 该调用的 Compose 焦点搜索会命中「上传」标签（见上方 flag 注释），
+                                // 立即把焦点拉回内容锚点，消除标签高亮闪烁；切页由 flag 兜底抑制。
+                                runCatching { contentAnchor.requestFocus() }
                                 touchAnchorTick++
                             }
                         }
