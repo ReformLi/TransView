@@ -66,9 +66,9 @@ import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.tvFocus
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
-import com.hpu.transview.util.StorageDiagnosis
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -205,6 +205,11 @@ fun SettingsScreen(
     // ——— 存储位置（首选存储）：切换后经 FileLocations.refresh() 立即推导活动存储，
     // ——— StateFlow 驱动本行 value 与下方「当前存储」信息条目自动刷新 ———
     val storageState by FileLocations.storageState.collectAsState()
+
+    // 「App 调试日志」开关的界面显示值（写 SharedPreferences 不会触发本页重组）
+    var appLogValue by remember { mutableStateOf(SettingsStore.appLogEnabled) }
+    // 日志目录提示文案：随活动存储（内部存储 / U 盘）变化
+    val appLogDir = AppLogger.logDirLabel()
 
     var selectedGroupIndex by remember { mutableIntStateOf(0) }
     // 焦点是否在设置页内容区（左侧分组/右侧详情）。顶部「设置」标签持有焦点时为 false ——
@@ -370,6 +375,11 @@ fun SettingsScreen(
         focusKey: String,
         label: String,
         value: String,
+        /**
+         * 可选的第二行小字（说明/警告）。为 null 时**渲染结果与加这个参数之前完全一致**
+         * （不额外包 Column），避免影响其余设置行的既有布局与焦点观感。
+         */
+        subtitle: String? = null,
         /** 禁用态：**仍可聚焦**（理由同 TvButton —— 正持有焦点的节点突然不可聚焦会把页面切走），
          *  只是不响应确定/右键并按灰色渲染值文本。用于「正在等待系统授权界面」期间锁住入口。 */
         enabled: Boolean = true,
@@ -420,22 +430,63 @@ fun SettingsScreen(
                 }
                 .padding(horizontal = 10.dp, vertical = 16.dp)
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    label,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Spacer(Modifier.weight(1f))
-                Text(
-                    value,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = if (enabled) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                )
-                Spacer(Modifier.width(8.dp))
-                Text("▸", style = MaterialTheme.typography.bodyLarge, color = OnDarkDim)
+            // subtitle 为 null 时，Column 只有一个子节点 → 测量结果与「直接用 Row」逐像素一致，
+            // 因此其余设置行的既有布局/焦点观感不受本次改动影响。
+            Column(Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        value,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = if (enabled) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("▸", style = MaterialTheme.typography.bodyLarge, color = OnDarkDim)
+                }
+                if (subtitle != null) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OnDarkDim
+                    )
+                }
             }
+        }
+        Spacer(Modifier.height(6.dp))
+    }
+
+    /**
+     * 「App 调试日志」开关下方的小字提示。
+     *
+     * **刻意不可聚焦**：它只是说明文字，若做成可聚焦节点会给焦点导航凭空多出一站
+     * （遥控器用户按 ↓ 会多停一次），也不符合设置页「一行一个动作」的既有习惯。
+     * 缩进与 [SettingRow] 的内容缩进对齐（12dp 留白 + 12dp 内边距 = 24dp）。
+     */
+    @Composable
+    fun LogPathHint(dirLabel: String) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 2.dp)
+        ) {
+            Text(
+                "日志文件位置：${dirLabel}（按日期分目录，文件名即写入时刻）",
+                style = MaterialTheme.typography.bodySmall,
+                color = OnDarkDim
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "查看方式：媒体库「其他」页 → TransView/Downloads/app_log → 当天日期目录 → 打开 .log 文件",
+                style = MaterialTheme.typography.bodySmall,
+                color = OnDarkDim
+            )
         }
         Spacer(Modifier.height(6.dp))
     }
@@ -878,35 +929,37 @@ fun SettingsScreen(
                                 if (storageComputing) "…" else storageLabel,
                                 onClick = refreshStorage
                             )
-                            // 存储诊断日志导出：电视上没有终端、看不到 logcat，外接盘"插了却不出现"
-                            // 时无法定位；这里把整条判定链路的证据写成 txt（落在「其他」分类目录，
-                            // 对账后可在 App 内打开，U 盘模式下也能拔下来插电脑看）。
-                            SettingRow("${g.title}:3", "导出存储诊断日志", "写入文件") {
-                                scope.launch {
-                                    val r = withContext(Dispatchers.IO) {
-                                        runCatching { StorageDiagnosis.export(context) }
-                                    }
-                                    r.fold(
-                                        onSuccess = { f ->
-                                            // 立刻对账一次：新 txt 经 SyncManager 索引进 media_items 后
-                                            // 才会出现在「其他」分类里（"与「其他」同路径"的意义所在）
-                                            runCatching { syncManager.sync() }
-                                            Toast.makeText(
-                                                context,
-                                                "诊断日志已导出到 ${f.absolutePath}",
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                        },
-                                        onFailure = { e ->
-                                            Toast.makeText(
-                                                context,
-                                                "导出失败：${e.javaClass.simpleName}: ${e.message}",
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                        }
-                                    )
-                                }
+                            // 「App 调试日志」开关（默认关）：电视端没有终端、拿不到 logcat，
+                            // 打开后 AppLogger 把运行日志异步落盘到
+                            // <活动沙盒>/TransView/Downloads/app_log/<yyyy-MM-dd>/<HH-mm-ss>.log；
+                            // 该目录属于「其他」分类 → 对账后可在「其他」页直接翻看。
+                            // focusKey 固定为 :3（:4/:5/:6 为其余三项，ID 稳定、不随行序变化）。
+                            SettingRow(
+                                "${g.title}:3", "App 调试日志",
+                                if (appLogValue) "开启" else "关闭",
+                                subtitle = "记录调试日志（仅供排查问题，长期开启可能影响性能）"
+                            ) {
+                                openChoice("${g.title}:3", ChoiceState(
+                                    "App 调试日志",
+                                    listOf("开启", "关闭"),
+                                    if (appLogValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    appLogValue = on
+                                    SettingsStore.appLogEnabled = on
+                                    // 立即生效（无需重启）：开 → 建目录 + 起消费协程；
+                                    // 关 → 停消费协程、关文件流、清空内存队列
+                                    AppLogger.setEnabled(on)
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启调试日志，写入 $appLogDir"
+                                        else "已关闭调试日志",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                })
                             }
+                            // 小字提示（不可聚焦，不参与焦点导航）：日志落点 + 去哪里看
+                            LogPathHint(appLogDir)
                             SettingRow("${g.title}:4", "清空上传记录", "仅清记录") {
                                 openConfirm("${g.title}:4", ConfirmState(
                                     "清空上传记录",

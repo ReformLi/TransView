@@ -145,4 +145,16 @@ object SettingsStore {
     var preferredStorageLabel: String
         get() = prefs()?.getString("preferred_storage_label", "内部存储") ?: "内部存储"
         set(v) { prefs()?.edit()?.putString("preferred_storage_label", v)?.apply() }
+
+    /**
+     * App 调试日志（默认**关**）。开启后 `AppLogger` 把运行日志异步落盘到
+     * `<活动沙盒>/TransView/Downloads/app_log/<yyyy-MM-dd>/<HH-mm-ss>.log`，
+     * 可在 TV 端「其他」页翻看。
+     *
+     * 已接入运行时：`TransViewApp.onCreate` 启动时按本项决定是否开启引擎；
+     * 设置页切换开关时**立即**调用 `AppLogger.setEnabled`，无需重启。
+     */
+    var appLogEnabled: Boolean
+        get() = prefs()?.getBoolean("app_log_enabled", false) ?: false
+        set(v) { prefs()?.edit()?.putBoolean("app_log_enabled", v)?.apply() }
 }

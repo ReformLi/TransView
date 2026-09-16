@@ -1,7 +1,6 @@
 package com.hpu.transview.data.sync
 
 import android.content.Context
-import android.util.Log
 import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.MediaType
 import com.hpu.transview.data.UploadRecordRepository
@@ -10,6 +9,7 @@ import com.hpu.transview.model.UploadState
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.UploadBus
 import com.hpu.transview.storage.StorageFile
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import kotlinx.coroutines.Dispatchers
@@ -241,7 +241,7 @@ class SyncManager private constructor(context: Context) {
         } catch (t: Throwable) {
             // 对账永不抛出：任何异常（含 FileLocations.refresh 失败、DB 异常）都兜底为
             // 「未变更」的结果，保证 sync() 在任何情况下都能正常结束（见类注释「异常兜底」）。
-            Log.w(TAG, "对账过程异常，已兜底结束", t)
+            AppLogger.w(TAG, "对账过程异常，已兜底结束", t)
         }
 
         val result = SyncResult(

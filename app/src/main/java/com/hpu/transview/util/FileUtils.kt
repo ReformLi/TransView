@@ -7,7 +7,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.storage.StorageManager
-import android.util.Log
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.hpu.transview.model.Category
@@ -97,7 +96,7 @@ object FileLocations {
         /** 该卷上的沙盒根（`TransView` 目录） */
         val sandbox: File get() = File(root, SANDBOX_DIR_NAME)
 
-        /** 展示用路径（诊断日志/设置页副标题） */
+        /** 展示用路径（设置页副标题 / 信息卡片） */
         val displayPath: String get() = root.absolutePath
 
         /** 总空间（字节）；取不到返回 0 */
@@ -428,23 +427,23 @@ object FileLocations {
             add(mountPoint, described[id])
         }
 
-        Log.d(TAG, "候选卷根：${candidates.keys.joinToString()}")
+        AppLogger.d(TAG, "候选卷根：${candidates.keys.joinToString()}")
 
         // ——— 逐个写探针：通过才算「可写设备」 ———
         for ((path, hint) in candidates) {
             val dir = File(path)
             if (!dir.isDirectory) {
-                Log.d(TAG, "候选 $path 跳过：不是目录")
+                AppLogger.d(TAG, "候选 $path 跳过：不是目录")
                 continue
             }
             val writable = probeWritable(dir)
-            Log.d(TAG, "候选 $path：canRead=${dir.canRead()} canWrite=${dir.canWrite()} " +
+            AppLogger.d(TAG, "候选 $path：canRead=${dir.canRead()} canWrite=${dir.canWrite()} " +
                 "listFiles=${runCatching { dir.listFiles()?.size }.getOrNull()} 写探针=$writable")
             if (!writable) continue
             val label = if (hint.isNullOrBlank()) "U盘 (${dir.name})" else "$hint (${dir.name})"
             out[dir.absolutePath] = StorageVolume(label, isRemovable = true, root = dir)
         }
-        Log.d(TAG, "可写设备扫描结果：${out.values.joinToString { "${it.label}(${it.id})" }}")
+        AppLogger.d(TAG, "可写设备扫描结果：${out.values.joinToString { "${it.label}(${it.id})" }}")
         return out.values.toList()
     }
 
@@ -463,7 +462,7 @@ object FileLocations {
      * 这是判断「这块盘能不能写」唯一可靠的手段 —— `File.canWrite()` 在部分 ROM 上对可移动卷
      * 恒为 false（传统 `WRITE_EXTERNAL_STORAGE` 不覆盖可移动卷根），实际却能写；
      * 反向的「只读到 `listFiles()` 非空」也不能证明可写。
-     * 探针会在卷根留下一瞬的文件，属沙盒外的一次性例外（与存储诊断日志同一手法）。
+     * 探针会在卷根留下一瞬的文件（建后即删），属沙盒外的一次性例外。
      */
     fun probeWritable(dir: File): Boolean = runCatching {
         if (!dir.isDirectory) return@runCatching false

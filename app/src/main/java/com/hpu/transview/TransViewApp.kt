@@ -7,6 +7,7 @@ import coil.decode.VideoFrameDecoder
 import coil.memory.MemoryCache
 import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.ui.settings.SettingsStore
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.CrashLogger
 import com.hpu.transview.util.FileLocations
 import kotlinx.coroutines.CoroutineScope
@@ -18,6 +19,10 @@ import kotlinx.coroutines.launch
 class TransViewApp : Application(), ImageLoaderFactory {
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    companion object {
+        private const val TAG = "TransViewApp"
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -31,6 +36,11 @@ class TransViewApp : Application(), ImageLoaderFactory {
         // 覆盖边界场景：App 在降级期间被关闭，下次启动时若U盘仍不在位 → 继续降级；
         // U盘已插回 → 状态自动恢复为U盘。此后的插拔由 ServerService 的广播监听接管。
         runCatching { FileLocations.init(this) }
+        // App 调试日志（默认关）：按持久化偏好决定是否启动异步落盘引擎。
+        // 必须放在 FileLocations.init **之后** —— 日志落点 = 活动沙盒的 Downloads/app_log/，
+        // 依赖活动存储状态（U 盘 / 内部存储）已检测完成；否则首次会落到兜底路径。
+        runCatching { AppLogger.setEnabled(SettingsStore.appLogEnabled) }
+        AppLogger.i(TAG, "App 启动：v${BuildConfig.VERSION_NAME}，调试日志=${if (AppLogger.isEnabled) "开" else "关"}")
         // 启动对账（IO 线程，绝不阻塞主线程）；正在同步时 sync() 内部互斥直接返回
         appScope.launch {
             runCatching { SyncManager.getInstance(this@TransViewApp).sync() }

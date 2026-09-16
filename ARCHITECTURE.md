@@ -1,7 +1,22 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.16　日期：2026-09-16
+> 版本：v1.17　日期：2026-09-16
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.17 变更：**「导出存储诊断日志」重构为「App 运行日志本地化」** —— ① 设置 → 存储与数据里原「导出存储诊断日志」
+> 入口**移除**，代之以**「App 调试日志」开关**（默认关，值存 `SettingsStore.appLogEnabled`，切换**立即生效**）。
+> ② 新增 `util/AppLogger.kt` 单例：`d/i/w/e` 在调用线程**只做两件事**——调一次原生 `android.util.Log`（保住
+> logcat，行为与改造前一致）+ 把整行文本 `trySend` 进 `Channel`（容量 4096）后立即返回；**队列满即静默丢弃，
+> 绝不阻塞业务线程，调用点零磁盘 IO**。③ 专用 `CoroutineScope(SupervisorJob() + Dispatchers.IO)` 消费队列，
+> `BufferedWriter`（UTF-8）缓冲写入，**凑满 4KB 或空闲满 1 秒才 flush**（空闲期轻量轮询、不做任何 IO），
+> 严禁每条日志都 flush。④ 落盘 `<活动沙盒>/TransView/Downloads/app_log/<yyyy-MM-dd>/<HH-mm-ss>.log`：
+> **按天分目录、单文件 2MB 切割（`_1`/`_2` 递增）、启动时只保留最近 7 天**；因位于 `Downloads/` 下，
+> 该目录**按 v1.16 的「目录即分类」被当作「其他」分类扫描入库** → **TV 端「其他」页可直接翻看**。
+> ⑤ 兜底：全部内部操作 `runCatching`，磁盘满/权限不足/IO 异常**静默丢弃日志**、绝不冒泡到业务代码；
+> **U 盘拔出写失败 → 关流清缓存 + 重解析落点 + 限流 30 秒触发 `FileLocations.refresh()`**，活动存储自动降级为
+> 内部存储并续写；关开关即取消消费协程（其 `finally` 在 IO 线程 flush/close）、排空内存队列。
+> ⑥ `SyncManager`/`BootReceiver`/`ServerService`/`FileLocations`（`FileUtils.kt`）共 8 处 `android.util.Log.*`
+> 改走 `AppLogger.*`；**`CrashLogger` 刻意不接入**（它运行在未捕获异常路径上，硬约束是不触碰
+> `FileLocations`/Room）。
 > v1.16 变更：**对账扫描改为「目录即分类 + 格式严格过滤」（方案 A）并做性能/内存优化** —— ① `SyncManager` 第 3 步
 > 不再「全量 `listFiles()` 后按扩展名判类型」，改为**按分类目录扫描**：`Movies/` 只收视频（`mediaType=0`）、
 > `Pictures/` 只收图片（`=1`）、`Downloads/` 只收「非视频且非图片」（`=2`），格式不符者**不入库、不展示、
@@ -49,7 +64,8 @@
 > 完全无法读写 U 盘的问题；`media_items.filePath/parentFolder` 兼容存 `content://` 文档 URI（§3.17）。
 > v1.11 变更：**存储诊断日志导出**（设置 → 存储与数据 → 导出存储诊断日志）——一键把「外接盘插了却不出现在存储位置」
 > 的整条判定链路写成 txt（六渠道扫描 + 逐目录写探针 + 沙盒落点检查 + 逐卷排除原因），落盘
-> `TransView/Downloads/storage_diagnosis.txt`（与「其他」分类同路径，对账后可 App 内打开、U 盘模式下可拷出）（§3.16）。
+> `TransView/Downloads/storage_diagnosis.txt`（与「其他」分类同路径，对账后可 App 内打开、U 盘模式下可拷出）。
+> **该功能已于 v1.17 被「App 调试日志」取代，实现文件 `StorageDiagnosis.kt` 已整体删除**（见 §3.19）。
 > v1.10 变更：**播放器交互重做——时间轴优先控制栏（§3.4 全节重写）**——① 控制栏三段结构（内联选择器 → 时间轴 → 按钮行），唤出时焦点落时间轴；② 倍速 / 画面比例改横排胶囊 `SelectorPill` 内联选择器、音轨 / 字幕改右侧滑入 `SettingsPanel`（删除 SpeedDialog / AspectDialog / TrackDialog 与 `anyDialogVisible`）；③ 时间轴可聚焦 + 左右拖动 + 上下换轨 / 边缘同向收起（`focusZone` 纵向轨道状态机）；④ 快进 / 快退反馈升级为缩略图预览卡（`loadThumb`：MediaMetadataRetriever + Mutex 串行 + 10s 分桶缓存 48 帧 + seq 守卫）；⑤ 播完自动连播前先弹下一集预告卡（5 秒倒计时，可立即播放 / 取消）。
 > v1.9 变更：**移除「上传与解压」设置组**——`SettingGroup.UPLOAD` 枚举、设置页 UI、`SettingsStore.autoUnzipZip/keepOriginalZip` 两键全部删除；压缩包解压改为固定行为：视频/图片分类 `.zip` 恒解压（`TransHttpServer` 触发条件去掉开关）、解压成功即删原包（`ZipExtractor` 第 4 步固定，失败路径仍一律保留）；设置页回归五分组（§3.9 / §3.14）。
 > v1.8.1 变更：**死数据治理**——① 僵尸「上传中」记录：进程被杀后 DB 残留的 RUNNING 记录永久卡在「上传中 xx%」，对账新增 0.5 步 `reapZombieRunning()` 统一标失败（仅在服务器未运行或本进程无在途上传时执行，防误伤活记录，§3.8）；② upload_records 表无限增长：insert 后自动裁剪只留最近 500 条（UI 最多显示 200，200 名之外为纯死数据，§3.8）；③ 删除无调用方的死 DAO 方法（MediaItemDao.getById/count、PlaybackHistoryDao.getPositionByPath）；④ 盘点报告：`addedTime`/`updatedTime` 为无读取方的预留字段（保留，成本可忽略）、`UploadStateCode.WAITING` 为无写入方的防御状态（保留 UI 映射）、`fallbackToDestructiveMigration` 发布 v3 起必须换正式迁移。
@@ -97,8 +113,11 @@ com.hpu.transview
 │   ├── NetUtils.kt            本机 IP 探测、存储权限统一入口（StoragePermission，含写探针）
 │   ├── IntentUtils.kt         安全启动 Activity（隐式 Intent 显式化，规避 ROM hook NPE）
 │   ├── QrCode.kt              ZXing 二维码生成
-│   ├── StorageDiagnosis.kt    存储诊断日志导出（六渠道扫描 + 写探针 + 逐卷排除原因，落盘 Downloads/）
-│   ├── CrashLogger.kt         未捕获异常落盘 Downloads/crash_log.txt（v1.13；不吞异常、不二次崩溃、128KB 轮转）
+│   ├── AppLogger.kt           **App 运行日志本地化（v1.17）**：Channel 无锁队列 + IO 协程消费 + BufferedWriter
+│   │                          （满 4KB / 空闲 1 秒 flush）+ 2MB 切割 + 保留 7 天 + U 盘拔出自动降级；
+│   │                          调用点零磁盘 IO、满队即丢、全 runCatching；仍调一次原生 Log 保住 logcat（见 §3.19）
+│   ├── CrashLogger.kt         未捕获异常落盘 Downloads/crash_log.txt（v1.13；不吞异常、不二次崩溃、128KB 轮转。
+│   │                          **刻意不接入 AppLogger** —— 崩溃路径不得触碰 FileLocations/Room）
 │   └── Constants.kt(并入NetUtils) 默认端口 DEFAULT_PORT=2333、预设端口列表 ALLOWED_PORTS、上传路径
 ├── server/                    网络接收层（不依赖 UI）
 │   ├── TransHttpServer.kt     NanoHTTPD：上传页/访问码校验/上传接口；记录入 Room + 计数流回写进度
@@ -358,7 +377,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 2. **同步外部删除**（防"有索引无文件"）：遍历 DB 全部 filePath，物理不存在 → 删记录（播放历史经 CASCADE 级联删除）。
 3. **同步新增/变更**（防"有文件无索引"，v1.16 方案 A「目录即分类」）：按分类目录顺序（**视频 → 图片 → 其他**）扫描，每个目录**只收本分类合法格式**，过滤在 `FileUtils.scanCategoryFiles` 内用 `File.listFiles(FileFilter)` 于**列目录阶段**完成（内存只保留「有效文件 + 全部文件夹」）。入库类型由**目录**决定（`MediaType.fromCategory`），不按扩展名猜；`addedTime` 首插取文件系统 mtime。格式不符的文件**只跳过、不删物理文件**。**增量**：路径已存在且 fileSize/lastModified/parentFolder 未变 → 直接跳过（不提取时长、不写库）；命中即入库（不等全部扫完）；单个目录读不到 → 跳过继续；进度经 `syncState` 推 `Running(step)`。用户 U 盘/电脑拷入的文件与上传文件同路径入库（只写 `media_items`，无上传记录/播放历史，属预期）。
 
-**触发时机**：Application 启动（appScope 协程，崩溃安全）+ 媒体库工具条「刷新」+ U 盘插拔（ServerService 去抖重检后）+ 设置页切换存储/导出诊断日志。对账期间 `syncState: StateFlow<SyncState>`（Idle/Running/SyncComplete）推送进度：`Running(step)` 由媒体库工具条实时显示，终态 `SyncComplete` 触发「扫描完成」短暂提示。`sync()` **永不抛出**（整体 try/catch 兜底）。
+**触发时机**：Application 启动（appScope 协程，崩溃安全）+ 媒体库工具条「刷新」+ U 盘插拔（ServerService 去抖重检后）+ 设置页切换存储。对账期间 `syncState: StateFlow<SyncState>`（Idle/Running/SyncComplete）推送进度：`Running(step)` 由媒体库工具条实时显示，终态 `SyncComplete` 触发「扫描完成」短暂提示。`sync()` **永不抛出**（整体 try/catch 兜底）。
 
 **App 内主动删除约定**（FileUtils + LibraryScreen）：先物理删除（`deletePhysicalFile`，连带清理空父目录）→ 成功后才删数据库记录；物理删除失败（返回 false）只弹 Toast **不删记录**，保证数据库永不出现"有索引无文件"。删除入口：焦点在媒体库文件行（列表/网格）按菜单键或删除键 → 弹窗确认（文件夹不可删）。
 
@@ -585,50 +604,11 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
   不这样做的话，服务器重启后用户永远看不到「请重新输入访问码」。
   （注意 `finishOne` 定义在 `uploadNext` 内部，`probeAuth` 在 IIFE 作用域，须由调用方把收尾回调传进去。）
 
-### 3.16 存储诊断日志导出（v1.11）
+### 3.16 ~~存储诊断日志导出（v1.11）~~（v1.17 已移除）
 
-**要解决的问题**：电视上没有终端、也看不到 logcat；外接 U 盘/SD 卡插着却不出现在「设置 → 存储与数据 → 存储位置」
-里时，用户在电视上**无法自助取证**。这一项把判定链路的全部原始证据写成一个 txt，用文件管理器打开、
-或拷到 U 盘拿到电脑上看。
-
-**落盘位置**：`FileLocations.root(Category.OTHER)` → `TransView/Downloads/storage_diagnosis.txt`。
-刻意与「其他」分类**同路径**：该目录在 `FileUtils.scanCategoryFiles(Category.OTHER)`（对账扫描范围）内，导出后设置页顺手触发
-一次 `SyncManager.sync()`，新文件即被索引进 `media_items` → 「其他」页直接可见可打开；U 盘模式下它天然落在
-U 盘上，**拔下来插电脑就能看**——这正是排障所需的取数通路。
-
-**实现**（`util/StorageDiagnosis.kt`，全程 `Dispatchers.IO`）：`export()` 先 `FileLocations.refresh()` 把存储状态
-刷成最新（用户点这一项的本意就是「现在立刻看」），`mkdirs()` 后用
-`BufferedWriter(OutputStreamWriter(FileOutputStream(file, false), UTF_8))` **逐行覆盖写**（不追加、不先在内存拼全文）；
-各渠道内部异常单独捕获并写进文件，**互不中断**。
-
-日志章节：
-
-| 章节 | 内容 | 回答的问题 |
-|:--|:--|:--|
-| 头部 | 导出时间 / 设备型号 / Android 版本与 API / 包名版本 minSdk targetSdk | 版本前提（minSdk 21 与平台 API 的差异） |
-| 渠道 A | `StorageManager.getStorageVolumes()` 逐卷：uuid、description、`getDirectory()`、反射 `getPath()`、isRemovable、isPrimary、state | 系统视角到底上报了哪些卷 |
-| 渠道 B | `/storage` 逐子目录 `exists/canRead/canWrite`（标注 emulated/self/encrypted）+ **`/proc/mounts` 兜底** | 路径对 App 是否可见、卷挂在哪、什么文件系统 |
-| 渠道 C | `/mnt`、`/mnt/usb`、`/mnt/media_rw` 逐子目录同上 | 原始挂载点（`/mnt/media_rw/XXXX-XXXX` 常为 0700 root-only） |
-| 渠道 D | `getExternalFilesDirs(null)` 各槽位 + 反推卷根 | 零权限方案（`Android/data/<包名>/files`）是否可用 |
-| 渠道 E | `SECONDARY_STORAGE` / `EXTERNAL_STORAGE` / `EMULATED_STORAGE_TARGET` 原始值 | 旧系统（≤6.0）信号 |
-| 写探针 | 每个候选目录创建并删除 `.transview_write_test`，失败带异常类与 `EACCES` 标注 | **路径可见 ≠ 可写**（最常见的卡点） |
-| 沙盒落点 | 各卷根下 `TransView/` 的 exists/canRead/canWrite + mkdirs + 写探针 | App 能否把沙盒建在这块盘上 |
-| 最终结果 | `FileLocations.storageState.volumes`（= 设置页「存储位置」列表）+ 活动/首选存储 + 可用/总量；无外接卷时写「未检测到任何外部存储设备」 | 用户实际能看到什么 |
-| 判定说明 | 逐卷复演 `scanVolumes` 的过滤规则（isPrimary / isRemovable / directory==null / isDirectory / canWrite），写明**被哪一条闸门排除** | 设置页为什么"静默看不见它" |
-
-**两个关键设计点**：
-
-* **渠道 B 的 `/proc/mounts` 兜底不可省**：Android 11+ 起第三方应用**列不出 `/storage` 根目录**
-  （`listFiles()` 返回 null，模拟器 API 36 实测即如此），若渠道 B 在这时 `return`，真机上这一节就是空白。
-  `/proc/mounts` 世界可读，能直接给出 `… /mnt/media_rw/0000-0000 vfat /dev/block/vold/public:253,80`
-  这类证据——「U 盘已被系统挂载、但 App 读不到」的结论就靠它。实现上必须是
-  `if (children == null) { … } else { … }` 结构，**不能提前 return**（初版正是踩了这个坑，日志里整段缺失）。
-* **写探针是沙盒约定的一次性例外**：会对 `/sdcard` 根等沙盒外目录创建一次 `.transview_write_test` 再删除
-  （隐藏文件、写后即删）。不做这一步就无法区分"路径可见"与"路径可写"，而这恰是本功能要回答的核心问题。
-
-**失败路径**：目标目录建不出来 / 卷不可写 → `export()` 抛异常 → 设置页
-`Toast「导出失败：<异常类>: <message>」`；成功则提示**绝对路径**（比固定文案更有用：U 盘模式下路径不是
-`/storage/emulated/0/...`）。
+> 设置 → 存储与数据里的「导出存储诊断日志」入口在 v1.17 被 **「App 调试日志」开关**取代（见 §3.19），
+> 其实现文件 `util/StorageDiagnosis.kt` 已于 v1.17 之后**整体删除**，不再保留任何代码。
+> 本节仅保留编号占位，以免后续 §3.17 / §3.18 / §3.19 的交叉引用错位。
 
 ### 3.17 存储卷发现与纯 File 存储抽象（v1.14）
 
@@ -728,6 +708,116 @@ ExoPlayer 用 `file://` 播放 U 盘视频（MediaCodec 正常解码，无异常
 另：模拟器的第二卷是 FUSE 挂载、`canWrite=true`，而 Vidda 上 `canWrite` 大概率为 false —— 写探针正是为这种情况准备的，
 但目前只在「探针=false 时被正确排除」这一侧得到验证。
 
+### 3.19 App 运行日志本地化（App 调试日志，v1.17）
+
+**要解决的问题**：电视端**没有终端、拿不到 logcat**。`CrashLogger`（§3.18）只覆盖「崩溃」；
+而实际排障中最常见的恰恰是**非崩溃**问题 —— 对账为什么没扫到新文件、服务器为什么没起来、
+上传为什么卡在「上传中」、存储什么时候降级的。这些以前完全没有留下任何证据。
+v1.11 那个「导出存储诊断日志」（已随 v1.17 一并移除、实现文件删除）虽然是本地取证，但**手动、一次性、只针对存储**，覆盖面太窄。
+
+**做法**：`util/AppLogger.kt` 单例，把运行日志**常态化异步落盘**，由设置项「App 调试日志」开关控制。
+
+#### 3.19.1 设置项与交互
+
+* 设置 → 存储与数据 → **App 调试日志**（`focusKey = "存储与数据:3"`，槽位固定为 `:3`；
+  其余三项 `:4/:5/:6`（清空上传记录 / 清空播放历史 / 手动触发对账）的焦点 ID 不受影响）。
+* **默认关**。值持久化在 `SettingsStore.appLogEnabled`（键 `app_log_enabled`）。
+* 开关实现沿用本项目布尔设置项的既有形态：**两项选择弹框（开启 / 关闭）**，而不是 Android 的 `Switch`
+  —— TV 端遥控器上「聚焦 + 确定选值」比「左右拨动 Switch」更稳（也避免引入新的焦点节点）。
+* 行内副标题（`SettingRow` 新增可选参数 `subtitle`）：「记录调试日志（仅供排查问题，长期开启可能影响性能）」。
+* 开关下方一行**不可聚焦**的小字提示（`LogPathHint`），写明**当前**日志位置与查看路径：
+  - `日志文件位置：内部存储/TransView/Downloads/app_log/（按日期分目录，文件名即写入时刻）`
+  - `查看方式：媒体库「其他」页 → TransView/Downloads/app_log → 当天日期目录 → 打开 .log 文件`
+  - 活动存储是 U 盘时自动换成 `U 盘（<盘名>）/TransView/Downloads/app_log/`（`AppLogger.logDirLabel()`）。
+* **立即生效**：切换时同步调用 `AppLogger.setEnabled(on)`，无需重启。
+  `TransViewApp.onCreate` 在 `FileLocations.init` **之后**按偏好启动一次（落点依赖活动存储已检测完成）。
+
+#### 3.19.2 落盘结构
+
+```
+<活动沙盒>/TransView/Downloads/app_log/       ← 活动存储 = 首选卷可用则首选卷，否则内部存储
+    ├── 2026-09-16/                            ← 按天分目录（yyyy-MM-dd）
+    │     ├── 14-30-05.log                     ← 会话首个文件，文件名 = 会话启动时刻（HH-mm-ss）
+    │     ├── 14-30-05_1.log                   ← 单文件写满 2MB → 同日目录下按序号新建
+    │     └── 14-30-05_2.log
+    └── 2026-09-15/                            ← 超过 7 天的日期目录在引擎启动时被清理
+```
+
+* 根目录 = `FileLocations.root(Category.OTHER)` + `app_log`，即**始终跟随活动存储**。
+* **与对账的联动（关键）**：`app_log/` 位于 `Downloads/` 之下，v1.16 起对账严格「目录即分类」
+  （见 §3.8 / README §3.3.7）—— `.log` 既非视频也非图片 → 归入 **「其他」分类**入库。
+  于是 **TV 端「其他」页能直接看到 `app_log` 文件夹并可逐级点进去打开日志**，
+  完全不需要电脑或 adb（这正是「本地化」的意义）。U 盘模式下日志天然落在 U 盘，也可拔下来插电脑看。
+
+#### 3.19.3 防卡顿：调用点零磁盘 IO（核心设计）
+
+```kotlin
+// 调用线程只做两件事，绝不碰磁盘、绝不阻塞
+AppLogger.i(TAG, "…")
+  ├─ ① android.util.Log.i(TAG, "…")          // 原生 Log 恒输出 → logcat 行为与改造前一致
+  └─ ② queue.trySend("时戳 级别/TAG: 内容")   // Channel(4096) 无锁队列；**满则丢弃，直接返回**
+
+// 专用 IO 协程消费
+CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  └─ while (isActive) {
+        取一条 → BufferedWriter 写入（UTF-8）
+        满 4KB 或距上次 flush ≥ 1 秒 → flush
+        队列空 → 到点 flush 后 delay(120ms)   // 空闲期不做任何 IO
+     } finally { flush + close }              // 关开关被取消时，在 IO 线程安全收尾
+```
+
+* **严禁每条都 flush**：靠 `BufferedWriter` + 「满 4KB / 空闲 1 秒」两个阈值，电视端存储 IO 不会被日志打满。
+* **为什么空闲时用 `delay` 轮询而不是 `withTimeoutOrNull { queue.receive() }`**：`Channel.receive()`
+  在超时取消时**存在丢元素**的语义风险（官方建议用 `select`）。这里选择 120ms 轻量轮询 ——
+  开销可忽略（不做任何 IO），却完全没有丢元素的可能。
+* **队列满 = 静默丢弃，绝不回压**：这是**故意**的取舍 —— 日志价值远低于业务可用性，
+  宁可丢日志也不能让上传 / 对账 / 播放因为写日志而变慢。
+
+#### 3.19.4 切割与历史清理（防无限增长）
+
+* **单文件上限 2MB**（电视端文本文件过大，读取/渲染都会卡）：写满立即 `flush+close`，
+  同日目录下按 **`<base>_1.log` / `<base>_2.log`** 递增新建（`<base>` = 会话启动的 `HH-mm-ss`），
+  **绝不允许单文件无限追加**。序号选择会跳过已达上限的同名文件，并有 `MAX_SEQ=999` 防御性上限。
+* **只保留最近 7 天**的日期目录，更早的物理删除。**双重保险确保不误删**：
+  ① 目录名必须严格匹配正则 `\d{4}-\d{2}-\d{2}`（`app_log/` 下的其他东西一律不碰）；
+  ② 必须通过 `FileLocations.isInsideSandbox` 断言（沙盒外一律不删）。
+  由于 `yyyy-MM-dd` 是定长字典序 == 时间序，按目录名倒排 `drop(7)` 即可，**不需要解析日期**。
+  清理范围**仅限 `app_log/` 下的旧日期目录**，绝不影响 `Downloads/` 下的其他文件。
+
+#### 3.19.5 异常兜底与边界
+
+| 场景 | 行为 |
+|:--|:--|
+| 磁盘满 / 权限不足 / 任何 IO 异常 | 全部 `runCatching` + 本类**内部只用原生 `Log`** 记录，**静默丢弃日志**，异常绝不冒泡到业务代码 |
+| **U 盘拔出**（活动存储是 U 盘） | 写失败 → `close()` + 清空缓存的落点 → **下一行重新解析落点**；并（**限流 30 秒**）触发一次 `FileLocations.refresh()`，活动存储自动降级为内部存储 → 日志无缝续写到内部沙盒。**绝不因拔 U 盘而中断或崩溃** |
+| 活动存储状态尚未刷新 | `fallbackBaseDir()` 兜底为 `<内部存储>/TransView/Downloads/app_log/`（`Environment` 硬拼，不依赖 `FileLocations`） |
+| 关开关 | 取消消费协程（`finally` 在 IO 线程 flush/close 文件流）+ **排空内存队列**（纯内存操作，可在调用线程直接做，不违反「不在调用点做 IO」） |
+| 中文日志 | 写盘强制 `Charsets.UTF_8`，不乱码 |
+| 日志体积统计 | 用 `utf8Len()` 逐字符估算字节数（不分配临时数组），2MB 判断对中文日志同样准确 |
+
+#### 3.19.6 全局替换与两处刻意的例外
+
+`android.util.Log.*` → `AppLogger.*` 共 **8 处 / 4 个文件**：
+
+| 文件 | 处数 | 说明 |
+|:--|:--|:--|
+| `util/FileUtils.kt`（`FileLocations`） | 4 | `getWritableDevices` 的候选卷根 / 写探针结果（`TAG = StorageDebug`）；改后 `adb logcat -s StorageDebug` **照旧可用** |
+| `service/BootReceiver.kt` | 2 | 开机自启拉起前台服务 / 启动失败 |
+| `service/ServerService.kt` | 1 | `startForeground` 失败 |
+| `data/sync/SyncManager.kt` | 1 | 对账异常兜底结束 |
+
+**刻意的例外（不得改）**：
+
+* **`CrashLogger`（§3.18）继续直接用 `android.util.Log`**。它运行在「未捕获异常」路径上，硬约束是
+  **不触碰 `FileLocations` / Room**（那可能正是崩溃源头）。接入 `AppLogger` 会经
+  `FileLocations.root(Category.OTHER)` 解析落点 → 引入对崩溃源头的依赖，属于**把兜底改脆**。
+* **`AppLogger` 自身内部失败不走队列**，只用原生 `Log`：否则「写盘失败 → 记日志 → 再写盘失败」会自激。
+
+> **死锁/递归安全说明**：`AppLogger` 与 `FileLocations` 之间存在双向引用
+> （`AppLogger` 解析落点读 `FileLocations`；`FileLocations` 的扫描日志走 `AppLogger`），
+> 但**不会死锁也不会无限递归** —— 因为 `AppLogger.d/i/w/e` 在调用线程**只 `trySend`（无锁、不等待消费者）**，
+> 写失败触发的 `FileLocations.refresh()` 又有 30 秒限流，且只发生在消费侧。
+
 ## 4. 构建与运行
 
 ```bash
@@ -749,3 +839,4 @@ ExoPlayer 用 `file://` 播放 U 盘视频（MediaCodec 正常解码，无异常
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）
 - [x] ~~U 盘上「其他」文件无法打开（`FileProvider` 路径未覆盖可移动卷）~~（v1.15 已完成，见 §3.17）
 - [x] ~~对账扫描改为「目录即分类 + 格式严格过滤」并做扫描性能/内存优化~~（v1.16 已完成，见 §3.3.7）
+- [x] ~~「导出存储诊断日志」重构为「App 运行日志本地化」（App 调试日志开关，默认关）~~（v1.17 已完成，见 §3.19）

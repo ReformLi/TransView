@@ -3,8 +3,8 @@ package com.hpu.transview.service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 import com.hpu.transview.ui.settings.SettingsStore
+import com.hpu.transview.util.AppLogger
 
 /**
  * 开机自启（设置 → 服务器与网络 → 开机自启）。
@@ -28,9 +28,9 @@ class BootReceiver : BroadcastReceiver() {
         // Application.onCreate 已初始化过，这里再调一次是幂等保护（进程可能由广播直接拉起）
         SettingsStore.init(context)
         if (!SettingsStore.bootAutostart) return
-        Log.i(TAG, "开机自启已开启，拉起文件服务器前台服务")
+        AppLogger.i(TAG, "开机自启已开启，拉起文件服务器前台服务")
         runCatching { ServerService.start(context) }
-            .onFailure { Log.w(TAG, "开机自启启动前台服务失败（系统限制？）：${it.message}") }
+            .onFailure { AppLogger.w(TAG, "开机自启启动前台服务失败（系统限制？）：${it.message}") }
     }
 
     private companion object {

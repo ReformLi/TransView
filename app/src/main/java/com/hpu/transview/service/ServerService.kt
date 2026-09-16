@@ -13,7 +13,6 @@ import android.content.pm.ServiceInfo
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.hpu.transview.MainActivity
 import com.hpu.transview.R
@@ -21,6 +20,7 @@ import com.hpu.transview.data.sync.SyncManager
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -199,7 +199,7 @@ class ServerService : Service() {
         }
         true
     } catch (t: Throwable) {
-        Log.e(TAG, "startForeground 失败，前台服务无法建立，主动停止", t)
+        AppLogger.e(TAG, "startForeground 失败，前台服务无法建立，主动停止", t)
         false
     }
 
