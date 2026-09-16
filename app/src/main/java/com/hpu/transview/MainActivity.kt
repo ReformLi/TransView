@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
@@ -30,7 +31,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // App 恒定深色主题：系统栏固定「深色样式」（浅色前景图标）。默认 auto 跟随系统深浅模式，
+        // 手机系统浅色时状态栏图标是深色，压在 App 近黑背景上看不清（时间/电量）——
+        // TV 无状态栏不受影响，手机上实测过（用户反馈「顶部导航栏背景变黑、看不清」）。
+        // scrim 透明：状态栏/导航栏区域透出 App 背景色（#0E1116），不叠系统灰底。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         ServerService.start(this)
         setContent {
             TransViewTheme {

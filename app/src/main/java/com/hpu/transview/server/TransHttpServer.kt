@@ -25,7 +25,9 @@ import org.json.JSONObject
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.OutputStream
+import java.net.Socket
 import java.util.concurrent.atomic.AtomicLong
 
 /** 上传网页模板里的设备名占位符（assets/web/index.html） */
@@ -69,6 +71,17 @@ class TransHttpServer(
     /** 电视端 Toast 需要主线程 Looper */
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * 「当前连接的输入流计数器」。**必须由计数流在 read 时绑到「正在读它的线程」**，
+     * 不能在 [createClientHandler] 里 set —— createClientHandler 跑在 ServerRunnable 的
+     * 接收连接线程上，而 handleUpload 跑在 asyncRunner 线程池的工作线程上（NanoHTTPD 2.3.1
+     * 实测源码：`asyncRunner.exec(createClientHandler(...))`），两者不是同一个线程，
+     * 在 createClientHandler 里 set 的话 handleUpload 里 get 恒为 null → 进度监视器直接
+     * 跳过 → 进度恒 0%。流 read 只发生在该连接的工作线程上，由 read 绑定天然对齐；
+     * 线程池复用也安全：下一条连接的流一 read 就会覆盖旧值。
+     */
+    private val inputCounterThreadLocal = ThreadLocal<AtomicLong>()
+
     init {
         // 临时文件放在应用外部私有目录，与 /sdcard 同卷，移动零拷贝
         val tempDir = File(
@@ -107,6 +120,21 @@ class TransHttpServer(
                 Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Server Error: ${e.message}"
             )
         }
+    }
+
+    /**
+     * 包装每个连接的套接字输入流，累计「已读字节数」，这是获得真实上传进度的唯一可靠挂接点。
+     *
+     * 为什么必须在这里计数：NanoHTTPD 2.3.1 在 `parseBody` 阶段先把**整个请求体**读进内存 /
+     * 暂存临时文件，再在 `decodeMultipartFormData → saveTmpFile` 里用
+     * `new FileOutputStream(tempFile.getName())` 按**文件名**直接写盘——文件 part 从不经过
+     * `TempFile.open()` 返回的流，故原先挂在 TempFile 上的 `bytesWritten` 计数器恒为 0，进度永远是 0%。
+     * 只有从「输入流」这一层计数才准（请求头字节相对文件体可忽略）。
+     */
+    override fun createClientHandler(socket: Socket, inputStream: InputStream): ClientHandler {
+        // 不在这里 set ThreadLocal：本方法跑在「接收连接线程」，handleUpload 在「工作线程」，
+        // 跨线程取不到。绑定改由 CountingInputStream 在 read 时完成（见字段注释）。
+        return ClientHandler(CountingInputStream(inputStream), socket)
     }
 
     /**
@@ -207,8 +235,13 @@ class TransHttpServer(
         }
         val busId = UploadBus.start(displayName, contentLength)
 
-        // 2. 进度监视：计数流字节数 / Content-Length → 回写百分比（节流）
-        val monitorJob = startProgressMonitor(recordId, contentLength)
+        // 2. 进度监视：已接收字节数 / Content-Length → 回写百分比（节流）。
+        //    计数来自「套接字输入流」包装（见 createClientHandler）——NanoHTTPD 2.3.1 把文件 part
+        //    按文件名直接写盘，不经过 TempFile.open() 的流，故挂在那里的字节计数恒为 0。
+        //    此处把计数器清零，保证 keep-alive 同连接多文件依次上传互不干扰。
+        val counter = inputCounterThreadLocal.get()
+        counter?.set(0)
+        val monitorJob = startProgressMonitor(recordId, contentLength, counter)
 
         // 3. 接收 → 落盘 → 收尾。**必须兜底**：手机端「取消上传」= abort 连接，会让
         //    parseBody 抛出 ResponseException 之外的异常（IO 中断）；不在这里收尾的话，
@@ -355,18 +388,19 @@ class TransHttpServer(
         UploadBus.finish(busId, state == UploadStateCode.SUCCESS)
     }
 
-    /** 轮询当前请求计数流的已写字节数，换算百分比回写 DB（600ms 节流，仅百分比变化时写）。
+    /** 轮询「已接收字节数」换算百分比回写 DB（600ms 节流，仅百分比变化时写）。
+     *  [counter] 来自套接字输入流的计数包装（见 [createClientHandler]）；为 null 或 contentLength<=0
+     *  时直接跳过中间进度，仅由收尾的 [finishRecord] 置 100%（与改造前一致）。
      *  用 updateProgressIfRunning：与收尾的 updateState 走不同协程，落库顺序不保证，
      *  无条件写会把已写入的「成功 100%」覆盖回「上传中 99%」，该记录将永远卡在上传中 */
-    private fun startProgressMonitor(recordId: Long, contentLength: Long): Job {
-        if (contentLength <= 0) return Job().also { it.complete() }
-        val manager = ExternalTempFileManager.current.get() ?: return Job().also { it.complete() }
+    private fun startProgressMonitor(recordId: Long, contentLength: Long, counter: AtomicLong?): Job {
+        if (contentLength <= 0 || counter == null) return Job().also { it.complete() }
         return bgScope.launch {
             var lastPct = -1
             while (isActive) {
                 delay(600)
-                val written = manager.bytesWritten.get()
-                val pct = ((written * 100) / contentLength).toInt().coerceIn(0, 99)
+                val received = counter.get()
+                val pct = ((received * 100) / contentLength).toInt().coerceIn(0, 99)
                 if (pct != lastPct) {
                     lastPct = pct
                     runCatching { uploadRecords.updateProgressIfRunning(recordId, pct) }
@@ -407,63 +441,60 @@ class TransHttpServer(
     }
 
     /** 把上传临时文件放到指定目录（外部存储），代替默认的系统临时目录。
-     *  计数流：写入字节数累加到 bytesWritten，供进度监视换算百分比。 */
+     *  进度计数已改到「套接字输入流」一层（见 [createClientHandler]）：NanoHTTPD 2.3.1 把文件 part
+     *  按文件名直接写盘，不经过 open() 返回的流，TempFile 内部做字节计数毫无意义，这里只提供落盘位置。 */
     private class ExternalTempFileManager(private val dir: File) : NanoHTTPD.TempFileManager {
-
-        companion object {
-            /** NanoHTTPD 每个会话在固定工作线程上处理，tempFileManager 创建与 handleUpload 同线程，
-             *  用 ThreadLocal 把"当前会话的计数器"递给 handleUpload */
-            val current = ThreadLocal<ExternalTempFileManager?>()
-        }
-
-        val bytesWritten = AtomicLong(0)
         private val created = mutableListOf<File>()
-
-        init {
-            current.set(this)
-        }
-
+        init { dir.mkdirs() }
         override fun createTempFile(filename: String?): NanoHTTPD.TempFile {
             val safe = (filename ?: "").replace(Regex("[^\\w.-]"), "_").takeLast(40)
             val file = File(dir, "upload_${System.nanoTime()}_$safe.tmp")
             created += file
             return object : NanoHTTPD.TempFile {
-                private var stream: CountingOutputStream? = null
+                private var stream: OutputStream? = null
                 override fun delete() { runCatching { stream?.close() }; file.delete() }
                 override fun getName(): String = file.absolutePath
                 override fun open(): OutputStream {
                     if (stream == null) {
-                        stream = CountingOutputStream(
-                            BufferedOutputStream(FileOutputStream(file), 128 * 1024), bytesWritten
-                        )
+                        stream = BufferedOutputStream(FileOutputStream(file), 128 * 1024)
                     }
                     return stream!!
                 }
             }
         }
-
         override fun clear() {
             created.forEach { it.delete() }
             created.clear()
         }
     }
 
-    /** 字节计数输出流 */
-    private class CountingOutputStream(
-        private val delegate: OutputStream,
-        private val counter: AtomicLong
-    ) : OutputStream() {
-        override fun write(b: Int) {
-            delegate.write(b)
-            counter.incrementAndGet()
+    /** 字节计数输入流：每 read 一字节 / 一块就累加到 [counter]，用于上报真实上传进度。
+     *  每次读取都把计数器绑到「当前正在读它的线程」（[inputCounterThreadLocal]）——
+     *  这是对齐线程的关键：handleUpload 与流读取必在同一工作线程上（keep-alive 循环内），
+     *  而 createClientHandler 跑在另一个线程上，靠它绑定永远对不上。inner 类：要写外部的 ThreadLocal。 */
+    private inner class CountingInputStream(
+        private val delegate: InputStream
+    ) : InputStream() {
+        private val counter = AtomicLong(0)
+
+        private fun bindToCurrentThread() {
+            inputCounterThreadLocal.set(counter)
         }
 
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            delegate.write(b, off, len)
-            counter.addAndGet(len.toLong())
+        override fun read(): Int {
+            bindToCurrentThread()
+            val b = delegate.read()
+            if (b >= 0) counter.incrementAndGet()
+            return b
         }
-
-        override fun flush() { delegate.flush() }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            bindToCurrentThread()
+            val n = delegate.read(b, off, len)
+            if (n > 0) counter.addAndGet(n.toLong())
+            return n
+        }
+        override fun available(): Int = delegate.available()
+        override fun skip(n: Long): Long = delegate.skip(n)
         override fun close() { delegate.close() }
     }
 }

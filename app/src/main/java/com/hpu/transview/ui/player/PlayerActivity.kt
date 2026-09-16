@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -333,7 +334,13 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // App 恒定深色主题：系统栏固定「深色样式」（浅色前景图标）。默认 auto 跟随系统深浅模式，
+        // 手机系统浅色时状态栏图标是深色，压在 App 近黑背景上看不清（时间/电量）。
+        // scrim 透明：状态栏/导航栏区域透出 App 背景色，不叠系统灰底。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         SettingsStore.init(this) // 读取设置页「播放设置」四项（App 启动时已 init，这里兜底）
 

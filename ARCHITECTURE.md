@@ -1,7 +1,12 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.22　日期：2026-09-16
+> 版本：v1.25　日期：2026-09-16
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.25 变更：**手机端系统栏图标固定为浅色**——修「手机上顶部状态栏背景变黑、时间/电量看不清」。三个 Activity 的裸 `enableEdgeToEdge()` 默认 `auto` 样式跟随系统深浅模式：手机系统浅色时状态栏图标为深色，压在 App 画满全屏的恒定深色背景（#0E1116）上看不清。改为显式 `SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)`（状态栏 + 导航栏）：固定浅色图标、透明 scrim。注意 `dark(scrim)` 参数是必填 `@ColorInt Int` 且无默认值；ImageViewer/Player 已导入 Compose `Color`（无 `TRANSPARENT` 常量），统一全限定写法避免导入冲突。**TV 无状态栏不受影响。**
+> v1.24 变更：**上传进度修复补全（计数器跨线程绑定）**——v1.23 把计数挪到套接字输入流后真机仍恒为 0%。根因：NanoHTTPD 2.3.1 的 ServerRunnable（**接收连接线程**）调用 `asyncRunner.exec(createClientHandler(...))`，在 `createClientHandler` 里 `ThreadLocal.set(counter)` 设到了 accept 线程；`handleUpload` 跑在 `asyncRunner` 线程池的**工作线程**上，`ThreadLocal.get()` 恒为 null → 进度监视器（`counter == null` 提前返回）从未启动。修法：绑定改由 `CountingInputStream` 在**每次 `read()` 时**把自己的计数器绑到当前线程——流读取只发生在该连接的工作线程上（keep-alive 循环内），天然与 `handleUpload` 同线程；线程池复用安全（下一条连接的流一 read 即覆盖旧值）。计数流改为 `inner class` 以访问外部 ThreadLocal。
+> v1.23 变更：**上传进度不再恒为 0%**——修「客户端进度正常，但 TV 端上传页进度一直停在 0%、成功才跳 100%」。根因：进度原由挂在 `TempFile.open()` 返回流上的 `bytesWritten` 计数器驱动，但 NanoHTTPD 2.3.1 在 `parseBody` 阶段先把**整个请求体**读进内存/暂存文件，再于 `decodeMultipartFormData → saveTmpFile` 用 `new FileOutputStream(tempFile.getName())` **按文件名直接写盘**——文件 part 从不经过 `open()` 返回的流，故计数器恒为 0。修法：改为在**套接字输入流**层计数——重写 `createClientHandler`，把连接输入流包成 `CountingInputStream`（每 read 一字节即累加），共享一个 `AtomicLong`；`handleUpload` 在每个请求开始时清零（keep-alive 同连接多文件依次上传互不干扰），进度监视器改用「已接收字节 / Content-Length」回写百分比。客户端进度（XHR `upload.onprogress`）本就正常，未改动。
+> v1.22 变更：**设置页选项弹框可滚动**——修「设备名称等候选较多的弹框超出屏幕、下方选项看不到」。修法：弹框 `Column` 加 `verticalScroll` + `heightIn(max = 可用高度 * 0.8)`。
+> v1.21 变更：**设置页焦点兜底锚点化 + 分组末行补齐 ↓ 拦截**——修「点空白处 / 划动右栏后焦点跳到『服务器与网络』」。修法：① 新增 `lastContentAnchor`，触摸票据兜底改为锚回最后聚焦节点；② `SettingRow` 加 `bottomEdge`，四组末行置 `true`（见 §3.1.5 / §3.22）。
 > v1.20 变更：**设置页两栏可滚动（矮屏兜底）**——修「手机横屏下设置页滑动不了：左侧末项『关于』看不到；选中『存储与数据』后右侧只能看到『存储空间占用』为止」。根因：设置页左右两栏都是**固定高度布局**（左栏 `Arrangement.Center`、右栏只有「关于」那一组的卡片内部挂了 `verticalScroll`），内容高于可视区时**既裁切又不可滚动** —— 矮屏内容区仅约 370 逻辑 dp，而左栏「设置」标题 + 5 个分组约 366dp、右栏「存储与数据」7 行设置 + 小字提示 + 信息条目远超一屏（居中布局溢出时上下同时被切）。修法：① 左栏 `width(280.dp).fillMaxHeight().verticalScroll(leftScrollState)`；② 右栏 `weight(1f).fillMaxHeight().verticalScroll(detailScrollState)`，滚动状态按分组重建（`remember(selectedGroupIndex) { ScrollState(0) }`）→ 切换分组自动回到顶部；③ 「关于」卡片去掉 `weight(1f)`，改贴内容高度（长内容散在整栏滚动里，滚到底能看到完整圆角底边）。**关键点**：`verticalScroll` 只把 `maxHeight` 放开为 `Infinity`，**`minHeight` 会沿传入约束原样下推**给内层 Column —— 于是「内容装得下就居中（`fillMaxHeight` 提供的 min 高度 + `Arrangement.Center`）、装不下就滚动」两者同时成立，**电视 / 平板内容不超出视口，显示逐像素不变**。触摸可直接拖动；遥控器焦点移到被遮挡的行时由滚动容器的 bring-into-view 自动滚入视野（与「关于」组原有行为一致）。（见 §3.9 / §3.21）
 > v1.19 变更：**矮屏（手机横屏）内容区整体等比缩放**——修「除顶部标签栏外，各页面字体与间距偏大、一屏装不下几条、看着散」（上传页访问码色块占比大、记录行只能显示约 4 条、「清空所有记录」突兀；媒体库 / 设置页尤其明显）。根因：页面内部按**电视大屏尺度**书写绝对尺寸（正文 16sp、访问码 24sp、图标 40dp、设置行 padding 16dp、网格间距 18dp）——同一批尺寸在 1080dp 高的电视上占屏高 6%，在 360dp 高的手机横屏上要占 18%。修法：新增 `ui/common/CompactUi.kt`，① `COMPACT_SCREEN_HEIGHT_DP = 480` 作为**唯一阈值**（顶部栏 / 上传页左面板 / 内容区缩放共用）；② `CompactContentDensity` 在**内容区**外层覆盖 `LocalDensity`（density × 0.87）——内容区所有 dp/sp **同步等比**缩小，字号与间距/图标/卡片的比例关系不变（「整块 UI 变小」而非「字变小、留白照旧」）；**顶部导航栏在覆盖之外**，保持用户认可的尺寸；③ `rememberContentWidthDp()` 给出缩放后的**实际**逻辑宽度 —— 媒体库的屏宽收敛值改用实际值，否则配置值 800dp 算得 5 列会把用户设置的「6 列」误压成 5 列（实际可用 919dp 本就能容纳 6 列）；④ 顺带把媒体库焦点边界由 `gridColumns` 改为与 `GridCells.Fixed` 同源的 `effectiveColumns`（原先两者在手机横屏列数收敛时不相等，会错位）。主体文字 16sp → 约 13.9sp，与紧凑顶部栏 `labelLarge`(14sp) 齐平。**TV / 平板与两个独立 Activity（播放器 / 图片查看器）逐像素不变。**（见 §3.1 / §3.20）
 > v1.18 变更：**上传页矮屏（手机横屏）紧凑模式** —— 修「手机横屏下左面板二维码被压没、地址被 Ellipsis 截断」。
@@ -994,6 +999,8 @@ v1.19 起统一为 `effectiveColumns`（与 `GridCells.Fixed` 同源）。
 - [x] ~~手机横屏下内容区字体/间距偏大（内容区整体等比缩放 + 媒体库列数收敛）~~（v1.19 已完成，见 §3.20）
 - [x] ~~矮屏（手机横屏）设置页内容被裁切且无法滑动（左栏看不到「关于」、右栏只能看到「存储空间占用」）~~（v1.20 已完成，见 §3.21）
 - [x] ~~设置页点空白 / 划动右栏后焦点莫名跳到「服务器与网络」（触摸票据兜底硬编码首个分组 + `SettingRow` 漏拦截分组末行 ↓）~~（v1.21 已完成，见 §3.22）
+- [x] ~~矮屏（手机横屏）设置页选项弹框（如设备名称）超出屏幕、看不到也够不到~~（v1.22 已完成：选项列表 `verticalScroll` + 高度上限）
+- [x] ~~TV 端上传进度一直停在 0%、成功后才变 100%~~（v1.23：NanoHTTPD 2.3.1 把文件 part 按文件名直接写盘、不经过 `TempFile.open()` 的流，原计数恒为 0；改为在**套接字输入流**层用 `CountingInputStream` 计数。v1.24 补全：计数器原在 `createClientHandler`（accept 线程）里绑 ThreadLocal，工作线程读不到，改为由计数流在 read 时绑定当前线程，见 §3.23）
 - [ ] 断点续传（需求 4.4 P2）
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）
 - [x] ~~U 盘上「其他」文件无法打开（`FileProvider` 路径未覆盖可移动卷）~~（v1.15 已完成，见 §3.17）
