@@ -60,6 +60,10 @@ class MediaRepository(context: Context) {
 
     /**
      * 插入或更新（以 filePath 唯一索引为准）：物理文件的信息以调用方扫描结果为准整体覆盖。
+     *
+     * [addedTime] 仅在**首次插入**时采用（更新时保留原值，排序稳定不跳）：
+     * 对账扫描传**文件系统的 lastModified**，使「按时间排序」对「手动拷入沙盒」的文件也成立
+     * （这类文件没有上传时间可用）。
      * @return 数据库 id
      */
     suspend fun upsert(
@@ -69,7 +73,8 @@ class MediaRepository(context: Context) {
         parentFolder: String,
         fileSize: Long,
         lastModified: Long,
-        duration: Long
+        duration: Long,
+        addedTime: Long = System.currentTimeMillis()
     ): Long = withContext(Dispatchers.IO) {
         val existing = dao.getByPath(filePath)
         val now = System.currentTimeMillis()
@@ -82,7 +87,8 @@ class MediaRepository(context: Context) {
             fileSize = fileSize,
             lastModified = lastModified,
             duration = if (duration > 0) duration else existing?.duration ?: 0L,
-            addedTime = existing?.addedTime ?: now
+            // 更新保留原 addedTime；首插用调用方传入的 addedTime（对账=文件系统 mtime），缺省=当前时间
+            addedTime = existing?.addedTime ?: addedTime.let { if (it > 0) it else now }
         )
         if (existing == null) {
             dao.insert(entity)

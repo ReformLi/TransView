@@ -1,7 +1,19 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.15　日期：2026-09-16
+> 版本：v1.16　日期：2026-09-16
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.16 变更：**对账扫描改为「目录即分类 + 格式严格过滤」（方案 A）并做性能/内存优化** —— ① `SyncManager` 第 3 步
+> 不再「全量 `listFiles()` 后按扩展名判类型」，改为**按分类目录扫描**：`Movies/` 只收视频（`mediaType=0`）、
+> `Pictures/` 只收图片（`=1`）、`Downloads/` 只收「非视频且非图片」（`=2`），格式不符者**不入库、不展示、
+> 绝不删物理文件**；入库类型由**目录**决定（`MediaType.fromCategory`）而非文件扩展名。② 格式判定统一走
+> `isValidFormatForCategory`（复用既有扩展名工具），并用 **`File.listFiles(FileFilter)` 在列目录阶段完成过滤**，
+> 内存只保留「有效文件 + 全部文件夹」，十万级无关文件不再被构造成数组。③ 扫描顺序 **视频 → 图片 → 其他**
+> （媒体库先出内容，「其他」不提取时长），**命中即入库**（边扫边看，不等全部扫完）。④ 进度经 `syncState`
+> 推送（`Running(step)`，如「正在扫描：Movies/电视剧（12 项）」），完成后推 `SyncComplete`；媒体库工具条
+> 实时显示进度并短暂提示「扫描完成」。⑤ 单个目录读不到（权限/拔盘）→ 跳过该目录继续；`sync()` 整体兜底，
+> **任何异常都能正常结束**（绝不冒泡）。⑥ 新增 `hasValidContentIn`：文件夹内（递归）没有任何本分类合法文件时
+> **不生成文件夹卡片**（如 `Movies/某某/` 全是 .txt；物理目录保留不删）。⑦ `addedTime` 首插改用**文件系统
+> lastModified**，使「按时间排序」对手动拷入的文件也成立。**防误删不变式与降级跳过逻辑完全不变。**
 > v1.15 变更：**修复 U 盘上「其他」文件无法打开（FileProvider 路径未覆盖可移动卷）**——「其他」分类文件经
 > `FileUtils.openExternal()` → `FileProvider.getUriForFile()` 交给系统应用打开，而 `res/xml/file_paths.xml` 原先只声明
 > `<external-path name="external_storage" path="." />`（仅对应内部共享存储 `/storage/emulated/0`），**不含可移动卷**，
@@ -335,7 +347,7 @@ com.hpu.transview
 | playback_history | mediaItemId / position / updatedTime* | **外键 → media_items，ON DELETE CASCADE** |
 | upload_records | fileName / fileSize / progress / state(0等待/1上传中/2成功/3失败) / category / time | 纯历史日志，删除不触碰物理文件；**自动防死数据**：insert 后裁剪只留最近 500 条（UI 最多显示 200） |
 
-\* `addedTime`/`updatedTime` 目前无业务读取方（排序用文件系统 mtime），作为审计/预留字段保留，成本可忽略。
+\* `addedTime` 无业务读取方（排序用 `lastModified`），作为审计字段保留；v1.16 起对账首插写入**文件系统 mtime**（手动拷入的文件也有合理时间）。`updatedTime` 仍为预留。
 
 DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访问 Room 的唯一通道；`PlaybackRepository` 对外保持 path 键调用面，内部桥接外键并在保存进度时自动补建缺失索引。
 
@@ -344,15 +356,15 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 0.5. **清扫僵尸「上传中」记录**（`UploadRecordRepository.reapZombieRunning`）：进程被杀 / 断电时请求线程的兜底收尾没机会执行，DB 会残留永远停在「上传中 xx%」的死记录，统一标失败。**仅在服务器未运行或本进程无在途上传时执行**（`ServerBus.running` + `UploadBus` RUNNING 判定）——手动对账可能撞上活的上传记录，那是活数据不能动；App 启动对账时服务器必然尚未启动，僵尸必被清扫。
 1. **清理空文件夹**：沙盒内三个分类根目录递归扫描，物理删除空文件夹——子删父空继续向上递归（分类根受 `FileLocations.isRoot` 保护永不删除；入口处 `isInsideSandbox` 断言，越界直接拒绝）。
 2. **同步外部删除**（防"有索引无文件"）：遍历 DB 全部 filePath，物理不存在 → 删记录（播放历史经 CASCADE 级联删除）。
-3. **同步新增/变更**（防"有文件无索引"）：递归收集**沙盒内**物理文件（用户 U 盘拷入的文件同样入库，属预期行为）→ 无记录的入库（视频时长 MediaMetadataRetriever 提取 + 进程内 ConcurrentHashMap 缓存）；有记录但 fileSize/lastModified 变化的更新。
+3. **同步新增/变更**（防"有文件无索引"，v1.16 方案 A「目录即分类」）：按分类目录顺序（**视频 → 图片 → 其他**）扫描，每个目录**只收本分类合法格式**，过滤在 `FileUtils.scanCategoryFiles` 内用 `File.listFiles(FileFilter)` 于**列目录阶段**完成（内存只保留「有效文件 + 全部文件夹」）。入库类型由**目录**决定（`MediaType.fromCategory`），不按扩展名猜；`addedTime` 首插取文件系统 mtime。格式不符的文件**只跳过、不删物理文件**。**增量**：路径已存在且 fileSize/lastModified/parentFolder 未变 → 直接跳过（不提取时长、不写库）；命中即入库（不等全部扫完）；单个目录读不到 → 跳过继续；进度经 `syncState` 推 `Running(step)`。用户 U 盘/电脑拷入的文件与上传文件同路径入库（只写 `media_items`，无上传记录/播放历史，属预期）。
 
-**触发时机**：Application 启动（appScope 协程，崩溃安全）+ 媒体库菜单键「刷新媒体库（对账）」（协程触发，Toast 汇报四项统计）。完成后 `syncState: StateFlow<SyncState>`（Idle/Running/Done）通知 UI。
+**触发时机**：Application 启动（appScope 协程，崩溃安全）+ 媒体库工具条「刷新」+ U 盘插拔（ServerService 去抖重检后）+ 设置页切换存储/导出诊断日志。对账期间 `syncState: StateFlow<SyncState>`（Idle/Running/SyncComplete）推送进度：`Running(step)` 由媒体库工具条实时显示，终态 `SyncComplete` 触发「扫描完成」短暂提示。`sync()` **永不抛出**（整体 try/catch 兜底）。
 
 **App 内主动删除约定**（FileUtils + LibraryScreen）：先物理删除（`deletePhysicalFile`，连带清理空父目录）→ 成功后才删数据库记录；物理删除失败（返回 false）只弹 Toast **不删记录**，保证数据库永不出现"有索引无文件"。删除入口：焦点在媒体库文件行（列表/网格）按菜单键或删除键 → 弹窗确认（文件夹不可删）。
 
 **异常兜底**（已接入 PlayerActivity）：打开入口或播放错误时发现物理文件不存在 → `SyncManager.reportMissingFile(path)` 删索引，Toast「文件已丢失，已从列表移除」，媒体库列表经 Room Flow 自动刷新。
 
-**媒体库 DB 驱动**（LibraryScreen）：文件列表来自 `MediaRepository.observeByCategory` Room Flow（上传入库/对账/删除均实时刷新，无需手动 re-list）；文件夹层级来自文件系统（DB 不索引文件夹）；视频时长优先取 DB 索引，缺失回退 MediaMetadataRetriever。`media_items.parentFolder` 存**父目录绝对路径**。
+**媒体库 DB 驱动**（LibraryScreen）：文件列表来自 `MediaRepository.observeByCategory` Room Flow（上传入库/对账/删除均实时刷新，无需手动 re-list）；文件夹层级来自文件系统（DB 不索引文件夹）；视频时长优先取 DB 索引，缺失回退 MediaMetadataRetriever。`media_items.parentFolder` 存**父目录绝对路径**。文件夹卡片（来自文件系统）经 `FileUtils.hasValidContentIn` 过滤：递归判定没有本分类合法文件的文件夹**不出卡片**（物理目录保留，不删）。
 
 **文件操作规范**（v1.14 修订）：读写沙盒一律经 **`IStorage`**（`FileLocations.activeStorage`），
 **不再直接 `java.io.File`**。`java.io.File` 只保留在三处：`FileStorage` 内部实现、
@@ -580,7 +592,7 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 或拷到 U 盘拿到电脑上看。
 
 **落盘位置**：`FileLocations.root(Category.OTHER)` → `TransView/Downloads/storage_diagnosis.txt`。
-刻意与「其他」分类**同路径**：该目录在 `FileUtils.listAllMediaFiles()`（对账扫描范围）内，导出后设置页顺手触发
+刻意与「其他」分类**同路径**：该目录在 `FileUtils.scanCategoryFiles(Category.OTHER)`（对账扫描范围）内，导出后设置页顺手触发
 一次 `SyncManager.sync()`，新文件即被索引进 `media_items` → 「其他」页直接可见可打开；U 盘模式下它天然落在
 U 盘上，**拔下来插电脑就能看**——这正是排障所需的取数通路。
 
@@ -735,3 +747,5 @@ ExoPlayer 用 `file://` 播放 U 盘视频（MediaCodec 正常解码，无异常
 - [x] ~~上传访问码（最小认证）~~（v1.7 已完成，见 §3.15）
 - [ ] 断点续传（需求 4.4 P2）
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）
+- [x] ~~U 盘上「其他」文件无法打开（`FileProvider` 路径未覆盖可移动卷）~~（v1.15 已完成，见 §3.17）
+- [x] ~~对账扫描改为「目录即分类 + 格式严格过滤」并做扫描性能/内存优化~~（v1.16 已完成，见 §3.3.7）

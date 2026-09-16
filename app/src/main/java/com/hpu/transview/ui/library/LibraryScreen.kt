@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
@@ -73,6 +74,7 @@ import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.PlaybackRepository
 import com.hpu.transview.data.db.MediaItemEntity
 import com.hpu.transview.data.sync.SyncManager
+import com.hpu.transview.data.sync.SyncState
 import com.hpu.transview.model.Category
 import com.hpu.transview.model.FileEntry
 import com.hpu.transview.model.SortOrder
@@ -98,6 +100,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 // 网格列数由「设置 → 界面设置 → 网格列数」决定（4/5/6），见 LibraryScreen 内 gridColumns。
 // 电视端一律多列网格，严禁单列列表。
@@ -169,6 +172,29 @@ fun LibraryScreen(
     var sortOrder by rememberSaveable(category.name) { mutableStateOf(SettingsStore.defaultSort) }
     var showSortDialog by remember { mutableStateOf(false) }
     var syncing by remember { mutableStateOf(false) }
+    // 对账进度（全局 StateFlow）：App 启动 / U盘插拔 / 设置页切换 / 本页手动刷新触发的对账
+    // 都能在这里实时显示进度与「扫描完成」提示（不只本页自己发起的那一次）。
+    val syncManager = remember { SyncManager.getInstance(context) }
+    val syncState by syncManager.syncState.collectAsState()
+    var scanDoneFlash by remember { mutableStateOf(false) }
+    var syncStateSeen by remember { mutableStateOf(false) }
+    LaunchedEffect(syncState) {
+        // 忽略进入本页时的「历史终态」：只在本次组合期内真正发生状态变化时才提示，
+        // 否则从别的页面切进来会立刻闪一下「扫描完成」（对账可能是几分钟前结束的）。
+        if (!syncStateSeen) { syncStateSeen = true; return@LaunchedEffect }
+        when (syncState) {
+            is SyncState.Running -> scanDoneFlash = false
+            is SyncState.SyncComplete -> {
+                scanDoneFlash = true
+                delay(1800)
+                scanDoneFlash = false
+            }
+            else -> Unit
+        }
+    }
+    // 工具条右侧的临时状态文案：进行中显示实时步骤，完成后短暂显示「扫描完成」
+    val syncStatusText = (syncState as? SyncState.Running)?.step
+        ?: if (scanDoneFlash) "扫描完成" else null
     // 网格列数取自「设置 → 界面设置 → 网格列数」。进入本页时读一次：设置页会替换掉本页组合，
     // 退出设置回到媒体库时必然重新组合，直接读取即能拿到最新值，与 UploadScreen 读 deviceName 同一套路。
     // 列数同时决定网格的「行首/行尾」判定（stayOnLeftEdge / stayOnRightEdge 与第一行判断），
@@ -222,6 +248,9 @@ fun LibraryScreen(
         dirEntries = withContext(Dispatchers.IO) {
             storage.listChildren(currentDir)
                 .filter { it.isDirectory && !it.name.startsWith(".") }
+                // 方案 A：文件夹内（递归）没有任何本分类合法文件时不出卡片
+                // —— 如 Movies/某某/ 里全是 .txt。物理文件夹保留不删，只是没东西可展示。
+                .filter { runCatching { FileUtils.hasValidContentIn(File(it.path), category) }.getOrDefault(true) }
                 .map { it.toFileEntry() }
         }
         dirEntriesStamp = currentDir
@@ -468,7 +497,9 @@ fun LibraryScreen(
         LibraryTopBar(
             crumb = buildCrumb(category, currentDir, storage),
             sortOrder = sortOrder,
-            syncing = syncing,
+            // 本页发起的对账（本地 syncing）与其它来源的对账（全局 Running）都要在工具条上体现
+            syncing = syncing || syncState is SyncState.Running,
+            syncStatusText = syncStatusText,
             // 工具条上按「上键」→ 顶部导航栏的当前分类标签（视频页 → 「视频」标签）
             upToTabsModifier = Modifier.onPreviewKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionUp) {
@@ -647,6 +678,8 @@ private fun LibraryTopBar(
     crumb: String,
     sortOrder: SortOrder,
     syncing: Boolean,
+    /** 对账进行中的实时步骤 / 完成后的「扫描完成」，null 表示不显示（非可聚焦，不影响焦点链路） */
+    syncStatusText: String?,
     upToTabsModifier: Modifier,
     sortFocusModifier: Modifier,
     refreshEdgeModifier: Modifier,
@@ -669,6 +702,18 @@ private fun LibraryTopBar(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
+        if (syncStatusText != null) {
+            Spacer(Modifier.width(12.dp))
+            // 非可聚焦的纯文本，不进焦点链路；限宽 + 单行省略，避免长路径把右侧按钮挤出屏幕
+            Text(
+                syncStatusText,
+                style = MaterialTheme.typography.bodySmall,
+                color = OnDarkDim,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 280.dp)
+            )
+        }
         Spacer(Modifier.width(16.dp))
         TvButton(
             text = "排序：${sortOrder.label}",

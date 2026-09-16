@@ -23,7 +23,7 @@ import java.util.Locale
  *
  * ## 落盘位置
  * 活动沙盒的「其他」分类目录（[FileLocations.root] 的 [Category.OTHER]）→ `/TransView/Downloads/`。
- * **刻意与「其他」分类同路径**：该目录在对账（SyncManager.listAllMediaFiles）的扫描范围内，
+ * **刻意与「其他」分类同路径**：该目录在对账（FileUtils.scanCategoryFiles，Downloads 分类）的扫描范围内，
  * 导出后触发一次对账即被索引进 media_items，于是能在「其他」标签里直接看到并打开这个 txt；
  * U 盘模式下则天然落在 U 盘上，拔下来插电脑即可查看（这正是排障所需的取数通路）。
  *

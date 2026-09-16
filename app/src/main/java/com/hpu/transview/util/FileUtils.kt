@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.io.FileFilter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -544,6 +545,26 @@ fun nameIsImageFile(name: String): Boolean =
 fun FileEntry.isVideoFile(): Boolean = nameIsVideoFile(name)
 fun FileEntry.isImageFile(): Boolean = nameIsImageFile(name)
 
+/**
+ * **方案 A：目录即分类** —— 某文件是否符合某分类目录的格式要求。
+ *
+ * 视频目录只收视频、图片目录只收图片、其他目录只收「非视频且非图片」。
+ * 判定统一走已有的扩展名工具（[isVideoFile] / [isImageFile]），**不在调用方另写一套**。
+ * 不符合的文件一律「不入库、不展示」，但**绝不物理删除**。
+ */
+fun isValidFormatForCategory(file: File, category: Category): Boolean = when (category) {
+    Category.VIDEO -> file.isVideoFile()
+    Category.IMAGE -> file.isImageFile()
+    Category.OTHER -> !file.isVideoFile() && !file.isImageFile()
+}
+
+/** [isValidFormatForCategory] 的名字版本（只有文件名、没有 File 的场景复用） */
+fun isValidFormatForCategory(name: String, category: Category): Boolean = when (category) {
+    Category.VIDEO -> nameIsVideoFile(name)
+    Category.IMAGE -> nameIsImageFile(name)
+    Category.OTHER -> !nameIsVideoFile(name) && !nameIsImageFile(name)
+}
+
 /** 媒体库卡片 → 可直接交给 Coil 的 Uri（`file://`） */
 fun FileEntry.toUri(): Uri = mediaUri(path)
 
@@ -644,22 +665,77 @@ object FileUtils {
         return result
     }
 
-    /** 收集活动存储三个分类目录下的全部媒体文件（递归、跳过隐藏项） */
-    fun listAllMediaFiles(): List<StorageFile> {
-        val storage = FileLocations.activeStorage
+    /**
+     * 按分类扫描活动沙盒的某个分类目录（**方案 A：目录即分类 + 格式严格过滤**）。
+     *
+     * 用 `File.listFiles(FileFilter)` 在**列目录阶段**就完成过滤，filter = 「目录 或 本分类合法格式」：
+     * 内存里只会出现「有效文件 + 全部文件夹」，十万个无关文件也不会被构造成数组
+     * （旧实现是先 `listFiles()` 拿全部再逐个判断，大目录会顶爆内存）。
+     *
+     * 递归进入子目录，对每一层都执行同一过滤；[onDir] 每进入一个目录回调一次（进度提示用）。
+     * 单个目录读取失败（权限 / 拔盘 / ROM 限制）→ 跳过该目录、**继续扫描其余目录**，不抛出。
+     *
+     * 隐藏项（`.` 开头，含 `.temp_unzip`）一律跳过；**绝不删除任何物理文件**。
+     *
+     * @return 该分类目录下的全部合法文件（未排序）
+     */
+    fun scanCategoryFiles(
+        category: Category,
+        onDir: ((dir: File, validCount: Int) -> Unit)? = null
+    ): List<StorageFile> {
+        val sandboxRoot = FileLocations.sandboxRoot
+        val root = File(sandboxRoot, FileLocations.categoryRelative(category))
         val out = ArrayList<StorageFile>()
-        for (category in Category.entries) {
-            walk(storage, FileLocations.categoryRelative(category), out)
+        if (!root.isDirectory) return out
+        val prefix = sandboxRoot.absolutePath + File.separator
+        val stack = ArrayDeque<File>()
+        stack.addLast(root)
+        while (stack.isNotEmpty()) {
+            val dir = stack.removeLast()
+            val children = runCatching { dir.listFiles(categoryFilter(category)) }.getOrNull() ?: continue
+            for (child in children) {
+                if (child.isDirectory) stack.addLast(child) else out.add(toStorageFile(child, prefix))
+            }
+            onDir?.invoke(dir, out.size)
         }
         return out
     }
 
-    private fun walk(storage: IStorage, relativePath: String, out: MutableList<StorageFile>) {
-        for (child in storage.listFiles(relativePath)) {
-            if (child.name.startsWith(".")) continue
-            if (child.isDirectory) walk(storage, child.relativePath, out) else out.add(child)
+    /**
+     * 该目录（递归）下是否存在至少一个本分类合法文件。
+     *
+     * 媒体库据此隐藏「全是无效格式」的文件夹卡片（如 `Movies/某某/` 里全是 .txt）：
+     * 物理文件夹**保留不删**，只是不生成卡片（没有有效文件可展示）。
+     */
+    fun hasValidContentIn(dir: File, category: Category): Boolean {
+        if (!dir.isDirectory) return false
+        val stack = ArrayDeque<File>()
+        stack.addLast(dir)
+        while (stack.isNotEmpty()) {
+            val d = stack.removeLast()
+            val children = runCatching { d.listFiles(categoryFilter(category)) }.getOrNull() ?: continue
+            for (child in children) {
+                if (child.isDirectory) stack.addLast(child) else return true
+            }
         }
+        return false
     }
+
+    /** 方案 A 的列目录过滤器：跳过隐藏项，保留「全部目录 + 本分类合法文件」 */
+    private fun categoryFilter(category: Category): FileFilter = FileFilter { f ->
+        !f.name.startsWith(".") && (f.isDirectory || isValidFormatForCategory(f, category))
+    }
+
+    /** File → StorageFile（absolutePath 为身份；relativePath 去掉沙盒根前缀） */
+    private fun toStorageFile(file: File, sandboxRootPrefix: String): StorageFile = StorageFile(
+        name = file.name,
+        path = file.absolutePath,
+        relativePath = file.absolutePath.removePrefix(sandboxRootPrefix),
+        parentPath = file.parentFile?.absolutePath.orEmpty(),
+        isDirectory = false,
+        size = file.length(),
+        lastModified = file.lastModified()
+    )
 
     // ————— 空文件夹清理 —————
 
