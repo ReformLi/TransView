@@ -2,4 +2,14 @@
 <paths>
     <!-- 覆盖 /storage/emulated/0 下的 Movies / Pictures / Download -->
     <external-path name="external_storage" path="." />
+
+    <!-- v1.15：可移动卷（U 盘）支持。
+         U 盘按卷 uuid 挂载在 /storage/<uuid>（部分 ROM 另暴露 /mnt/media_rw/<uuid>），
+         上面的 external-path 只对应内部共享存储 /storage/emulated/0，不含可移动卷，
+         导致「其他」文件用 FileProvider 打开时报
+         "Failed to find configured root that contains /storage/<uuid>/TransView/Downloads/…"。
+         这里补上两种挂载前缀，任意卷上的沙盒文件均可被安全暴露（provider 仍 exported=false，
+         仅通过显式 grantUriPermissions 授权给目标应用）。 -->
+    <root-path name="storage_root" path="/storage/" />
+    <root-path name="media_rw_root" path="/mnt/media_rw/" />
 </paths>

@@ -1,7 +1,15 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.14　日期：2026-09-15
+> 版本：v1.15　日期：2026-09-16
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.15 变更：**修复 U 盘上「其他」文件无法打开（FileProvider 路径未覆盖可移动卷）**——「其他」分类文件经
+> `FileUtils.openExternal()` → `FileProvider.getUriForFile()` 交给系统应用打开，而 `res/xml/file_paths.xml` 原先只声明
+> `<external-path name="external_storage" path="." />`（仅对应内部共享存储 `/storage/emulated/0`），**不含可移动卷**，
+> 于是 U 盘上的文件报 `Failed to find configured root that contains /storage/<uuid>/TransView/Downloads/…`。视频 / 图片
+> 不受影响——它们走 `Uri.fromFile` 直连 ExoPlayer / Coil，根本不经过 FileProvider。修复：`file_paths.xml` 增加
+> `<root-path name="storage_root" path="/storage/" />` 与 `<root-path name="media_rw_root" path="/mnt/media_rw/" />`，
+> 覆盖任意卷 uuid 挂载点（provider 仍 `exported=false`，仅经显式 `grantUriPermissions` 授权给目标应用）。同版附带
+> **顶部导航栏随屏紧凑化**（手机横屏矮屏时缩留白 / 字号、隐藏品牌标题与状态文字），见 §2.1 与 §3.17。
 > v1.14 变更：**彻底移除 SAF，U 盘改用直接文件路径（File API）**——真机（Vidda 电视）实测系统的 SAF 授权框架
 > （`ACTION_OPEN_DOCUMENT_TREE`）被屏蔽、**授权根本不可能成功**；而用第三方文件管理器验证，U 盘物理路径
 > `/storage/0000-0000` **实际可读可写**。结论是问题不在权限、而在「系统不上报存储卷」，于是回到纯 `java.io.File`：
@@ -660,6 +668,9 @@ v1.14 起**恒为绝对路径**（如 `/storage/0000-0000/TransView/Movies/a.mp4
 与 Coil 都原生支持，且**不走 `ContentResolver`、无 IPC**，比 `content://` 更快更稳。
 `MediaMetadataRetriever` 用 `setDataSource(path)`（绝对路径版本比 URI 版本更快）。
 唯一例外是**「其他」文件的外部打开**：Android 7+ 不允许直接暴露 `file://`，仍走 `FileProvider`。
+`FileProvider` 的可用根目录由 `res/xml/file_paths.xml` 声明：**必须同时覆盖内部共享存储与可移动卷**——v1.14 及以前只写了
+`<external-path path="." />`（=`/storage/emulated/0`），导致 U 盘（`/storage/<uuid>`）上的「其他」文件打开时报
+`Failed to find configured root that contains …`；v1.15 补 `<root-path path="/storage/" />` 与 `<root-path path="/mnt/media_rw/" />`。
 
 #### 3.17.3 降级与恢复（与前版一致，未改动）
 
