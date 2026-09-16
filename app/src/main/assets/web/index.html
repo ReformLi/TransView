@@ -408,7 +408,8 @@
         relPath: (it.relPath || '').replace(/\\/g, '/'),
         category: category,   // 入队时的分类快照，上传时以此为准
         status: 'wait',
-        progress: 0
+        progress: 0,
+        ts: Date.now()        // 入队时间：列表按它倒序显示（新的在上）
       });
     });
     if (skipped > 0) {
@@ -489,7 +490,16 @@
 
   function render() {
     queueEl.innerHTML = '';
-    queue.forEach(function (item, idx) {
+    // 显示顺序与处理队列（queue 数组）解耦：等待/上传中置顶、成功/失败/已取消沉底，
+    // 组内按入队时间倒序（新的在上）。queue 数组本身保持 FIFO —— uploadNext 取首个
+    // wait 项、重试插队等上传顺序逻辑一概不受显示排序影响。
+    var shown = queue.slice().sort(function (a, b) {
+      var aa = (a.status === 'wait' || a.status === 'run') ? 0 : 1;
+      var bb = (b.status === 'wait' || b.status === 'run') ? 0 : 1;
+      if (aa !== bb) return aa - bb;
+      return (b.ts || 0) - (a.ts || 0);
+    });
+    shown.forEach(function (item) {
       var li = document.createElement('li');
 
       var row = document.createElement('div');
@@ -567,6 +577,7 @@
     if (item.status !== 'err' && item.status !== 'cancel') return;
     item.status = 'wait';
     item.progress = 0;
+    item.ts = Date.now();   // 重试算一次新上传：显示排序回到进行中组的最新位置
     // 插到「待上传区」最前面：批量上传时后面还排着一串文件，
     // 若只把状态改回 wait，用户点了重试要等前面全部传完才有反应
     var i = queue.indexOf(item);

@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -180,6 +181,21 @@ fun UploadScreen(
         }
     }
 
+    // ——— 新「进行中」记录置顶时滚到列表顶 ———
+    // LazyColumn 按 key 锚定第一可见行（数据变化时保持原行不动）：新记录插到第 0 位会
+    // 落在可视区**上方**，屏幕上看不到任何变化 —— 实测表现为「上传过程中列表一动不动、
+    // 进度也不展示，结束后才看到记录」（v1.26 排序改动后暴露，机理一直存在）。
+    // 仅当新顶行是进行中（等待 0 / 上传中 1）且**焦点不在列表内**时才滚：
+    // 遥控器焦点在行上时强行滚动会把焦点行滚出屏幕（LazyColumn 回收屏外行 → 焦点丢失）；
+    // 此时新行仍在上方，按「上键」由 bring-into-view 自然带进视野。
+    val listState = rememberLazyListState()
+    LaunchedEffect(records.firstOrNull()?.id) {
+        val top = records.firstOrNull()
+        if (top != null && top.state <= UploadStateCode.RUNNING && !listHasFocus) {
+            listState.scrollToItem(0)
+        }
+    }
+
     // 网络可能在后台变化（Wi-Fi 重连等），回到前台时刷新
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -311,7 +327,8 @@ fun UploadScreen(
                 }
             } else {
                 LazyColumn(
-                    Modifier
+                    state = listState,
+                    modifier = Modifier
                         .weight(1f)
                         // hasFocus = 记录区自身或其中任一行（含行内「删除」按钮）持有焦点。
                         // 删除前据此决定是否需要「焦点安全港」：遥控器路径必须先停靠，

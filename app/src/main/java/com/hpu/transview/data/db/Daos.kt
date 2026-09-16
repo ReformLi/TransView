@@ -81,7 +81,15 @@ interface PlaybackHistoryDao {
 @Dao
 interface UploadRecordDao {
 
-    @Query("SELECT * FROM upload_records ORDER BY time DESC LIMIT :limit")
+    /**
+     * 列表排序：进行中（等待 0 / 上传中 1）置顶，成功 2 / 失败 3 沉底；
+     * 组内按上传时间倒序（新的在上），同秒以 id 稳定排序。
+     * (state <= 1) 为 1/0 布尔值，DESC 让进行中分组排最前。
+     */
+    @Query(
+        "SELECT * FROM upload_records " +
+            "ORDER BY (state <= 1) DESC, time DESC, id DESC LIMIT :limit"
+    )
     fun observeRecent(limit: Int = 200): Flow<List<UploadRecordEntity>>
 
     @Insert
