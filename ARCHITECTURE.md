@@ -1,7 +1,18 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.17　日期：2026-09-16
+> 版本：v1.22　日期：2026-09-16
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.20 变更：**设置页两栏可滚动（矮屏兜底）**——修「手机横屏下设置页滑动不了：左侧末项『关于』看不到；选中『存储与数据』后右侧只能看到『存储空间占用』为止」。根因：设置页左右两栏都是**固定高度布局**（左栏 `Arrangement.Center`、右栏只有「关于」那一组的卡片内部挂了 `verticalScroll`），内容高于可视区时**既裁切又不可滚动** —— 矮屏内容区仅约 370 逻辑 dp，而左栏「设置」标题 + 5 个分组约 366dp、右栏「存储与数据」7 行设置 + 小字提示 + 信息条目远超一屏（居中布局溢出时上下同时被切）。修法：① 左栏 `width(280.dp).fillMaxHeight().verticalScroll(leftScrollState)`；② 右栏 `weight(1f).fillMaxHeight().verticalScroll(detailScrollState)`，滚动状态按分组重建（`remember(selectedGroupIndex) { ScrollState(0) }`）→ 切换分组自动回到顶部；③ 「关于」卡片去掉 `weight(1f)`，改贴内容高度（长内容散在整栏滚动里，滚到底能看到完整圆角底边）。**关键点**：`verticalScroll` 只把 `maxHeight` 放开为 `Infinity`，**`minHeight` 会沿传入约束原样下推**给内层 Column —— 于是「内容装得下就居中（`fillMaxHeight` 提供的 min 高度 + `Arrangement.Center`）、装不下就滚动」两者同时成立，**电视 / 平板内容不超出视口，显示逐像素不变**。触摸可直接拖动；遥控器焦点移到被遮挡的行时由滚动容器的 bring-into-view 自动滚入视野（与「关于」组原有行为一致）。（见 §3.9 / §3.21）
+> v1.19 变更：**矮屏（手机横屏）内容区整体等比缩放**——修「除顶部标签栏外，各页面字体与间距偏大、一屏装不下几条、看着散」（上传页访问码色块占比大、记录行只能显示约 4 条、「清空所有记录」突兀；媒体库 / 设置页尤其明显）。根因：页面内部按**电视大屏尺度**书写绝对尺寸（正文 16sp、访问码 24sp、图标 40dp、设置行 padding 16dp、网格间距 18dp）——同一批尺寸在 1080dp 高的电视上占屏高 6%，在 360dp 高的手机横屏上要占 18%。修法：新增 `ui/common/CompactUi.kt`，① `COMPACT_SCREEN_HEIGHT_DP = 480` 作为**唯一阈值**（顶部栏 / 上传页左面板 / 内容区缩放共用）；② `CompactContentDensity` 在**内容区**外层覆盖 `LocalDensity`（density × 0.87）——内容区所有 dp/sp **同步等比**缩小，字号与间距/图标/卡片的比例关系不变（「整块 UI 变小」而非「字变小、留白照旧」）；**顶部导航栏在覆盖之外**，保持用户认可的尺寸；③ `rememberContentWidthDp()` 给出缩放后的**实际**逻辑宽度 —— 媒体库的屏宽收敛值改用实际值，否则配置值 800dp 算得 5 列会把用户设置的「6 列」误压成 5 列（实际可用 919dp 本就能容纳 6 列）；④ 顺带把媒体库焦点边界由 `gridColumns` 改为与 `GridCells.Fixed` 同源的 `effectiveColumns`（原先两者在手机横屏列数收敛时不相等，会错位）。主体文字 16sp → 约 13.9sp，与紧凑顶部栏 `labelLarge`(14sp) 齐平。**TV / 平板与两个独立 Activity（播放器 / 图片查看器）逐像素不变。**（见 §3.1 / §3.20）
+> v1.18 变更：**上传页矮屏（手机横屏）紧凑模式** —— 修「手机横屏下左面板二维码被压没、地址被 Ellipsis 截断」。
+> 根因：左面板是竖向堆叠、二维码靠 `weight(1f)` 吃剩余高度，而横屏内容区只有 ~300dp（TV ~950dp），
+> 原先 ~200dp 的固定项（标题 30 + 访问码牌 48 + 地址 26 + 复制 36 + 两行提示 36 + 间距 ~30）把二维码压到几十 dp；
+> 且左面板只占宽度 `0.9/2.9 ≈ 31%`（横屏约 215dp、内部仅 171dp），装不下 16sp 的 `http://192.168.x.x:2333`（~205dp）。
+> 修法（判据 `screenHeightDp < 480`，与 `MainScreen.isCompact` **同阈值**）：① `Row` 留白 40/18 → 16/10、
+> 左面板 `0.9f:2f` → `0.85f:1f`（占比 46%）；② 省略左上角冗余标题（省 30dp）；③ **地址与复制并排一行、
+> `CopyAddressButton(iconOnly = true)` 只留图标**（省 36dp），地址 `bodyMedium` + `maxLines = 2` 允许折行；
+> ④ 各段间距 10 → 6、访问码牌内边距 8 → 5、面板竖向留白 16 → 12。合计把二维码拉回 **~145dp**。
+> **TV / 平板走原路径，逐像素不变**（见 §3.3 上传页职责 / §3.15 TV 端）。
 > v1.17 变更：**「导出存储诊断日志」重构为「App 运行日志本地化」** —— ① 设置 → 存储与数据里原「导出存储诊断日志」
 > 入口**移除**，代之以**「App 调试日志」开关**（默认关，值存 `SettingsStore.appLogEnabled`，切换**立即生效**）。
 > ② 新增 `util/AppLogger.kt` 单例：`d/i/w/e` 在调用线程**只做两件事**——调一次原生 `android.util.Log`（保住
@@ -144,6 +155,8 @@ com.hpu.transview
     ├── theme/                  恒定深色 TV 主题
     ├── common/                 tvFocus 焦点修饰符、TvButton、OptionRow、
     │                           FileTypeIcon（Canvas 手绘）、VideoMeta（时长缓存）
+    │                           **CompactUi.kt 矮屏内容区整体缩放（v1.19）**：CompactContentDensity
+    │                           （覆盖 LocalDensity，dp/sp 等比缩到 87%）+ rememberContentWidthDp()
     ├── MainScreen.kt           四标签导航 + 右侧「设置」入口（聚焦即打开设置页）+ 返回键回导航栏
     ├── permission/             存储权限引导页
     ├── upload/UploadScreen.kt  左右分栏：左侧固定服务器面板（二维码带访问码 + 访问码色块 + 地址 + 状态）
@@ -220,7 +233,7 @@ com.hpu.transview
 - 切换文件夹/上传完成时 `dirRefreshKey++` 驱动文件夹列表重列。
 
 **「上传」页职责（v1.1 重构，v1.3 改左右分栏）**
-- 顶部 `Row` 左右分栏（按占比自适应）：**左侧固定区**（`weight 0.9f`，不滚动）= 二维码 + 地址 + 复制按钮 + 服务器状态/唤醒入口；**右侧记录区**（`weight 2f`，`LazyColumn` 可滚动）= **纯上传记录列表**（数据库驱动）。
+- 顶部 `Row` 左右分栏（按占比自适应）：**左侧固定区**（宽屏 `weight 0.9f : 2f` ≈ 31%；**矮屏紧凑模式 `0.85f : 1f` ≈ 46%**，v1.18，不滚动）= 二维码 + 地址 + 复制按钮 + 服务器状态/唤醒入口；**右侧记录区**（`weight 2f` / 紧凑 `1f`，`LazyColumn` 可滚动）= **纯上传记录列表**（数据库驱动）。
 - 每条记录含文件名/大小/进度条百分比/状态（等待中/上传中/成功/失败）/时间/分类六要素；焦点在记录上按**菜单键或删除键**（或右侧「删除」按钮）弹窗确认删除——**仅删 upload_records 日志，本地文件保留**；列表头部提供「清空所有记录」。
 
 ### 3.4 播放器（v1.10 时间轴优先控制栏）
@@ -396,6 +409,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
 **布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
+**两栏各自可滚动（v1.20）**：左栏 `fillMaxHeight().verticalScroll(…)`、右栏 `weight(1f).fillMaxHeight().verticalScroll(…)`——矮屏上两栏内容都可能高于一屏（左栏 5 个分组 + 标题、右栏「存储与数据」7 行）。内容装得下时内层 Column 的 `minHeight` 由 `fillMaxHeight` 撑满、`Arrangement.Center` 照旧居中（**逐像素与改造前一致**），装不下才滚动；右栏滚动状态随 `selectedGroupIndex` 重建，切换分组回到顶部。详见 §3.21。
 设置项**已全部接通**（v1.4），因此 `SettingRow` 的灰色「待实现」徽标（原 `pending` 参数）已随最后两项接线一并移除。
 
 **焦点规范（v1.4 落地）**：
@@ -403,7 +417,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - 详情行 ← 回左侧当前分组（`groupFocusers` 直接 requestFocus）；每组首行 ↑ 回「设置」标签；首分组 ↑ / 末分组 ↓ / 详情行首 ←、行尾 → 等边缘显式吃掉按键，防环绕到顶部标签切页（与媒体库「左右边界」同规）。
 - 弹框**打开时**焦点落在**当前选中项**上（`ChoiceState.selectedIndex` 那一行挂 `FocusRequester` + `LaunchedEffect` 里 `requestFocusNextFrame()`）：否则「● 当前值」与聚焦高亮分别停在两行，视觉上像两个选中项；更实际的风险是用户直接按确定会静默改成**第一项**（实测踩到：网格列数当前 5 列，弹框焦点停在「4 列」，直接确定就把列数改成了 4）。
 - 弹框（单选 `ChoiceState` / 确认 `ConfirmState` 两类，同一时刻最多一个）关闭后焦点回原行：`pendingFocusReturn` 记录行 key + `rowFocusMap` 每行 `FocusRequester` + **帧门控重试**（`repeat(10)` 次 `requestFocusNextFrame()`，用 `rowFocused[key]` 状态确认落焦成功——单次请求会被静默丢弃，媒体库同款经验）。
-- **「关于」组不使用弹框**（v1.4）：信息条目**直接内联**在右侧详情区。条目用 `AboutEntry`（`focusable()` 但**无 `clickable`**，故按确定 / → 都没有动作，只有焦点高亮）；该组外层 `Arrangement.Top` + Surface `weight(1f)` 撑满剩余高度，卡片内 `verticalScroll(aboutScrollState)`——可聚焦节点在滚动容器内自带 bring-into-view，**焦点上下移动即自动滚动**。条目左右/上下边缘按键与 `SettingRow` 同规（左键回分组、首条 ↑ 回标签、→ 吃掉、末条 ↓ 吃掉防环绕切页）。
+- **「关于」组不使用弹框**（v1.4）：信息条目**直接内联**在右侧详情区。条目用 `AboutEntry`（`focusable()` 但**无 `clickable`**，故按确定 / → 都没有动作，只有焦点高亮）；该组右栏 `Arrangement.Top`（内容靠上）——可聚焦节点在滚动容器内自带 bring-into-view，**焦点上下移动即自动滚动**（v1.20 起滚动容器由「卡片内部的 `verticalScroll`」上移为「整栏的 `verticalScroll`」，卡片不再 `weight(1f)` 撑满而是贴内容高度）。条目左右/上下边缘按键与 `SettingRow` 同规（左键回分组、首条 ↑ 回标签、→ 吃掉、末条 ↓ 吃掉防环绕切页）。
 - 进入详情的聚焦重试前需**等 `rowFocusMap` 填充**（右侧行在切换分组后才组合渲染，立即请求必然 miss；外层 `repeat(10) + delay(16ms)` 等键出现再走重试）。
 - **焦点描边要四边可见，需两个条件同时满足**（v1.4 实测）：
   ① `tvFocus()` 必须挂在可聚焦修饰符（`clickable` / `focusable`）的**上游**——它内部的 `onFocusChanged`
@@ -580,6 +594,21 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 **面板竖向预算**（改这块前先看这条）：左面板高度 = 屏幕高 − Row 的上下 padding（18dp×2），
 内部 = 标题 + 二维码(`weight(1f)`) + 访问码条 + 地址 + 复制按钮 + 一行提示。
 二维码吃满剩余高度，所以**动任何一块的高度都会等比反噬二维码**。
+
+**矮屏（手机横屏）紧凑模式（v1.18）**：判据 `LocalConfiguration.current.screenHeightDp < 480`，
+与 `MainScreen` 顶部导航栏的 `isCompact` **同一阈值**（顶部栏紧凑时本页也紧凑，观感一致）。
+手机横屏高度 360~410dp、TV 720/1080dp、平板横屏 800dp+，都落在阈值两侧，不会误判。紧凑时按这个顺序让高度：
+
+① `Row` 留白 `horizontal 40 → 16` / `vertical 18 → 10`，左面板权重 `0.9f : 2f → 0.85f : 1f`
+（占比 31% → 46%，面板内部宽度 171dp → ~300dp，16sp 的地址（~205dp）终于放得下）；
+② 省略左上角标题（顶部导航栏已写着「上传」，二维码本身也自明）—— 省 30dp；
+③ **地址与「复制」并排一行**、`CopyAddressButton(iconOnly = true)` 只留图标（左右留白 12 → 8dp）
+—— 省 36dp；地址改 `bodyMedium` 且 `maxLines = 2`（窄机型横屏仅 ~640dp 宽时折两行，**宁可占高也不再截成 `…`**）；
+④ 各段间距 `10 → 6`、访问码牌内边距 `8 → 5`、面板竖向留白 `16 → 12`。
+
+合计把二维码从「被压到几十 dp」拉回 **~145dp**，可正常扫码。
+⚠️ 这里**不要**改成「二维码在左、文字在右」的横向排布：文字列只剩 ~150dp，
+16sp 的地址必然被截断（v1.18 推导时算过）——「竖向堆叠 + 加宽面板」才是对的方向。
 
 **二维码尺寸自适应（顺带修掉的历史问题）**：二维码容器为 `weight(1f)`，内部用 **`BoxWithConstraints` 量出可用空间后
 显式取 `min(maxWidth, maxHeight)` 作正方形边长**（实测 1280×720 / density 213 下 283×283 px = 213dp，
@@ -818,6 +847,132 @@ CoroutineScope(SupervisorJob() + Dispatchers.IO)
 > 但**不会死锁也不会无限递归** —— 因为 `AppLogger.d/i/w/e` 在调用线程**只 `trySend`（无锁、不等待消费者）**，
 > 写失败触发的 `FileLocations.refresh()` 又有 30 秒限流，且只发生在消费侧。
 
+### 3.20 矮屏（手机横屏）内容区整体缩放（v1.19）
+
+**要解决的问题**：手机横屏（屏高 360~410dp）下，除顶部标签栏外各页面都「字大、一屏装不下几条、看着散」
+—— 上传页访问码色块占比大、右侧上传记录只能显示约 4 条、「清空所有记录」按钮突兀；媒体库与设置页尤其明显。
+
+**根因**：页面内部全部按**电视大屏尺度**书写绝对尺寸：正文 `bodyLarge` / `titleMedium`(16sp)、
+上传页访问码 `headlineSmall`(24sp)、类型图标 `Modifier.size(40.dp)`、设置行 `padding(vertical = 16.dp)`、
+网格间距 `spacedBy(18.dp)`。同一批绝对尺寸在 1080dp 高的电视上只占屏高 6%，在 360dp 高的手机横屏上
+却要占 18% —— **比例的差异**就是「看起来很大」的全部原因（字号本身是标准 Material 值）。
+
+**修法**（`ui/common/CompactUi.kt`，三处判据统一为一个常量）：
+
+1. `COMPACT_SCREEN_HEIGHT_DP = 480` —— `MainScreen` 顶部栏、`UploadScreen` 左面板、内容区缩放
+   **共用同一阈值**，避免「顶部栏已紧凑、内容区还是电视尺度」的割裂感。
+2. `CompactContentDensity` —— 在**内容区**外层覆盖 `LocalDensity`（`density × 0.87`）。
+   `density` 是「1dp = 多少 px」，**调小**它 → 元素物理尺寸变小，同时屏幕可容纳的逻辑 dp 数变多。
+   于是内容区里所有 dp / sp **同步等比**缩小，字号与间距 / 图标 / 卡片的比例关系完全不变
+   —— 视觉是「整块 UI 变小」，而不是「字变小、留白照旧」（后者会让布局显得更空）。
+   **顶部导航栏在覆盖之外**，保持逐像素不变（它的紧凑形态是用户认可的基准）。
+3. `rememberContentWidthDp()` —— 内容区**实际**可用的逻辑宽度。`LocalConfiguration.screenWidthDp`
+   来自 Activity 配置、**不随覆盖变化**；媒体库按「宽度 / 150」收敛列数，按配置值算会**偏小**，
+   把用户设置的列数错误压掉（配置值 800dp 只算得 5 列 → `coerceAtMost` 把「6 列」设置压成 5 列，
+   而内容区实际可用 919dp、本就能容纳 6 列）。媒体库改用它。
+   ⚠️ 注意列数语义没变：仍是 `gridColumns.coerceAtMost(收敛值)`，**用户设置永远是上限** ——
+   本项**不会**把默认的 5 列自动变多。
+
+**取值依据**：0.87 使内容区主体文字 16sp → 约 13.9sp，与紧凑顶部栏的 `labelLarge`(14sp) 齐平。
+要调整力度只需改 `COMPACT_CONTENT_DENSITY_SCALE` 一处。
+
+**顺带修掉的一处隐患**：`LibraryScreen` 的网格列数用 `effectiveColumns`，而「第一行 / 行首 / 行尾」
+焦点边界用 `gridColumns` —— 两者在手机横屏（屏宽收敛列数）时并不相等，会让左右边界判定错位。
+v1.19 起统一为 `effectiveColumns`（与 `GridCells.Fixed` 同源）。
+
+**哪些东西真的变小、哪些没变**：缩的是「有固定绝对尺寸」的东西 —— 字号、图标、
+`padding` / 间距 / 圆角 / 固定宽高的弹框；而**填满可用空间**的元素（网格列、左右分栏）
+尺寸由列数 / 权重决定，**基本不变**（媒体库卡片宽高几乎与改造前一致，缩小的是卡片内的文字
+与网格间距）。想让手机横屏的卡片更小更密，要在设置里把列数调到 6，或改 `COMPACT_CONTENT_DENSITY_SCALE`。
+
+**不变量**：TV / 平板（屏高 >= 480dp）不做任何覆盖，逐像素与改造前一致；
+播放器 / 图片查看器是**独立 Activity**，不经过本覆盖，尺寸一律不变；
+`LocalConfiguration` 不受 `LocalDensity` 覆盖影响，因此页面内 `screenHeightDp < 480` 的判定依旧可靠；
+`BoxWithConstraints` 量出的 `maxWidth/maxHeight` 会随密度一起换算，二者自洽
+（上传页二维码 `minOf(maxWidth, maxHeight)` 换算后实际像素尺寸不变）。
+
+### 3.21 设置页两栏滚动（矮屏兜底，v1.20）
+
+**要解决的问题**：手机横屏（屏高 < 480dp）下设置页**滑动不了** —— 左侧分组列表看不到末项「关于」；
+选中「存储与数据」后右侧只能看到「存储空间占用」为止，下面的行看不到也点不到。
+
+**根因**：设置页两栏都是**固定高度布局**，没有任何滚动容器：
+
+- **左栏** `Column(width(280.dp).fillMaxHeight(), verticalArrangement = Center)`：内容（「设置」标题
+  `titleLarge` + 5 个分组，每组 `padding(vertical = 15.dp)`×2 + 10dp 间距）合计约 366dp；
+  矮屏内容区仅约 370 逻辑 dp（屏高 360~410dp 减去紧凑顶部栏，再按内容区 0.87 缩放换算）。
+  一旦超出，`Arrangement.Center` 会把溢出量**平均分给上下两端** → 末尾的「关于」被切到屏幕外，
+  且不可滚动、无法聚焦。
+- **右栏** `Column(weight(1f).fillMaxHeight(), …)` 里**只有「关于」那一组的卡片**挂了 `verticalScroll`，
+  「存储与数据」等组完全没有滚动容器 → 超出部分（App 调试日志 / 清空上传记录 / 清空播放历史 /
+  手动触发对账）直接被裁掉。
+
+**修法**（`SettingsScreen.kt`，只改修饰符，不动结构）：
+
+1. 左栏：`.width(280.dp).fillMaxHeight().verticalScroll(leftScrollState)`（`rememberScrollState()`）。
+2. 右栏：`.weight(1f).fillMaxHeight().verticalScroll(detailScrollState)`，其中
+   `detailScrollState = remember(selectedGroupIndex) { ScrollState(0) }` —— 滚动位置**按分组重建**，
+   切换分组回到顶部（不会「切过去就停在半截」）。
+3. 「关于」组卡片去掉 `weight(1f)`，改 `fillMaxWidth()` **贴内容高度**：滚动上移到整栏后，
+   卡片再撑满剩余高度已无意义（内容在卡片外滚动），贴内容反而让长内容滚到底时能看到完整的圆角底边。
+
+**为什么「装得下仍居中」与「装不下能滚动」可以同时成立**：`verticalScroll` 的
+`ScrollingLayoutModifier` 测量子节点时**只把 `maxHeight` 放开为 `Infinity`，`minHeight` 原样下推**。
+于是内层 Column 拿到的 `minHeight` 仍是 `fillMaxHeight` / `weight(1f)` 给出的视口高度：
+
+- 内容比视口矮 → Column 高度 = `minHeight` = 视口高度 → `Arrangement.Center` 在剩余空间里居中
+  → **与改造前逐像素一致**；
+- 内容比视口高 → Column 高度 = 内容高度 → 滚动范围 = 内容高度 − 视口高度，正常滚动。
+
+⚠️ 反过来说：**不能**把 `verticalScroll` 挂在没有高度约束的 Column 上（`minHeight` 为 0，居中失效、
+内容在 TV 上会贴顶）。这正是本方案必须保留 `fillMaxHeight()` / `weight(1f)` 的原因。
+
+**顺带获得的能力**：① 触摸可直接拖动滚动（以前完全没有，矮屏上只能干看着被裁掉的内容）；
+② 遥控器焦点移到被遮挡的行时，滚动容器的 bring-into-view 自动把它滚入视野 ——
+与「关于」组原有行为一致，无需额外代码。
+
+**不变量**：TV / 平板内容不超出视口 → 滚动范围为 0，布局与加滚动前**逐像素一致**；
+左右边界按键处理（行首 ←、行尾 →、首行 ↑ 回标签、末行 ↓ 吃掉）与 `contentFocused` /
+`BackHandler` 分层均未改动。
+
+### 3.22 设置页焦点兜底锚点化 + 分组末行 ↓ 拦截（v1.21）
+
+**要解决的问题**：手机横屏上两个「焦点莫名跳到服务器与网络（左栏第一个分组）」的入口 ——
+①「点击设置页空白处」；②「在右栏划动 / 移到分组末行」。前者还会连带把左栏选中项改成第 0 个、
+右栏内容一起切走。
+
+**根因（两条独立路径）**：
+
+1. **触摸点空白 / 滑动**：内容区外层 Box 挂着触摸锚点，它在 `PointerEventPass.Initial` 收到 `Press`
+   时**无条件**执行 `rootView.requestFocusFromTouch()` + `contentAnchor.requestFocus()` ——
+   焦点在按下瞬间就被抢到锚点，`contentFocused` 随即变 false。**只有触点落在可聚焦节点上**时，
+   该节点的 `pointerInput`（Main 阶段，晚于 Initial）才会把焦点抢回内容区。触点落在
+   **行间 6dp 间隙、行左右各 12dp 留白、不可聚焦的日志路径小字、卡片边缘**时没人抢回，
+   150ms 后的票据兜底成为唯一落点，而它此前**无条件**执行
+   `groupFocusers[0].requestFocusNextFrame()` → 左栏「服务器与网络」。
+2. **右栏分组末行按 ↓**：`SettingRow` 的 `onPreviewKeyEvent` 只处理 ← / → / ↑，**漏了 ↓**
+   （`LeftGroup` 的末项 `Key.DirectionDown -> idx == lastIdx`、`AboutEntry` 的 `isLast` 都有）。
+   末行按 ↓ 返回 false → Compose 一维方向搜索向下无候选 → 环绕到**整棵树第一个可聚焦元素**，
+   即左栏第一个分组。
+
+**修法**：
+
+1. 新增 `lastContentAnchor: String?`，由两栏的 `onFocusChanged` 维护 —— 左栏分组写 `"@group:$idx"`
+   （常量 `GROUP_ANCHOR_PREFIX`），右栏行写 `focusKey`（`"分组标题:序号"`），前缀天然区分两栏。
+2. `LaunchedEffect(focusTicket)` 的兜底改为**按记忆锚回**：分组 → `groupFocusers[idx]`；
+   右栏行 → 帧门控重试（`repeat(10)` + `rowFocused[key]` 确认）直到落焦；两条都失效才退回
+   `groupFocusers[selectedGroupIndex]`；**完全没有记忆**（刚进页面、从标签按 ↓）保持原行为落到首个分组。
+3. `SettingRow` 新增 `bottomEdge: Boolean = false`（与既有 `topEdge` 对称），
+   `Key.DirectionDown -> bottomEdge`；四组末行（设备名称 / 默认画面比例 / 默认排序方式 /
+   手动触发对账）置 `true`。
+
+**语义变化**：触摸点空白 / 划空白现在等价于「不改动焦点位置」（锚回原处）。副带效果：
+「设置」标签按 ↓ 再次进入内容区时回到**上次停留的位置**，而不是每次都被拉回第一个分组
+（首次进入仍是第一个分组，TV 上观感不变）。
+
+**不变量**：TV / 平板与遥控器路径的**既有行为**不受影响 —— 票据兜底只在 `contentFocused == false`
+时执行，而遥控器操作全程 `contentFocused == true`。
+
 ## 4. 构建与运行
 
 ```bash
@@ -835,6 +990,10 @@ CoroutineScope(SupervisorJob() + Dispatchers.IO)
 - [ ] （v1.4 已清空）设置页九项全部接通，无待接线项
 - [x] ~~zip 压缩包上传后服务端自动解压并按分类过滤~~（v1.6 已完成，见 §3.14）
 - [x] ~~上传访问码（最小认证）~~（v1.7 已完成，见 §3.15）
+- [x] ~~上传页手机横屏适配（矮屏紧凑模式：二维码被压没、地址被截断）~~（v1.18 已完成，见 §3.15）
+- [x] ~~手机横屏下内容区字体/间距偏大（内容区整体等比缩放 + 媒体库列数收敛）~~（v1.19 已完成，见 §3.20）
+- [x] ~~矮屏（手机横屏）设置页内容被裁切且无法滑动（左栏看不到「关于」、右栏只能看到「存储空间占用」）~~（v1.20 已完成，见 §3.21）
+- [x] ~~设置页点空白 / 划动右栏后焦点莫名跳到「服务器与网络」（触摸票据兜底硬编码首个分组 + `SettingRow` 漏拦截分组末行 ↓）~~（v1.21 已完成，见 §3.22）
 - [ ] 断点续传（需求 4.4 P2）
 - [x] ~~上传中断网时手机端支持「取消/重试」按钮~~（v1.5 已完成，见 §3.13）
 - [x] ~~U 盘上「其他」文件无法打开（`FileProvider` 路径未覆盖可移动卷）~~（v1.15 已完成，见 §3.17）

@@ -2,6 +2,7 @@ package com.hpu.transview.ui.settings
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -9,6 +10,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -48,7 +51,9 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.hpu.transview.BuildConfig
@@ -60,6 +65,8 @@ import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.SortOrder
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.ui.common.COMPACT_CONTENT_DENSITY_SCALE
+import com.hpu.transview.ui.common.COMPACT_SCREEN_HEIGHT_DP
 import com.hpu.transview.ui.common.OptionRow
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.requestFocusNextFrame
@@ -155,6 +162,14 @@ private fun sandboxSizeText(): String = runCatching {
     FileUtils.formatSize(total)
 }.getOrDefault("未知")
 
+/**
+ * 左栏分组在「内容区最后聚焦节点」里的键前缀。
+ *
+ * 右栏行的键是 `"分组标题:序号"`（如 `"存储与数据:6"`），左栏用 `"@group:序号"` 与之区分 ——
+ * 两者都塞进同一个 `lastContentAnchor` 字符串里，靠前缀判断该锚回去哪一栏。
+ */
+private const val GROUP_ANCHOR_PREFIX = "@group:"
+
 private fun speedLabel(speed: Float): String = when (speed) {
     1.25f -> "1.25x"
     1.5f -> "1.5x"
@@ -216,14 +231,27 @@ fun SettingsScreen(
     // 此时左侧分组**不显示**选中高亮，避免用户误以为「焦点自动跳进了内容区」
     //（实测：进入设置页时「服务器与网络」默认带竖条+主色文字高亮，被误读为焦点跳转）。
     var contentFocused by remember { mutableStateOf(false) }
+    // 内容区**最后聚焦的那个节点**：左栏分组记 "$GROUP_ANCHOR_PREFIX序号"，右栏行直接记 focusKey。
+    // 触摸点按空白处 / 滑动时触点不在任何可聚焦节点上，没人把焦点抢回内容区，150ms 后的票据兜底
+    // 此前是**无条件**投给首个分组 —— 用户实测「点设置页空白处焦点总是跳到服务器与网络」（还会
+    // 连带把左栏选中项改成第 0 个、右栏内容一起切走）。现在据此锚回原处，语义等价于
+    // 「点空白 / 划空白不改动焦点位置」；没有任何聚焦记忆时才保持原行为落到首个分组。
+    var lastContentAnchor by remember { mutableStateOf<String?>(null) }
     val groupFocusers = remember { List(SettingGroup.entries.size) { FocusRequester() } }
     val rowFocusMap = remember { mutableStateMapOf<String, FocusRequester>() }
     // 各行当前是否获得焦点，用于聚焦重试时确认落焦成功（见 detailTicket / dialog 关闭的 retry）
     val rowFocused = remember { mutableStateMapOf<String, Boolean>() }
     var detailTicket by remember { mutableIntStateOf(0) }
-    // 「关于」页信息较长，用独立滚动状态：内容超出可视区时随焦点上下移动自动滚动
-    // （可聚焦节点在滚动容器内会带上 bring-into-view 行为）。
-    val aboutScrollState = rememberScrollState()
+    // 左/右两栏各自一份滚动状态。矮屏（手机横屏）下**两栏**都可能高于可视区：
+    // 左栏是「设置」标题 + 5 个分组，右栏「存储与数据」有 7 行设置 + 小字提示 + 信息条目。
+    // 原先两栏都是固定高度布局（左栏 `Arrangement.Center`、右栏仅「关于」组内部滚动），
+    // 内容一超出就被裁掉、且无法滚动（用户实测：左侧末项「关于」看不到，
+    // 右侧「存储与数据」只能看到「存储空间占用」为止）。
+    // 现在两栏都可滚动：触摸可直接拖动，遥控器焦点移到被遮挡的行时
+    // 由滚动容器的 bring-into-view 自动滚入视野（内容不超出时不滚动，观感与改造前一致）。
+    val leftScrollState = rememberScrollState()
+    // 右侧按分组各自重置滚动位置：切换分组时回到顶部，不沿用上一分组的偏移
+    val detailScrollState = remember(selectedGroupIndex) { ScrollState(0) }
 
     // 三个弹框状态（同一时刻最多开一个）
     var choiceState by remember { mutableStateOf<ChoiceState?>(null) }
@@ -318,10 +346,34 @@ fun SettingsScreen(
         consumedFocusTicket = focusTicket
         // 触摸路径防护：触点在分组/条目上时 goToDetail 已把焦点导向所选分组详情
         //（contentFocused=true），此时票据只是触摸兜底，跳过以免把刚选的分组拉回首个分组
-        //（用户实测：点「关于」焦点与选中瞬间跳回「服务器与网络」）。空处点按 / 标签按↓
-        // 时内容区无焦点（contentFocused=false），票据正常落到首个分组。
+        //（用户实测：点「关于」焦点与选中瞬间跳回「服务器与网络」）。
         if (contentFocused) return@LaunchedEffect
-        groupFocusers[0].requestFocusNextFrame()
+        // ——— 空处点按 / 滑动：锚回「最后聚焦的节点」，不再无条件甩到首个分组 ———
+        // 触点落在行间间隙、行左右 12dp 留白、不可聚焦的日志路径小字、卡片边缘时，没有任何
+        // 节点会请求焦点（MainScreen 的锚点已在 Press 阶段把焦点抢到 contentAnchor），
+        // 于是这里成了唯一落点。此前写死 `groupFocusers[0]` → 用户实测「点设置页空白处焦点
+        // 总是跳到服务器与网络」；滑动时同一个根因表现为「划动右栏子菜单后焦点跳走」。
+        // 现按记忆锚回：左栏分组 → 该分组；右栏行 → 该行（帧门控重试到落焦成功）。
+        // 两条都失效（如刚进页面、右栏行所属分组已切换）才退回当前选中分组；
+        // 完全没有记忆时保持原行为：首个分组（「设置」标签首次按 ↓ 进入内容区）。
+        val anchor = lastContentAnchor
+        if (anchor != null && anchor.startsWith(GROUP_ANCHOR_PREFIX)) {
+            val idx = anchor.removePrefix(GROUP_ANCHOR_PREFIX).toIntOrNull()
+            val target = idx?.let { groupFocusers.getOrNull(it) }
+            if (target != null && target.requestFocusNextFrame()) return@LaunchedEffect
+        } else if (anchor != null && rowFocusMap.containsKey(anchor)) {
+            rowFocused[anchor] = false
+            repeat(10) {
+                rowFocusMap[anchor]?.requestFocusNextFrame()
+                if (rowFocused[anchor] == true) return@LaunchedEffect
+            }
+        }
+        if (lastContentAnchor == null) {
+            groupFocusers[0].requestFocusNextFrame()
+        } else {
+            groupFocusers[selectedGroupIndex.coerceIn(groupFocusers.indices)]
+                .requestFocusNextFrame()
+        }
     }
 
     // ————— 局部可调用组件（共享上面状态，避免大量传参） —————
@@ -332,7 +384,13 @@ fun SettingsScreen(
             Modifier
                 .fillMaxWidth()
                 .focusRequester(groupFocusers[idx])
-                .onFocusChanged { if (it.isFocused) selectedGroupIndex = idx }
+                .onFocusChanged {
+                    if (it.isFocused) {
+                        selectedGroupIndex = idx
+                        // 记下「内容区最后聚焦的节点」，供票据兜底锚回（见 LaunchedEffect(focusTicket)）
+                        lastContentAnchor = "$GROUP_ANCHOR_PREFIX$idx"
+                    }
+                }
                 .onPreviewKeyEvent { event ->
                     if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                     when (event.key) {
@@ -383,6 +441,10 @@ fun SettingsScreen(
         /** 禁用态：**仍可聚焦**（理由同 TvButton —— 正持有焦点的节点突然不可聚焦会把页面切走），
          *  只是不响应确定/右键并按灰色渲染值文本。用于「正在等待系统授权界面」期间锁住入口。 */
         enabled: Boolean = true,
+        /** 分组末行：按 ↓ 吃掉按键。Compose 向下搜索不到候选时会环绕到整棵树第一个可聚焦元素
+         * （= 左栏首个分组「服务器与网络」），必须显式拦截 —— 与 [LeftGroup] 的末项、
+         *  [AboutEntry] 的 `isLast` 同规（漏了这一处，用户实测右栏末行按 ↓ 焦点会跳到首个分组）。 */
+        bottomEdge: Boolean = false,
         onClick: () -> Unit
     ) {
         val requester = remember(focusKey) { FocusRequester() }
@@ -397,7 +459,11 @@ fun SettingsScreen(
                 // 与原先的内容缩进完全一致（文本位置不动），只是描边不再贴着卡片边缘。
                 .padding(horizontal = 12.dp)
                 .focusRequester(requester)
-                .onFocusChanged { rowFocused[focusKey] = it.isFocused }
+                .onFocusChanged {
+                    rowFocused[focusKey] = it.isFocused
+                    // 记下「内容区最后聚焦的节点」，供票据兜底锚回（见 LaunchedEffect(focusTicket)）
+                    if (it.isFocused) lastContentAnchor = focusKey
+                }
                 // tvFocus 必须挂在可聚焦修饰符（clickable）的**上游**：它内部的 onFocusChanged
                 // 只能观察到「下游」的焦点节点，写在 clickable 之后会观察不到 → 焦点高亮整行不显示
                 // （实测：设置页所有设置行按方向键移动时看不到任何高亮）。
@@ -425,6 +491,9 @@ fun SettingsScreen(
                         Key.DirectionRight -> { if (enabled) onClick(); true }
                         // 每组的首行按上 → 回到顶部「设置」标签（与媒体页内容区按上回标签一致）
                         Key.DirectionUp -> { if (topEdge) onFocusTabs(); topEdge }
+                        // 分组末行按下：吃掉按键（与 LeftGroup 末项、AboutEntry isLast 同规），
+                        // 否则 Compose 环绕到整棵树第一个可聚焦元素 = 左栏「服务器与网络」
+                        Key.DirectionDown -> bottomEdge
                         else -> false
                     }
                 }
@@ -519,7 +588,11 @@ fun SettingsScreen(
                 // 留出 12dp 后四边都可见（tvFocus 的 scale(1.03) 放大只占去约 8dp，仍在留白内）。
                 .padding(horizontal = 12.dp)
                 .focusRequester(requester)
-                .onFocusChanged { rowFocused[focusKey] = it.isFocused }
+                .onFocusChanged {
+                    rowFocused[focusKey] = it.isFocused
+                    // 记下「内容区最后聚焦的节点」，供票据兜底锚回（见 LaunchedEffect(focusTicket)）
+                    if (it.isFocused) lastContentAnchor = focusKey
+                }
                 // tvFocus 放在 focusable 之前（上游），理由同 SettingRow：其 onFocusChanged
                 // 只观察下游焦点节点，写在下游会导致条目聚焦时没有任何视觉反馈。
                 .tvFocus()
@@ -595,11 +668,14 @@ fun SettingsScreen(
                 } else false
             }
     ) {
-        // 左侧分组
+        // 左侧分组：整栏可滚动（矮屏上 5 个分组 + 标题会高于可视区，末项「关于」否则被裁掉）。
+        // 内容不超出视口时 `fillMaxHeight` 撑满 + `Arrangement.Center` 居中，
+        // 与改造前逐像素一致（电视/平板不受影响）；超出时整栏滚动。
         Column(
             Modifier
                 .width(280.dp)
-                .fillMaxHeight(),
+                .fillMaxHeight()
+                .verticalScroll(leftScrollState),
             verticalArrangement = Arrangement.Center
         ) {
             Text(
@@ -616,15 +692,16 @@ fun SettingsScreen(
 
         Spacer(Modifier.width(28.dp))
 
-        // 右侧详情
+        // 右侧详情：整栏可滚动（理由同左侧 —— 矮屏下「存储与数据」等内容会超出可视区）。
+        // 「关于」内容最长，靠上排列；其余分组内容较少，维持垂直居中
+        // （`fillMaxHeight` + `Arrangement.Center` 在内容不超出时与改造前逐像素一致）。
         val group = SettingGroup.entries[selectedGroupIndex]
-        // 「关于」内容较长：内容靠上排列、卡片撑满剩余高度并在卡片内滚动（焦点下移自动滚动）；
-        // 其余分组内容少，维持垂直居中。
         val aboutMode = group == SettingGroup.ABOUT
         Column(
             Modifier
                 .weight(1f)
-                .fillMaxHeight(),
+                .fillMaxHeight()
+                .verticalScroll(detailScrollState),
             verticalArrangement = if (aboutMode) Arrangement.Top else Arrangement.Center
         ) {
             Text(
@@ -636,14 +713,12 @@ fun SettingsScreen(
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = MaterialTheme.colorScheme.surface,
-                modifier = if (aboutMode) Modifier.fillMaxWidth().weight(1f)
-                else Modifier.fillMaxWidth()
+                // 卡片贴着内容高度（不再 `weight(1f)` 撑满）：整栏滚动后卡片随内容自然延伸，
+                // 「关于」的长内容滚到底能完整看到卡片的圆角底边。
+                modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
                     Modifier
-                        .then(
-                            if (aboutMode) Modifier.verticalScroll(aboutScrollState) else Modifier
-                        )
                         .padding(vertical = 8.dp)
                 ) {
                     val g = group
@@ -711,7 +786,8 @@ fun SettingsScreen(
                             }
                             SettingRow(
                                 "${g.title}:3", "设备名称",
-                                deviceNameValue
+                                deviceNameValue,
+                                bottomEdge = true
                             ) {
                                 openChoice("${g.title}:3", ChoiceState(
                                     "设备名称",
@@ -796,7 +872,8 @@ fun SettingsScreen(
                             }
                             SettingRow(
                                 "${g.title}:3", "默认画面比例",
-                                defaultAspectValue.label
+                                defaultAspectValue.label,
+                                bottomEdge = true
                             ) {
                                 openChoice("${g.title}:3", ChoiceState(
                                     "默认画面比例",
@@ -837,7 +914,8 @@ fun SettingsScreen(
                             }
                             SettingRow(
                                 "${g.title}:1", "默认排序方式",
-                                defaultSortValue.label
+                                defaultSortValue.label,
+                                bottomEdge = true
                             ) {
                                 openChoice("${g.title}:1", ChoiceState(
                                     "默认排序方式",
@@ -980,7 +1058,10 @@ fun SettingsScreen(
                                     Toast.makeText(context, "已清空播放历史", Toast.LENGTH_SHORT).show()
                                 })
                             }
-                            SettingRow("${g.title}:6", "手动触发对账", "刷新媒体库") {
+                            SettingRow(
+                                "${g.title}:6", "手动触发对账", "刷新媒体库",
+                                bottomEdge = true
+                            ) {
                                 scope.launch {
                                     val r = syncManager.sync()
                                     // 降级模式跳过了「同步外部删除」（防误删），提示里注明
@@ -1023,38 +1104,69 @@ fun SettingsScreen(
         LaunchedEffect(cs.title, cs.selectedIndex) {
             runCatching { selectedOptionFocus.requestFocusNextFrame() }
         }
+        // 选项列表独立滚动状态：换弹框（标题变化）时回到顶部，
+        // 打开后由「选中项请求焦点」自带的 bring-into-view 把当前值滚进视野。
+        val listScroll = remember(cs.title) { ScrollState(0) }
         Dialog(onDismissRequest = { choiceState = null }) {
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
-                Column(Modifier.padding(28.dp).width(380.dp)) {
-                    Text(
-                        cs.title,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    cs.options.forEachIndexed { i, opt ->
-                        OptionRow(
-                            text = opt,
-                            selected = i == cs.selectedIndex,
-                            modifier = if (i == cs.selectedIndex) {
-                                Modifier.focusRequester(selectedOptionFocus)
-                            } else Modifier
+            // 选项个数是**可变**的（设备名 8 项、存储卷 N 项、保活策略还带逐项说明），
+            // 矮屏上很容易超出屏幕高度 —— 而 Dialog 的内容超出可视区时**只会被裁掉、不会滚动**
+            // （用户实测：「设备名称」弹框列了很多名字，后面的看不到也够不到）。
+            // 这里用 BoxWithConstraints 量出弹框实际可用高度，给选项列表一个高度上限 +
+            // verticalScroll：装得下 → 贴内容高度（外观与改造前逐像素一致）；
+            // 装不下 → 列表内滚动（遥控器焦点上下移动自动带进视野，手机可手指拖动）。
+            BoxWithConstraints {
+                val config = LocalConfiguration.current
+                val compact = config.screenHeightDp < COMPACT_SCREEN_HEIGHT_DP
+                val outerPadding = if (compact) 18.dp else 28.dp
+                // 预留：上下内边距 + 标题行 + 标题下间距（+ 少量余量）
+                val chrome = outerPadding * 2 + 38.dp
+                // maxHeight 是「本地 dp」—— 内容区已按 [COMPACT_CONTENT_DENSITY_SCALE] 覆盖过密度，
+                // 本地 dp 比物理 dp 小。兜底：万一平台给的是无限约束，用物理屏高换算成同一套本地 dp。
+                val scale = if (compact) COMPACT_CONTENT_DENSITY_SCALE else 1f
+                val available = if (maxHeight == Dp.Infinity) {
+                    config.screenHeightDp.dp / scale * 0.92f
+                } else {
+                    maxHeight * 0.98f
+                }
+                val listMaxHeight = (available - chrome).coerceAtLeast(140.dp)
+                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+                    Column(Modifier.padding(outerPadding).width(380.dp)) {
+                        Text(
+                            cs.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.height(if (compact) 10.dp else 14.dp))
+                        Column(
+                            Modifier
+                                .heightIn(max = listMaxHeight)
+                                .verticalScroll(listScroll)
                         ) {
-                            choiceState = null
-                            cs.onPick(i)
+                            cs.options.forEachIndexed { i, opt ->
+                                OptionRow(
+                                    text = opt,
+                                    selected = i == cs.selectedIndex,
+                                    modifier = if (i == cs.selectedIndex) {
+                                        Modifier.focusRequester(selectedOptionFocus)
+                                    } else Modifier
+                                ) {
+                                    choiceState = null
+                                    cs.onPick(i)
+                                }
+                                // 逐项说明（灰色小字，对齐选项文字起点）：仅当调用方提供了 descriptions 时渲染
+                                cs.descriptions?.getOrNull(i)?.let { desc ->
+                                    Text(
+                                        desc,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = OnDarkDim,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(start = 16.dp, end = 4.dp, bottom = 6.dp)
+                                    )
+                                }
+                                Spacer(Modifier.height(4.dp))
+                            }
                         }
-                        // 逐项说明（灰色小字，对齐选项文字起点）：仅当调用方提供了 descriptions 时渲染
-                        cs.descriptions?.getOrNull(i)?.let { desc ->
-                            Text(
-                                desc,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = OnDarkDim,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(start = 16.dp, end = 4.dp, bottom = 6.dp)
-                            )
-                        }
-                        Spacer(Modifier.height(4.dp))
                     }
                 }
             }

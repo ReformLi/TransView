@@ -9,8 +9,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
-import androidx.compose.ui.platform.LocalConfiguration
 import com.hpu.transview.ui.common.LocalIsTouchMode
+import com.hpu.transview.ui.common.rememberContentWidthDp
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -201,9 +201,12 @@ fun LibraryScreen(
     // 必须和 GridCells.Fixed 用同一个变量，否则焦点边界会错位。
     val gridColumns = SettingsStore.gridColumns
     // 手机横屏（屏宽较小）按宽度收敛列数，最低 3 列；TV 大屏仍用用户设置值。
-    // screenWidthDp 在组合体内读取（与 LocalContext.current 同级），再作为 remember 的入参，
-    // 避免在 remember 计算 lambda 内调用 CompositionLocal.current 触发组合上下文告警。
-    val screenW = LocalConfiguration.current.screenWidthDp
+    // 宽度走 rememberContentWidthDp()：矮屏下内容区被 CompactContentDensity 整体缩小后，
+    // 实际可用的逻辑宽度比 Activity 配置值大（约 1/0.87）。若按配置值算，收敛值会偏小，
+    // 把用户设置的列数错误压掉（配置值 800dp 算得 5 列 → 把「6 列」压成 5 列；
+    // 实际可用 919dp 本就能容纳 6 列）。helper 内部在组合体读取、remember 缓存，
+    // 避免在 remember lambda 里取 CompositionLocal。
+    val screenW = rememberContentWidthDp()
     val effectiveColumns = remember(gridColumns, screenW) {
         gridColumns.coerceAtMost((screenW / 150).coerceAtLeast(3))
     }
@@ -582,13 +585,15 @@ fun LibraryScreen(
                         onDelete = { pendingDelete = entry },
                         // 第一行按「上键」→ 本页工具条（网格已滚到顶才算是第一行，否则交回 Compose 做网格内上行）
                         onNavigateUp = {
-                            if (gridIndex < gridColumns && gridState.firstVisibleItemIndex == 0) {
+                            // 与 GridCells.Fixed(effectiveColumns) 必须同源：两者若不等，
+                            // 「第一行 / 行首 / 行尾」判定就会错位（手机端屏宽收敛列数时尤其明显）。
+                            if (gridIndex < effectiveColumns && gridState.firstVisibleItemIndex == 0) {
                                 runCatching { toolbarFocus.requestFocus() }
                                 true
                             } else false
                         },
-                        stayOnLeftEdge = gridIndex % gridColumns == 0,
-                        stayOnRightEdge = (gridIndex + 1) % gridColumns == 0 ||
+                        stayOnLeftEdge = gridIndex % effectiveColumns == 0,
+                        stayOnRightEdge = (gridIndex + 1) % effectiveColumns == 0 ||
                             gridIndex + 1 >= totalGridItems
                     )
                 }

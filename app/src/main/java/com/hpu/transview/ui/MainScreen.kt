@@ -58,6 +58,8 @@ import com.hpu.transview.model.Category
 import com.hpu.transview.model.MainTab
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.ui.common.COMPACT_SCREEN_HEIGHT_DP
+import com.hpu.transview.ui.common.CompactContentDensity
 import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.LocalIsTouchMode
 import com.hpu.transview.ui.library.LibraryScreen
@@ -109,7 +111,8 @@ fun MainScreen() {
     val config = LocalConfiguration.current
     // 手机横屏：高度方向 dp 较小（通常 < 480），顶部导航栏需紧凑化，否则在矮屏上占去半屏。
     // TV/盒子高度 dp 一般 >= 720，不进入紧凑模式。
-    val isCompact = config.screenHeightDp < 480
+    // 判据走共享常量 COMPACT_SCREEN_HEIGHT_DP：与上传页左面板、内容区整体缩放必须同阈值。
+    val isCompact = config.screenHeightDp < COMPACT_SCREEN_HEIGHT_DP
     LaunchedEffect(touchAnchorTick) {
         if (touchAnchorTick == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(150)
@@ -302,8 +305,12 @@ fun MainScreen() {
         // 注：不要在这里挂 `focusProperties { exit = { FocusRequester.Cancel } }` 当「焦点围墙」——
         // 实测它会连带让内容区内的程序化 `requestFocus()`（如首行按上键跳到本页工具条）失效。
         // 边界保护统一走各页面自己的 `onPreviewKeyEvent` 拦截。
-        Box(
-            Modifier
+        // ——— 矮屏（手机横屏）内容区整体等比缩放 ———
+        // 顶部导航栏在**覆盖之外**，保持用户认可的尺寸（「标签栏字体和大小正合适」）；
+        // 内容区里所有 dp/sp 同步缩到约 0.87，字号与间距/图标/卡片的比例关系不变。
+        // 详见 CompactContentDensity 的注释。TV / 平板不做任何覆盖，逐像素不变。
+        CompactContentDensity(
+            modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 // ——— 触摸焦点锚点 ———

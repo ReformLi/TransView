@@ -61,6 +61,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
@@ -77,6 +78,7 @@ import com.hpu.transview.data.db.UploadRecordEntity
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.ui.common.COMPACT_SCREEN_HEIGHT_DP
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.common.TypeBadge
 import com.hpu.transview.ui.common.requestFocusNextFrame
@@ -200,20 +202,41 @@ fun UploadScreen(
         } else null
     }
 
-    // 宽屏左右分栏：左侧固定区（二维码 + 地址 + 服务器状态）不滚动，右侧上传记录可滚动
+    // 宽屏左右分栏：左侧固定区（二维码 + 地址 + 服务器状态）不滚动，右侧上传记录可滚动。
+    //
+    // ——— 矮屏（手机横屏）紧凑模式 ———
+    // 左面板是「二维码 → 访问码 → 地址 → 复制 → 提示」的**竖向堆叠**，二维码靠 `weight(1f)`
+    // 吃掉剩余高度，所以**面板高度直接等于二维码能长多大**。手机横屏时内容区只剩 ~300dp
+    // （TV 有 ~950dp），而原先那批固定项 —— 标题 30 + 访问码牌 48 + 地址 26 + 复制 36 +
+    // 两行提示 36 + 间距 ~30 ≈ 200dp —— 会把二维码压到几十 dp，看上去就是「二维码没了」
+    //（用户实测反馈）。同时左面板只占宽度 0.9/2.9 ≈ 31%（手机横屏下约 215dp、内部仅 171dp），
+    // 装不下 16sp 的 `http://192.168.x.x:2333`（约 205dp），被 `Ellipsis` 截成「…」。
+    //
+    // 判据用 `screenHeightDp < 480`，与 MainScreen 顶部导航栏的 isCompact **同一阈值**
+    // （顶部栏紧凑时本页也紧凑，观感一致）。手机横屏高度在 360~410dp，TV 是 720/1080、
+    // 平板横屏 800+，都落在阈值两侧，不会误判。紧凑时：整页留白 40/18 → 16/10、
+    // 左面板占比 31% → 46%（地址拿到 ~300dp，能整行显示），ServerPanel 内部再按上面那套收紧
+    // —— 合计把二维码从「被压到几十 dp」拉回 ~145dp，可正常扫码。
+    // **TV / 平板走原路径，逐像素不变。**
+    val compact = LocalConfiguration.current.screenHeightDp < COMPACT_SCREEN_HEIGHT_DP
     Row(
         Modifier
             .fillMaxSize()
             // 竖向留白 18dp（原 24dp）：左面板是「二维码 + 访问码 + 地址 + 复制」的竖向堆叠，
             // 高度直接决定二维码能长多大；把这 12dp 让给二维码，宽屏下的观感更好
-            .padding(horizontal = 40.dp, vertical = 18.dp),
-        horizontalArrangement = Arrangement.spacedBy(28.dp)
+            .padding(
+                horizontal = if (compact) 16.dp else 40.dp,
+                vertical = if (compact) 10.dp else 18.dp
+            ),
+        horizontalArrangement = Arrangement.spacedBy(if (compact) 18.dp else 28.dp)
     ) {
         // ——— 左侧固定区：二维码 + 地址 + 服务器状态 + 存储状态 ———
         ServerPanel(
             modifier = Modifier
-                .weight(0.9f)
+                // 紧凑时 0.85 : 1（左面板占 46%，地址够宽）；宽屏沿用 0.9 : 2（占 31%）
+                .weight(if (compact) 0.85f else 0.9f)
                 .fillMaxHeight(),
+            compact = compact,
             running = running,
             hibernated = hibernated,
             mode = mode,
@@ -230,7 +253,8 @@ fun UploadScreen(
         // ——— 右侧：上传记录（可滚动） ———
         Column(
             Modifier
-                .weight(2f)
+                // 紧凑时与左面板 0.85 : 1；宽屏沿用 0.9 : 2
+                .weight(if (compact) 1f else 2f)
                 .fillMaxHeight()
         ) {
             // 列表头：标题 + 清空入口
@@ -385,6 +409,8 @@ fun UploadScreen(
 @Composable
 private fun ServerPanel(
     modifier: Modifier,
+    /** 矮屏紧凑模式（手机横屏）：省掉冗余标题、地址与复制并排、各段间距收紧，把高度让给二维码 */
+    compact: Boolean,
     running: Boolean,
     hibernated: Boolean,
     mode: ServerMode,
@@ -406,20 +432,31 @@ private fun ServerPanel(
             // 竖向是一条「从上到下、越往下越次要」的信息流：
             //   标题 → 二维码（主） → 访问码牌（次主，有色块承载） → 地址 → 复制 → 提示
             // 二维码用 weight(1f) 吃掉所有剩余高度，所以上面每一块的高度都要抠着给。
+            //
+            // 矮屏（手机横屏）下上面这几块的**固定高度直接等于二维码被压掉的高度**，所以：
+            //   · 省略标题（顶部导航栏已写着「上传」，二维码本身也自明）—— 省 30dp；
+            //   · 地址与「复制」并排一行、复制按钮收成纯图标 —— 省 36dp；
+            //   · 各段间距 10 → 6、面板竖向留白 16 → 12、访问码牌内边距 8 → 5 —— 再省 20dp。
+            // 合计把二维码从「被压到几十 dp」拉回 ~145dp，可正常扫码。
             Column(
                 Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 22.dp, vertical = 16.dp),
+                    .padding(
+                        horizontal = if (compact) 18.dp else 22.dp,
+                        vertical = if (compact) 12.dp else 16.dp
+                    ),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(
-                    "手机扫码上传",
-                    // labelLarge（14sp）：比 titleMedium 矮 4dp，且这不是强调信息，
-                    // 不需要和「访问码」抢视觉层级
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Spacer(Modifier.height(10.dp))
+                if (!compact) {
+                    Text(
+                        "手机扫码上传",
+                        // labelLarge（14sp）：比 titleMedium 矮 4dp，且这不是强调信息，
+                        // 不需要和「访问码」抢视觉层级
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
 
                 // 二维码占据中间剩余空间**自动缩放**：写死尺寸（原 180dp）在 720p 上会把下方文案
                 // 整个挤出面板（历史问题）。这里用 BoxWithConstraints 量出可用空间后显式取正方形边长，
@@ -452,7 +489,7 @@ private fun ServerPanel(
                     )
                 }
 
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
 
                 // ——— 访问码牌 ———
                 // 做成一条**有底色的横条**，而不是原来那行裸文字：访问码是「手输方式的唯一凭据」，
@@ -469,13 +506,13 @@ private fun ServerPanel(
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                            .padding(horizontal = 16.dp, vertical = if (compact) 5.dp else 8.dp),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
                             "访问码",
-                            // bodyMedium（14sp）：原来用 bodySmall，紧贴 24sp 的大字会显得标签"没做完"
+                            // bodyMedium（14sp）：原来用 bodySmall，紧贴 24sp 的大字会显得标签“没做完”
                             style = MaterialTheme.typography.bodyMedium,
                             color = OnDarkDim
                         )
@@ -489,25 +526,46 @@ private fun ServerPanel(
                     }
                 }
 
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
 
                 val address = if (ip != null) "http://$ip:$port" else null
                 if (address != null) {
-                    Text(
-                        address,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Spacer(Modifier.height(2.dp))
                     // 复制**带访问码**的完整链接：粘到手机浏览器即直接通过认证，等价于扫码。
                     // 屏幕上显示的仍是不带码的短地址（手输用），两者用途不同。
-                    CopyAddressButton(
-                        copyText = "http://$ip:$port/?token=${token ?: ""}",
-                        displayText = address
-                    )
+                    val copyText = "http://$ip:$port/?token=${token ?: ""}"
+                    if (compact) {
+                        // 矮屏：地址与复制并排，复制收成纯图标 —— 换掉「地址一行 + 复制一行」，
+                        // 省下整整 36dp，正好还给二维码。窄机型（横屏仅 ~640dp 宽）地址允许折成
+                        // 两行：宁可多占一行高度，也不要再被截成「…」（用户反馈的第二个问题）。
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Text(
+                                address,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                textAlign = TextAlign.Center,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            CopyAddressButton(copyText, address, iconOnly = true)
+                        }
+                    } else {
+                        Text(
+                            address,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        CopyAddressButton(copyText, address)
+                    }
                 } else {
                     Text(
                         "无法获取网络地址\n请检查网络连接",
@@ -517,7 +575,7 @@ private fun ServerPanel(
                     )
                 }
 
-                Spacer(Modifier.height(2.dp))
+                Spacer(Modifier.height(if (compact) 4.dp else 2.dp))
 
                 // 只留一行：原来两行提示要占 32dp 高度，而高度预算归二维码。
                 // 「手输要填访问码」由上方那条色块本身说明，不必再用文字复述。
@@ -530,7 +588,7 @@ private fun ServerPanel(
                 // 这里不再重复「当前模式」：顶部状态区（服务器运行中 · 极速模式）已经显示，
                 // 重复一行只会挤掉二维码的可用高度。省下的空间由上面的 weight(1f) 自动给二维码。
 
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(if (compact) 2.dp else 4.dp))
                 // 活动存储状态（外接盘拔出自动降级/插回恢复）：一行 bodySmall（~16dp），
                 // 超出的高度同样由 weight(1f) 的二维码吸收
                 StorageStatusRow(storageLabel, storageFreeBytes, storageDegradedLabel)
@@ -540,7 +598,10 @@ private fun ServerPanel(
             Column(
                 Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 24.dp, vertical = 26.dp),
+                    .padding(
+                        horizontal = if (compact) 18.dp else 24.dp,
+                        vertical = if (compact) 16.dp else 26.dp
+                    ),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
@@ -789,7 +850,7 @@ private fun ConfirmDialog(
  * [displayText] 只用于提示语里说明这是哪台电视的地址，避免 Toast 太长。
  */
 @Composable
-private fun CopyAddressButton(copyText: String, displayText: String) {
+private fun CopyAddressButton(copyText: String, displayText: String, iconOnly: Boolean = false) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
@@ -811,7 +872,8 @@ private fun CopyAddressButton(copyText: String, displayText: String) {
             }
             // 竖向 padding 收到 5dp：这是一个「附属于地址行」的次要操作，
             // 40dp 的点击热区在焦点框里显得虚胖，也白占左面板本就紧张的高度
-            .padding(horizontal = 12.dp, vertical = 5.dp),
+            // 纯图标态（矮屏，与地址并排）再收一点左右留白，给地址多让出宽度
+            .padding(horizontal = if (iconOnly) 8.dp else 12.dp, vertical = if (iconOnly) 6.dp else 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
@@ -819,11 +881,13 @@ private fun CopyAddressButton(copyText: String, displayText: String) {
             tint = if (copied) SuccessGreen else MaterialTheme.colorScheme.primary,
             modifier = Modifier.size(22.dp)
         )
-        Text(
-            if (copied) "已复制" else "复制链接",
-            style = MaterialTheme.typography.bodyLarge,
-            color = if (copied) SuccessGreen else MaterialTheme.colorScheme.primary
-        )
+        if (!iconOnly) {
+            Text(
+                if (copied) "已复制" else "复制链接",
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (copied) SuccessGreen else MaterialTheme.colorScheme.primary
+            )
+        }
     }
 }
 
