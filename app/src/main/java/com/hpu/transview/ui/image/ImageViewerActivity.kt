@@ -7,6 +7,8 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import com.hpu.transview.ui.common.ProvideTouchMode
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
@@ -22,6 +24,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -105,6 +109,7 @@ class ImageViewerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val path = intent.getStringExtra(EXTRA_PATH)
@@ -127,7 +132,9 @@ class ImageViewerActivity : ComponentActivity() {
 
         setContent {
             TransViewTheme {
-                ViewerScreen()
+                ProvideTouchMode {
+                    ViewerScreen()
+                }
             }
         }
     }
@@ -410,6 +417,8 @@ class ImageViewerActivity : ComponentActivity() {
                         .background(
                             Brush.verticalGradient(listOf(Color(0xCC000000), Color.Transparent))
                         )
+                        .navigationBarsPadding()
+                        .displayCutoutPadding()
                         .padding(horizontal = 40.dp, vertical = 24.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -445,6 +454,8 @@ class ImageViewerActivity : ComponentActivity() {
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
                         .background(Color(0x99000000))
+                        .navigationBarsPadding()
+                        .displayCutoutPadding()
                         .zIndex(1f)
                 ) {
                     // 前后各留「半屏 - 半个缩略图」的空白，让任意一张都能滚到正中央

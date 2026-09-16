@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -49,6 +50,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.dp
@@ -57,6 +59,7 @@ import com.hpu.transview.model.MainTab
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.requestFocusNextFrame
+import com.hpu.transview.ui.common.LocalIsTouchMode
 import com.hpu.transview.ui.library.LibraryScreen
 import com.hpu.transview.ui.settings.SettingsScreen
 import com.hpu.transview.ui.theme.OnDarkDim
@@ -103,6 +106,10 @@ fun MainScreen() {
     val contentAnchor = remember { FocusRequester() }
     val windowInfo = LocalWindowInfo.current
     val rootView = LocalView.current
+    val config = LocalConfiguration.current
+    // 手机横屏：高度方向 dp 较小（通常 < 480），顶部导航栏需紧凑化，否则在矮屏上占去半屏。
+    // TV/盒子高度 dp 一般 >= 720，不进入紧凑模式。
+    val isCompact = config.screenHeightDp < 480
     LaunchedEffect(touchAnchorTick) {
         if (touchAnchorTick == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(150)
@@ -222,12 +229,13 @@ fun MainScreen() {
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .safeDrawingPadding()
     ) {
         // 顶部导航栏
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 40.dp, vertical = 20.dp)
+                .padding(horizontal = if (isCompact) 16.dp else 40.dp, vertical = if (isCompact) 8.dp else 20.dp)
                 // 跟踪「焦点是否在标签栏」：返回键据此区分「标签上的返回（回上传/退出）」与
                 // 「内容区的返回（回选中标签）」。hasFocus 含子树（四个媒体标签 + 设置标签）。
                 // 焦点离开标签栏（进入内容区 / 设置页）→ 取消未完成的「再按一次退出」确认。
@@ -237,14 +245,17 @@ fun MainScreen() {
                 },
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                "传视 TransView",
-                style = MaterialTheme.typography.titleLarge,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.width(28.dp))
+            if (!isCompact) {
+                Text(
+                    "传视 TransView",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(28.dp))
+            }
             MainTab.entries.forEachIndexed { index, tab ->
                 TabChip(
+                    compact = isCompact,
                     title = tab.title,
                     // 设置页打开时不显示媒体标签的「选中」态，避免「其他」残留高亮
                     selected = !showSettings && tab == selected,
@@ -273,6 +284,7 @@ fun MainScreen() {
             // 功能不变：聚焦即打开设置页、焦点留在其上、按 ↓ 进入设置页选项、内容区按上键回到它。
             Spacer(Modifier.weight(1f))
             TabChip(
+                compact = isCompact,
                 title = "设置",
                 selected = showSettings,
                 onNavigateDown = { settingsFocusTicket++ },
@@ -283,7 +295,7 @@ fun MainScreen() {
                     }
             ) { showSettings = true }
             Spacer(Modifier.width(20.dp))
-            ServerStatusBadge()
+            ServerStatusBadge(compact = isCompact)
         }
 
         // 内容区（返回键见上面的 BackHandler）
@@ -361,9 +373,12 @@ private fun TabChip(
     selected: Boolean,
     onNavigateDown: () -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
     onClick: () -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
+    val isTouchMode = LocalIsTouchMode.current
+    val showFocus = focused && !isTouchMode
     Box(
         modifier
             .onFocusChanged { focused = it.isFocused }
@@ -384,24 +399,24 @@ private fun TabChip(
             .clip(RoundedCornerShape(50))
             .background(
                 when {
-                    focused -> MaterialTheme.colorScheme.primary
+                    showFocus -> MaterialTheme.colorScheme.primary
                     selected -> MaterialTheme.colorScheme.surfaceVariant
                     else -> Color.Transparent
                 }
             )
             .border(
                 width = 1.dp,
-                color = if (selected || focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                color = if (selected || showFocus) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
                 else MaterialTheme.colorScheme.outlineVariant,
                 shape = RoundedCornerShape(50)
             )
             .clickable { onClick() }
-            .padding(horizontal = 30.dp, vertical = 10.dp)
+            .padding(horizontal = if (compact) 14.dp else 30.dp, vertical = if (compact) 6.dp else 10.dp)
     ) {
         Text(
             title,
-            style = MaterialTheme.typography.titleMedium,
-            color = if (focused) MaterialTheme.colorScheme.onPrimary
+            style = if (compact) MaterialTheme.typography.labelLarge else MaterialTheme.typography.titleMedium,
+            color = if (showFocus) MaterialTheme.colorScheme.onPrimary
             else if (selected) MaterialTheme.colorScheme.primary
             else OnDarkDim
         )
@@ -410,7 +425,7 @@ private fun TabChip(
 
 /** 右上角服务器状态徽标（运行状态 + 当前模式） */
 @Composable
-private fun ServerStatusBadge() {
+private fun ServerStatusBadge(compact: Boolean = false) {
     val running by ServerBus.running.collectAsState()
     val mode by ServerBus.mode.collectAsState()
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -420,19 +435,22 @@ private fun ServerStatusBadge() {
                 .clip(CircleShape)
                 .background(if (running) SuccessGreen else DangerRed)
         )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            if (running) "服务器运行中" else "服务器已停止",
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (running) SuccessGreen else DangerRed
-        )
-        Spacer(Modifier.width(10.dp))
-        Text(
-            // 首页只显示模式名本身（极速/智能/省电），不带「模式」后缀；设置页等处仍用完整 label
-            "· ${mode.label.removeSuffix("模式")}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = OnDarkDim
-        )
+        // 紧凑模式（手机横屏窄屏）只保留状态圆点，避免顶部栏横向溢出/占比过大。
+        if (!compact) {
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (running) "服务器运行中" else "服务器已停止",
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (running) SuccessGreen else DangerRed
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                // 首页只显示模式名本身（极速/智能/省电），不带「模式」后缀；设置页等处仍用完整 label
+                "· ${mode.label.removeSuffix("模式")}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = OnDarkDim
+            )
+        }
     }
 }
 

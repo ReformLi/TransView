@@ -21,6 +21,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.hpu.transview.service.ServerService
 import com.hpu.transview.ui.MainScreen
 import com.hpu.transview.ui.permission.PermissionScreen
+import com.hpu.transview.ui.common.ProvideTouchMode
 import com.hpu.transview.ui.theme.TransViewTheme
 import com.hpu.transview.util.IntentUtils
 import com.hpu.transview.util.StoragePermission
@@ -33,7 +34,9 @@ class MainActivity : ComponentActivity() {
         ServerService.start(this)
         setContent {
             TransViewTheme {
-                AppRoot()
+                ProvideTouchMode {
+                    AppRoot()
+                }
             }
         }
     }

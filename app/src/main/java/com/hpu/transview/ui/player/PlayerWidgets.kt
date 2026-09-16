@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import com.hpu.transview.ui.common.LocalIsTouchMode
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -189,14 +190,14 @@ fun PlayerIconButton(
 ) {
     var focused by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = if (focused) 1.1f else 1f,
+        targetValue = if (focused && !LocalIsTouchMode.current) 1.1f else 1f,
         animationSpec = tween(120),
         label = "playerIconBtnScale"
     )
     val shape = RoundedCornerShape(if (emphasized) 14.dp else 10.dp)
     val tint = when {
-        !enabled -> Color.White.copy(alpha = if (focused) 0.40f else 0.28f)
-        focused -> MaterialTheme.colorScheme.onPrimary
+        !enabled -> Color.White.copy(alpha = if (focused && !LocalIsTouchMode.current) 0.40f else 0.28f)
+        focused && !LocalIsTouchMode.current -> MaterialTheme.colorScheme.onPrimary
         emphasized -> MaterialTheme.colorScheme.primary
         else -> Color.White
     }
@@ -214,9 +215,9 @@ fun PlayerIconButton(
             .background(
                 when {
                     // 禁用态不给主色填充（暗图标压在亮蓝上会糊成一片），改用灰底
-                    !enabled && focused -> Color.White.copy(alpha = 0.14f)
+                    !enabled && focused && !LocalIsTouchMode.current -> Color.White.copy(alpha = 0.14f)
                     !enabled -> Color.White.copy(alpha = 0.06f)
-                    focused -> MaterialTheme.colorScheme.primary
+                    focused && !LocalIsTouchMode.current -> MaterialTheme.colorScheme.primary
                     emphasized -> MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
                     else -> Color.White.copy(alpha = 0.10f)
                 }
@@ -224,9 +225,9 @@ fun PlayerIconButton(
             .then(
                 when {
                     // 禁用态的焦点提示：灰色描边（焦点位置依然看得见，但一眼可辨「不可用」）
-                    !enabled && focused -> Modifier.border(2.dp, Color.White.copy(alpha = 0.45f), shape)
+                    !enabled && focused && !LocalIsTouchMode.current -> Modifier.border(2.dp, Color.White.copy(alpha = 0.45f), shape)
                     !enabled -> Modifier
-                    focused -> Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape)
+                    focused && !LocalIsTouchMode.current -> Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape)
                     emphasized -> Modifier.border(
                         1.dp,
                         MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
@@ -254,7 +255,7 @@ fun PlayerTextButton(
 ) {
     var focused by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = if (focused) 1.08f else 1f,
+        targetValue = if (focused && !LocalIsTouchMode.current) 1.08f else 1f,
         animationSpec = tween(120),
         label = "playerTextBtnScale"
     )
@@ -271,7 +272,7 @@ fun PlayerTextButton(
             }
             .clip(shape)
             .background(
-                if (focused) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.10f)
+                if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.10f)
             )
             .then(
                 if (focused) {
@@ -285,7 +286,7 @@ fun PlayerTextButton(
         Text(
             text = text,
             style = MaterialTheme.typography.bodyLarge,
-            color = if (focused) MaterialTheme.colorScheme.onPrimary else Color.White
+            color = if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.onPrimary else Color.White
         )
     }
 }
@@ -312,7 +313,7 @@ fun PlayerProgressBar(
         if (duration > 0) (buffered.toFloat() / duration).coerceIn(0f, 1f) else 0f
     val primary = MaterialTheme.colorScheme.primary
     val focusLevel by animateFloatAsState(
-        targetValue = if (focused) 1f else 0f,
+        targetValue = if (focused && !LocalIsTouchMode.current) 1f else 0f,
         animationSpec = tween(160),
         label = "progressBarFocus"
     )
@@ -485,7 +486,7 @@ fun SelectorPill(
 ) {
     var focused by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = if (focused) 1.08f else 1f,
+        targetValue = if (focused && !LocalIsTouchMode.current) 1.08f else 1f,
         animationSpec = tween(120),
         label = "selectorPillScale"
     )
@@ -519,7 +520,7 @@ fun SelectorPill(
         Text(
             text = text,
             style = MaterialTheme.typography.bodyLarge,
-            color = if (focused) MaterialTheme.colorScheme.onPrimary else Color.White
+            color = if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.onPrimary else Color.White
         )
     }
 }

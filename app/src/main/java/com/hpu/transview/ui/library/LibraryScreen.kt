@@ -9,6 +9,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
+import androidx.compose.ui.platform.LocalConfiguration
+import com.hpu.transview.ui.common.LocalIsTouchMode
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -172,6 +174,13 @@ fun LibraryScreen(
     // 列数同时决定网格的「行首/行尾」判定（stayOnLeftEdge / stayOnRightEdge 与第一行判断），
     // 必须和 GridCells.Fixed 用同一个变量，否则焦点边界会错位。
     val gridColumns = SettingsStore.gridColumns
+    // 手机横屏（屏宽较小）按宽度收敛列数，最低 3 列；TV 大屏仍用用户设置值。
+    // screenWidthDp 在组合体内读取（与 LocalContext.current 同级），再作为 remember 的入参，
+    // 避免在 remember 计算 lambda 内调用 CompositionLocal.current 触发组合上下文告警。
+    val screenW = LocalConfiguration.current.screenWidthDp
+    val effectiveColumns = remember(gridColumns, screenW) {
+        gridColumns.coerceAtMost((screenW / 150).coerceAtLeast(3))
+    }
 
     var actionEntry by remember { mutableStateOf<FileEntry?>(null) }
     var pendingDelete by remember { mutableStateOf<FileEntry?>(null) }
@@ -490,7 +499,7 @@ fun LibraryScreen(
             }
             entries.isEmpty() && atRoot -> EmptyHint()
             else -> LazyVerticalGrid(
-                columns = GridCells.Fixed(gridColumns),
+                columns = GridCells.Fixed(effectiveColumns),
                 state = gridState,
                 // hasFocus = 网格自身或其中任一卡片持有焦点。目录切换 / 返回上级 /
                 // 删除前据此决定是否需要「焦点安全港」：遥控器（键盘焦点）路径必须先停靠，
@@ -759,16 +768,16 @@ private fun MediaCard(
 
     Column(
         Modifier
-            .zIndex(if (focused) 1f else 0f)
-            .scale(if (focused) 1.1f else 1f)
+            .zIndex(if (focused && !LocalIsTouchMode.current) 1f else 0f)
+            .scale(if (focused && !LocalIsTouchMode.current) 1.1f else 1f)
             .clip(shape)
             .background(
-                if (focused) MaterialTheme.colorScheme.surfaceVariant
+                if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.surfaceVariant
                 else MaterialTheme.colorScheme.surface
             )
             .border(
                 width = 2.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                color = if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.primary else Color.Transparent,
                 shape = shape
             )
             .focusRequester(focusRequester)
@@ -906,7 +915,7 @@ private fun MediaCard(
                 .fillMaxWidth()
                 // 聚焦时才滚动：长文件名在本卡片获得焦点后循环跑马灯，能完整看全；
                 // 未聚焦保持 Ellipsis 截断（不挂 marquee，避免所有卡片同时滚动分散注意力）。
-                .then(if (focused) titleMarquee else Modifier)
+                .then(if (focused && !LocalIsTouchMode.current) titleMarquee else Modifier)
         )
         Text(
             subtitleOf(entry, childCount),
@@ -955,16 +964,16 @@ private fun UpCard(
 
     Column(
         Modifier
-            .zIndex(if (focused) 1f else 0f)
-            .scale(if (focused) 1.1f else 1f)
+            .zIndex(if (focused && !LocalIsTouchMode.current) 1f else 0f)
+            .scale(if (focused && !LocalIsTouchMode.current) 1.1f else 1f)
             .clip(shape)
             .background(
-                if (focused) MaterialTheme.colorScheme.surfaceVariant
+                if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.surfaceVariant
                 else MaterialTheme.colorScheme.surface
             )
             .border(
                 width = 2.dp,
-                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                color = if (focused && !LocalIsTouchMode.current) MaterialTheme.colorScheme.primary else Color.Transparent,
                 shape = shape
             )
             // 同 MediaCard：按键处理放在焦点目标之前，确定键显式执行

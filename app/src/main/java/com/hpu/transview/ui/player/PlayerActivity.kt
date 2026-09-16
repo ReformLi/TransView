@@ -9,6 +9,8 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import com.hpu.transview.ui.common.ProvideTouchMode
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -31,6 +33,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -329,6 +333,7 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         SettingsStore.init(this) // 读取设置页「播放设置」四项（App 启动时已 init，这里兜底）
 
@@ -369,7 +374,9 @@ class PlayerActivity : ComponentActivity() {
 
         setContent {
             TransViewTheme {
-                PlayerScreen()
+                ProvideTouchMode {
+                    PlayerScreen()
+                }
             }
         }
 
@@ -1093,6 +1100,8 @@ class PlayerActivity : ComponentActivity() {
                 exit = fadeOut(tween(200)) + slideOutHorizontally(tween(220)) { it / 3 },
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
+                    .navigationBarsPadding()
+                    .displayCutoutPadding()
                     .padding(end = 48.dp, bottom = 200.dp)
             ) {
                 Box(Modifier.onFocusChanged { if (it.hasFocus) focusZone = FocusZone.CARD }) {
@@ -1128,6 +1137,8 @@ class PlayerActivity : ComponentActivity() {
                 .background(
                     Brush.verticalGradient(listOf(Color(0xCC000000), Color.Transparent))
                 )
+                .navigationBarsPadding()
+                .displayCutoutPadding()
                 .padding(horizontal = 48.dp, vertical = 26.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -1176,6 +1187,8 @@ class PlayerActivity : ComponentActivity() {
                 // 触屏适配：控制栏「操作区」吸收空白区点击，不触发视频画面的切换逻辑
                 // （子弹框/按钮本身是更深的命中目标，仍会先消费点击）。
                 .pointerInput(Unit) { detectTapGestures { /* 空白区：吸收，无动作 */ } }
+                .navigationBarsPadding()
+                .displayCutoutPadding()
                 .padding(horizontal = 48.dp, vertical = 30.dp)
         ) {
             // ——— 内联选择器（倍速/比例）：时间轴上方横排胶囊 ———

@@ -18,6 +18,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.ui.platform.LocalView
+import android.view.View
+import android.view.ViewTreeObserver.OnTouchModeChangeListener
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
@@ -26,6 +32,25 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
+
+/** 触屏模式：全局可观察，用于触屏交互时隐藏 TV 风格焦点环/描边，遥控器按键时恢复。 */
+val LocalIsTouchMode = compositionLocalOf { false }
+
+/**
+ * 提供全局触屏模式状态：监听 View 的 touch mode 变化（触屏交互后转 true，
+ * 遥控器/键盘按键后转 false），下发给所有焦点组件，使其在触屏下不显示焦点高亮。
+ */
+@Composable
+fun ProvideTouchMode(content: @Composable () -> Unit) {
+    val view = LocalView.current
+    var isTouchMode by remember { mutableStateOf(view.isInTouchMode) }
+    DisposableEffect(view) {
+        val listener = OnTouchModeChangeListener { isTouchMode = it }
+        view.viewTreeObserver.addOnTouchModeChangeListener(listener)
+        onDispose { view.viewTreeObserver.removeOnTouchModeChangeListener(listener) }
+    }
+    CompositionLocalProvider(LocalIsTouchMode provides isTouchMode) { content() }
+}
 
 /**
  * 下一帧再请求焦点。
@@ -44,8 +69,9 @@ suspend fun FocusRequester.requestFocusNextFrame(): Boolean {
     focusedScale: Float = 1.03f
 ): Modifier = composed {
     var focused by remember { mutableStateOf(false) }
+    val isTouchMode = LocalIsTouchMode.current
     val scale by animateFloatAsState(
-        targetValue = if (focused) focusedScale else 1f,
+        targetValue = if (focused && !isTouchMode) focusedScale else 1f,
         animationSpec = tween(120),
         label = "focusScale"
     )
@@ -57,11 +83,11 @@ suspend fun FocusRequester.requestFocusNextFrame(): Boolean {
         }
         .clip(RoundedCornerShape(cornerRadius.dp))
         .background(
-            if (focused) MaterialTheme.colorScheme.surfaceVariant
+            if (focused && !isTouchMode) MaterialTheme.colorScheme.surfaceVariant
             else Color.Transparent
         )
         .then(
-            if (focused) Modifier.border(
+            if (focused && !isTouchMode) Modifier.border(
                 width = 2.dp,
                 color = MaterialTheme.colorScheme.primary,
                 shape = RoundedCornerShape(cornerRadius.dp)
@@ -91,7 +117,8 @@ fun TvButton(
     onClick: () -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
-    val showFocused = focused && showFocusVisual
+    val isTouchMode = LocalIsTouchMode.current
+    val showFocused = focused && showFocusVisual && !isTouchMode
     val scale by animateFloatAsState(
         targetValue = if (showFocused) 1.06f else 1f,
         animationSpec = tween(120),
