@@ -197,11 +197,22 @@ class SyncManager private constructor(context: Context) {
             } else {
                 _syncState.value = SyncState.Running("正在核对已有索引")
                 val dbPaths = mediaRepository.getAllPaths()
-                val missing = withContext(Dispatchers.IO) {
-                    dbPaths.filter { path -> !FileLocations.existsForPath(path) }
+                // 防拔盘竞态（v1.28）：本轮存储快照取自 sync() 开头，而对账可能跑很久
+                //（大库数分钟）。期间拔盘 → existsForPath 依据的仍是「卷可用」的旧快照 →
+                // 真实探测失败 → U 盘全部索引连同播放历史被批量删除。
+                // 删除前用**最新**状态再核一次：一旦降级（首选盘已拔出）就整体跳过本步。
+                val freshState = withContext(Dispatchers.IO) { FileLocations.refresh() }
+                if (freshState.degraded) {
+                    _syncState.value = SyncState.Running(
+                        "${preferredLabel}已断开，跳过删除核对（历史记录已保留）"
+                    )
+                } else {
+                    val missing = withContext(Dispatchers.IO) {
+                        dbPaths.filter { path -> !FileLocations.existsForPath(path) }
+                    }
+                    mediaRepository.deleteByPaths(missing)
+                    deletedMissing = missing.size
                 }
-                mediaRepository.deleteByPaths(missing)
-                deletedMissing = missing.size
             }
 
             // 3. 同步新增 / 变更（防"有文件无索引"；只扫活动存储）。
@@ -221,16 +232,22 @@ class SyncManager private constructor(context: Context) {
                         _syncState.value = SyncState.Running("正在扫描：${rel}（${count} 项）")
                     }
                 }
-                for (file in files) {
-                    val path = file.path
-                    val existing = dbIndex[path]
-                    val changed = existing == null ||
-                        existing.fileSize != file.size ||
-                        existing.lastModified != file.lastModified ||
-                        existing.parentFolder != file.parentPath
-                    if (changed) {
-                        upsertFile(file, category)
-                        if (existing == null) inserted++ else updated++
+                // upsert 必须整体在 IO 线程：视频时长提取走 MediaMetadataRetriever
+                //（原生编解码调用，20~50ms/个），sync() 的调用方可能是主线程
+                //（媒体库手动刷新 / 设置页手动对账都从 Main 发起），
+                // 首扫或大批新视频时逐个在主线程跑原生提取器足以触发 ANR。
+                withContext(Dispatchers.IO) {
+                    for (file in files) {
+                        val path = file.path
+                        val existing = dbIndex[path]
+                        val changed = existing == null ||
+                            existing.fileSize != file.size ||
+                            existing.lastModified != file.lastModified ||
+                            existing.parentFolder != file.parentPath
+                        if (changed) {
+                            upsertFile(file, category)
+                            if (existing == null) inserted++ else updated++
+                        }
                     }
                 }
             }

@@ -229,12 +229,18 @@ object FileLocations {
     fun existsForPath(path: String): Boolean {
         if (path.startsWith("content://")) return false
         val file = runCatching { File(path) }.getOrNull() ?: return true
-        val insideAvailableVolume = state.volumes.any { vol ->
-            vol.available && runCatching {
+        val owner = state.volumes.firstOrNull { vol ->
+            runCatching {
                 path == vol.root.absolutePath || path.startsWith(vol.root.absolutePath + File.separator)
             }.getOrDefault(false)
-        }
-        if (!insideAvailableVolume) return true
+        } ?: return true
+        if (!owner.available) return true
+        // 卷快照写着「可用」也要复核**卷根此刻是否真的还在**（v1.28）：
+        // 外接盘拔出的广播有 2 秒去抖，去抖窗口内卷列表仍是 available=true，
+        // 此时真实探测必然失败 → 整盘索引（含播放历史）会被对账当成「文件已删除」批量清掉。
+        // 卷根目录消失 = 盘被拔了，一律判「存在」；盘插回后索引原样恢复。
+        // 只对外接盘做这一步：内部主卷根不会消失，加判据反而会因偶发读取失败留下永不清理的僵尸索引。
+        if (owner.isRemovable && !runCatching { owner.root.isDirectory }.getOrDefault(false)) return true
         return runCatching { file.exists() }.getOrDefault(false)
     }
 
@@ -818,13 +824,26 @@ object FileUtils {
     /**
      * 提取视频时长（毫秒）；失败或非视频返回 0。须在 IO 线程调用。
      * [path] 是绝对路径，直接用 `setDataSource(path)`（比 URI 版本更快，也不依赖 `ContentResolver`）。
+     *
+     * **不能用 `use { }`**（v1.28 修）：`MediaMetadataRetriever` 到 **API 29** 才实现
+     * `AutoCloseable`/新增 `close()`，而本工程 minSdk 是 21。`use` 编译期解析到
+     * `AutoCloseable.close()`，在 API 21~28 的设备上 `finally` 一执行就抛
+     * `IncompatibleClassChangeError`/`NoSuchMethodError` —— 被 `runCatching` 吞掉后
+     * **时长恒为 0**（明明已经提取成功），且原生编解码器资源永不释放，每调用一次泄一个。
+     * 统一显式调用 `release()`：该 API 自 API 10 起就在，全版本可用。
      */
-    fun extractVideoDuration(context: Context, path: String): Long = runCatching {
-        MediaMetadataRetriever().use { r ->
-            r.setDataSource(path)
-            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+    fun extractVideoDuration(context: Context, path: String): Long {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (t: Throwable) {
+            0L
+        } finally {
+            // 释放原生资源；失败也不外抛（时长提取是尽力而为）
+            runCatching { retriever.release() }
         }
-    }.getOrDefault(0L)
+    }
 
     /** 构造一个已指向 [path] 的 retriever（播放器取缩略帧用） */
     fun retrieverFor(context: Context, path: String): MediaMetadataRetriever =

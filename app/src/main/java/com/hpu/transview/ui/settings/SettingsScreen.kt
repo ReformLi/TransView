@@ -267,9 +267,14 @@ fun SettingsScreen(
             // 帧门控重试：requestFocus 必须在帧回调内发起才生效，单次可能被静默丢弃
             // （媒体库/上传页实测经验），所以循环请求并用 rowFocused 确认落焦成功后退出。
             rowFocused[key] = false
-            repeat(10) {
+            // 帧门控重试：requestFocus 必须在帧回调内发起才生效，且 rowFocused 由 onFocusChanged
+            // 在**下一帧**才更新 —— 必须跨帧等待（delay）才有意义。
+            // ⚠️ 这里不能用 `return@repeat`：它只结束**当前这次迭代**（等价 continue），
+            // 循环仍会跑满 10 次；要真正提前退出必须用 for + break。
+            for (attempt in 0 until 10) {
                 rowFocusMap[key]?.requestFocusNextFrame()
-                if (rowFocused[key] == true) return@repeat
+                delay(16)
+                if (rowFocused[key] == true) break
             }
             pendingFocusReturn = null
         }
@@ -286,7 +291,11 @@ fun SettingsScreen(
             storageComputing = false
         }
     }
-    LaunchedEffect(Unit) { refreshStorage() }
+    // 以「活动存储身份」为 key：切换首选存储、外接盘拔出自动降级、插回自动恢复时
+    // `FileLocations.refresh()` 会整体替换 StorageState（activeKey 随之变化），
+    // 这里跟着重算一次 —— 否则「存储空间占用」只在进页面时算过一次，之后一直显示旧值，
+    // 与同一组里「当前存储」自动刷新的行为不一致（用户报告）。
+    LaunchedEffect(storageState.activeKey) { refreshStorage() }
 
     val uploadRepo = remember { UploadRecordRepository(context) }
     val playbackRepo = remember { PlaybackRepository(context) }
@@ -1044,8 +1053,12 @@ fun SettingsScreen(
                                     "确定清空全部上传记录吗？\n仅删除历史日志，本地文件将全部保留。",
                                     "全部清空"
                                 ) {
-                                    scope.launch { uploadRepo.clearAll() }
-                                    Toast.makeText(context, "已清空上传记录，本地文件已保留", Toast.LENGTH_SHORT).show()
+                                    // Toast 必须放在 launch 内部、suspend 的 clearAll() **之后** ——
+                                    // 写在外面会在 DB 删除还没落地时就提示「已清空」（用户报告）。
+                                    scope.launch {
+                                        uploadRepo.clearAll()
+                                        Toast.makeText(context, "已清空上传记录，本地文件已保留", Toast.LENGTH_SHORT).show()
+                                    }
                                 })
                             }
                             SettingRow("${g.title}:5", "清空播放历史", "清空历史") {
@@ -1054,8 +1067,10 @@ fun SettingsScreen(
                                     "确定清空全部播放历史吗？\n仅删除播放进度记录，已上传的视频/图片不受影响。",
                                     "全部清空"
                                 ) {
-                                    scope.launch { playbackRepo.clearAllHistory() }
-                                    Toast.makeText(context, "已清空播放历史", Toast.LENGTH_SHORT).show()
+                                    scope.launch {
+                                        playbackRepo.clearAllHistory()
+                                        Toast.makeText(context, "已清空播放历史", Toast.LENGTH_SHORT).show()
+                                    }
                                 })
                             }
                             SettingRow(

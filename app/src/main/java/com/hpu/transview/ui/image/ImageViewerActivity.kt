@@ -159,6 +159,11 @@ class ImageViewerActivity : ComponentActivity() {
         val next = index + delta
         if (next in images.indices) {
             index = next
+            // 取景框游标必须跟着主图走（v1.28）：轮播可见时 ←/→ 只移动 cursorIndex（设计如此，
+            // 「焦点框不动、滑动的是缩略图」），但**触摸横滑主图**走的是这里、只改 index。
+            // 不同步的话，横滑后取景框仍框着旧缩略图，此时按确定会跳回旧图 —— 即用户看到的
+            // 「轮播与横滑失同步」。任意改 index 的路径都把两者拉回一致。
+            cursorIndex = next
             scale = 1f
             offset = Offset.Zero
             overlayVisible = true

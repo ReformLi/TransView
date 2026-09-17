@@ -91,15 +91,30 @@ class FileStorage(private val rootDir: File) : IStorage {
     /**
      * 把本地临时文件**搬**进沙盒（同卷时 `renameTo` 即改名，零拷贝；跨卷退化为 copy + delete）。
      * 上传落盘优先走这条快路径（同卷零拷贝）；跨卷时退化为流式 copy。
+     *
+     * **绝不覆盖已有文件**（v1.28）：目标已存在时直接返回 false，由调用方换名重试。
+     * 这条不变量必须由本方法自己守住 —— Linux 同卷 `renameTo`（`rename(2)`）会**静默覆盖**
+     * 已存在的目标文件：两台手机并发上传同名文件时，后到者会把先到者的文件整个盖掉
+     * （数据不可恢复）。调用方的「先列目录、再挑唯一名」本身不是原子的，
+     * 单靠它挡不住并发。
      */
-    fun moveFileInto(src: File, relativePath: String): Boolean = runCatching {
-        val target = resolve(relativePath)
+    fun moveFileInto(src: File, relativePath: String): Boolean {
+        val target = runCatching { resolve(relativePath) }.getOrNull() ?: return false
+        if (target.exists()) return false
         target.parentFile?.mkdirs()
-        if (src.renameTo(target)) return@runCatching target.isFile
-        src.copyTo(target, overwrite = false)
-        src.delete()
-        target.isFile
-    }.getOrDefault(false)
+        if (src.renameTo(target)) return true
+        // renameTo 失败（多为跨卷）后目标可能已被并发创建，再核一次，避免 copyTo 撞名抛异常
+        if (target.exists()) return false
+        return try {
+            src.copyTo(target, overwrite = false)
+            src.delete()
+            true
+        } catch (e: Exception) {
+            // 跨卷复制中途失败（磁盘满 / 掉盘）：清掉半截文件，避免「半个视频」被对账入库
+            runCatching { if (target.exists()) target.delete() }
+            false
+        }
+    }
 
     /** 相对路径 → 沙盒内的 File。逐段过滤 `..`、`.`、空段与绝对路径分隔，防越界 */
     fun resolve(relativePath: String): File {

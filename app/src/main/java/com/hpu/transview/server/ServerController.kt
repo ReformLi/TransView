@@ -304,8 +304,15 @@ object ServerController {
 
     /** 停止监听。访问码保留（会话内固定），下次启动沿用，手机端免重复输入；UI 侧置 null 隐藏码与二维码 */
     private fun stopServer() {
-        runCatching { httpServer?.stop() }
+        val server = httpServer
         httpServer = null
+        runCatching { server?.stop() }
+        // 必须显式 shutdown：每个 TransHttpServer 实例自带一个 bgScope（进度轮询 + 落盘后建索引）。
+        // 智能模式每次熄屏 / 播放 / 休眠恢复都走一轮 stop→start，只 stop() 不 cancel 的话，
+        // 每个被丢弃的实例都会遗留一个永不取消的协程作用域，随启停次数累积（v1.28 修）。
+        // 顺序上先 stop()（关监听）再 shutdown()（取消作用域）：极少数「刚落盘、索引协程尚未跑完」
+        // 的情况会被取消掉，但媒体索引是可重建数据，下一次对账会补上，不危及文件与播放历史。
+        runCatching { server?.shutdown() }
         ServerBus.setToken(null)
     }
 

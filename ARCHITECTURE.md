@@ -1,8 +1,25 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.27　日期：2026-09-16
+> 版本：v1.28　日期：2026-09-17
 > 对应需求：README.md（局域网媒体中心与传输工具）
-> v1.27 变更：**修「TV 端上传过程中记录不出现、进度不展示」**——根因不在数据层（insert 在收包前执行、排序 SQL 与 Room Flow 表注册均验证正确），而在 `LazyColumn` 的**按 key 锚定滚动**：数据变化时第一可见行按 key 保持不动，顶部插入的新行落在可视区上方，屏幕上毫无变化，直到滑动 / 重组才可见。修法：新顶行是进行中（state ≤ 1）且焦点不在列表内时 `scrollToItem(0)`；焦点在列表内不强滚（屏外行被回收会丢焦点），交由按「上键」的 bring-into-view。
+> v1.28 变更：**代码审查（5 份报告）核实与修复** —— 逐条读码验证后修掉 3 个严重 + 6 个中等 + 4 个轻微问题：
+> ① **并发同名上传覆盖丢数据**（`UploadStorage` 的「列目录 → 唯一名 → 移入」非原子 + `FileStorage.moveFileInto` 走
+> `renameTo` 在同卷**静默覆盖**已存在目标）→ 加 `synchronized` 名称分配锁 + `moveFileInto` 改为**永不覆盖**
+> （目标已存在直接返回 false，`copyTo(overwrite=false)` 兜底且失败清残块）；② **对账在主线程提取视频时长**（ANR 风险）
+> → 逐文件 `upsertFile` 循环包进 `withContext(Dispatchers.IO)`；③ **API 21–28 视频时长恒为 0 + native 泄漏**
+> （`MediaMetadataRetriever.close()` 是 API 29+，`.use{}` 编译成 `close()` → 低版本 `NoSuchMethodError` 被
+> `runCatching` 吞掉，且 `release()` 永不执行）→ `FileUtils.extractVideoDuration` / `VideoMeta.getDuration` 改为
+> 显式 `try/catch/finally { release() }`；④ **对账拔盘竞态误删整盘索引** → 删除步前重新 `refresh()`，降级中跳过删除，
+> 且 `existsForPath` 增加「外接盘卷根此刻不存在 → 判存在」；⑤ **`finishedPaths` 残留**（重看已看完的集数后进度不再保存）
+> → `skipTo` / `重播` 时移出集合；⑥ **`TransHttpServer.bgScope` 泄漏**（智能模式每次停服只 `stop()` 不取消作用域）
+> → `stopServer()` 补 `shutdown()`；⑦ **zip 解压空间预算失效**（把「剩余空间」当 `needed` 传入）→ 改传「预估体积 ×1.2」；
+> ⑧ **顶部标签栏左右边界未拦截**（行首按左 / 末项按右会环绕到标签、「聚焦即选中」误切页）→ `TabChip` 收
+> `stayOn*Edge`；⑨ **设置页「存储空间占用」不自动刷新** → `LaunchedEffect` 改挂 `storageState.activeKey`；
+> ⑩ 轻微项：「已清空」Toast 移进 `launch` 内（原先在 suspend 删除之前就提示）、`return@repeat` 改 `for+break`
+> （前者等价 `continue`，帧门控重试等于没生效）、续播弹窗异步读库加 `currentFile?.path == path` 守卫（等待中切集会
+> 被老文件的续播位置顶掉）、图片查看器横滑切图时同步 `cursorIndex`（否则取景框与主图失同步，按确定跳回旧图）。
+> 另：4 处「与需求字面有偏差」经确认属设计取舍，未改动（见 §3.25）。
+> v1.27 变更：**修「TV 端上传过程中记录不出现、进度不展示」**——根因不在数据层（insert 在收包前执行、排序 SQL 与 Room Flow 表注册均验证正确），而在 `LazyColumn` 的**按 key 锚定滚动**：数据变化时第一可见行按 key 保持不动，顶部插入的新行落在可视区上方，屏幕上毫无变化，直到滑动 / 重组才可见。修法：新顶行是进行中（state ≤ 1）且焦点不在列表内时 `scrollToItem(0)`；焦点在列表内不强滚（屏外行被回收会丢焦点），交由按「上键」的 bring-into-view。（§3.24）
 > v1.26 变更：**上传记录排序改为「进行中置顶、成功沉底」**——手机网页与 TV 端同步。**TV 端**：`UploadRecordDao.observeRecent` 查询改为 `ORDER BY (state <= 1) DESC, time DESC, id DESC`（state：0=等待 1=上传中 2=成功 3=失败；`state <= 1` 布尔值 DESC 让等待 / 上传中分组排最前），组内按时间倒序、同秒以 id 稳定排序。**网页端**：显示顺序与处理队列解耦——`queue` 数组保持 FIFO（`uploadNext` 取首个 wait 项、重试插队等**上传顺序**逻辑不变），仅 `render()` 对**副本**排序：等待 / 上传中置顶、成功 / 失败 / 已取消沉底，组内按入队时间戳 `ts` 倒序；重试刷新 `ts`（算一次新上传）。
 > v1.25 变更：**手机端系统栏图标固定为浅色**——修「手机上顶部状态栏背景变黑、时间/电量看不清」。三个 Activity 的裸 `enableEdgeToEdge()` 默认 `auto` 样式跟随系统深浅模式：手机系统浅色时状态栏图标为深色，压在 App 画满全屏的恒定深色背景（#0E1116）上看不清。改为显式 `SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)`（状态栏 + 导航栏）：固定浅色图标、透明 scrim。注意 `dark(scrim)` 参数是必填 `@ColorInt Int` 且无默认值；ImageViewer/Player 已导入 Compose `Color`（无 `TRANSPARENT` 常量），统一全限定写法避免导入冲突。**TV 无状态栏不受影响。**
 > v1.24 变更：**上传进度修复补全（计数器跨线程绑定）**——v1.23 把计数挪到套接字输入流后真机仍恒为 0%。根因：NanoHTTPD 2.3.1 的 ServerRunnable（**接收连接线程**）调用 `asyncRunner.exec(createClientHandler(...))`，在 `createClientHandler` 里 `ThreadLocal.set(counter)` 设到了 accept 线程；`handleUpload` 跑在 `asyncRunner` 线程池的**工作线程**上，`ThreadLocal.get()` 恒为 null → 进度监视器（`counter == null` 提前返回）从未启动。修法：绑定改由 `CountingInputStream` 在**每次 `read()` 时**把自己的计数器绑到当前线程——流读取只发生在该连接的工作线程上（keep-alive 循环内），天然与 `handleUpload` 同线程；线程池复用安全（下一条连接的流一 read 即覆盖旧值）。计数流改为 `inner class` 以访问外部 ThreadLocal。
@@ -979,6 +996,71 @@ v1.19 起统一为 `effectiveColumns`（与 `GridCells.Fixed` 同源）。
 
 **不变量**：TV / 平板与遥控器路径的**既有行为**不受影响 —— 票据兜底只在 `contentFocused == false`
 时执行，而遥控器操作全程 `contentFocused == true`。
+
+### 3.23 上传进度计数（v1.23 / v1.24）
+
+**症状**：手机网页进度正常，TV 端上传页进度条一直停在 0%，成功才跳 100%。
+
+**根因（两层）**：
+
+1. **NanoHTTPD 2.3.1 的落盘路径绕过计数器**（v1.23）：`parseBody` 先把整个请求体读进暂存，
+   再在 `decodeMultipartFormData → saveTmpFile` 里用 `new FileOutputStream(tempFile.getName())`
+   **按文件名直接写盘** —— 文件 part 从不经过 `TempFile.open()` 返回的流，挂在那个流上的 `bytesWritten` 恒为 0。
+2. **ThreadLocal 绑错线程**（v1.24）：把计数挪到套接字输入流后真机仍恒 0%。NanoHTTPD 的 ServerRunnable
+   （**接收连接线程**）调用 `asyncRunner.exec(createClientHandler(...))`，在 `createClientHandler` 里
+   `ThreadLocal.set(counter)` 设到了 accept 线程；`handleUpload` 跑在 `asyncRunner` 线程池的**工作线程**上，
+   `ThreadLocal.get()` 恒为 null → 进度监视器（`counter == null` 提前返回）从未启动。
+
+**修法**：把连接输入流包成 `CountingInputStream`（每 read 一字节即累加，共享一个 `AtomicLong`），
+并**由计数流在每次 `read()` 时把自己的计数器绑到当前线程** —— 流读取只发生在该连接的工作线程上
+（keep-alive 循环内），天然与 `handleUpload` 同线程；线程池复用安全（下一条连接的流一 read 即覆盖旧值）。
+`handleUpload` 在每个请求开始时把计数器清零（keep-alive 同连接多文件依次上传互不干扰），
+进度监视器改用「已接收字节 / Content-Length」按 600ms 节流回写百分比。
+计数流因此改为 `inner class` 以访问外部 `ThreadLocal`。
+
+### 3.24 LazyColumn 按 key 锚定滚动（v1.27）
+
+**症状**：TV 端上传过程中，新记录不出现、进度不展示。
+
+**根因**：上传记录**一请求开始就已插入 DB**（`handleUpload` 先 insert 再收包，排序 SQL 与 Room 生成的
+Flow 注册表名均已验证正确），坑在渲染：`LazyColumn` 用 `key = record.id` 后，数据变化时
+**按 key 锚定第一可见行**（`updateScrollPositionIfTheFirstItemWasMoved`）—— 新记录插到第 0 位会落在
+可视区**上方**，屏幕毫无变化，直到滑动 / 切页重组才看到。机理一直存在（此前列表短 / 空、或没人盯着顶部看），
+v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
+
+**修法**：新顶行是进行中（`state <= 1`）且**焦点不在列表内**时 `scrollToItem(0)` 滚到顶部；
+焦点在列表内时**不强滚**（`LazyColumn` 回收屏外行会丢焦点），新行交给按「上键」时的 bring-into-view 带进视野。
+
+### 3.25 代码审查修复（v1.28）
+
+对用户提交的 5 份审查报告逐条读码核实后修复。**按危害排序**：
+
+| # | 问题 | 根因 | 修法 |
+|---|------|------|------|
+| 1 | 并发同名上传**覆盖丢数据** | `UploadStorage` 的「列目录 → 取唯一名 → `moveFileInto`」三步非原子；且同卷 `renameTo`（`rename(2)`）**静默覆盖**已存在目标 | `synchronized(名称分配锁)` 串行化 + 最多 50 次唯一名重试；`FileStorage.moveFileInto` 改为**永不覆盖**：目标已存在直接 `false`，`copyTo(overwrite=false)` 兜底，失败删残块 |
+| 2 | 对账**主线程**提取视频时长（ANR） | `SyncManager` 逐文件 `upsertFile` 直接在调用线程跑 | 整段循环包进 `withContext(Dispatchers.IO)` |
+| 3 | **API 21–28 时长恒 0 + native 泄漏** | `MediaMetadataRetriever.close()` 是 API 29+，`.use{}` 编译成 `close()` → 低版本 `NoSuchMethodError`，被 `runCatching` 静默吞掉且 `release()` 永不执行 | 改显式 `try/catch/finally { release() }`（`FileUtils.extractVideoDuration`、`VideoMeta.getDuration`） |
+| 4 | 对账拔 U 盘**竞态误删整盘索引** | 拔出广播有 2s 去抖，窗口内卷快照仍 `available=true` | 删除步前重新 `refresh()`、降级中跳过删除；`existsForPath` 增加「外接盘卷根此刻不存在 → 判存在」 |
+| 5 | `finishedPaths` 残留 | 重看已看完的集数时该路径仍在「已看完」集合里 → 进度不再保存 | `skipTo(index)` / 重播时 `finishedPaths.remove(path)` |
+| 6 | `TransHttpServer.bgScope` 泄漏 | 智能模式每次熄屏 / 播放 / 休眠恢复都 stop→start，只 `stop()` 不取消协程作用域 | `ServerController.stopServer()` 补 `runCatching { server?.shutdown() }` |
+| 7 | zip 解压**空间预算失效** | 调用处把「剩余可用空间」传成了 `needed` 参数 | 改传「中央目录预估体积 × 1.2」（否则伪造元数据的 zip 能把磁盘写满） |
+| 8 | 顶部标签栏**左右边界未拦截** | 首个标签按左 / 末个标签按右会环绕到别处，「聚焦即选中」→ 误切页 | `TabChip` 增 `stayOnLeftEdge` / `stayOnRightEdge`（首项置左、末尾「设置」置右） |
+| 9 | 设置页「存储空间占用」不自动刷新 | 只挂了 `LaunchedEffect(Unit)`，进页面算一次；切首选存储 / 降级恢复后显示旧值 | 改挂 `LaunchedEffect(storageState.activeKey)` |
+| 10 | 「已清空」Toast 早于异步完成 | Toast 写在 `scope.launch { }` **外面**，suspend 的 `clearAll()` 还没落地就提示 | Toast 移进 `launch` 内、置于 suspend 调用之后 |
+| 11 | 弹框关闭后的焦点回退**不早退** | `repeat(10){ …; if (ok) return@repeat }` —— `return@repeat` 只结束**本次迭代**（等价 `continue`），循环仍跑满 10 次；且无 `delay` 时同帧发 10 次请求毫无意义 | 改 `for (i in 0 until 10) { …; delay(16); if (ok) break }` |
+| 12 | 续播弹窗异步读库竞态 | 读库期间用户可能已「下一集 / 上一集」切走，回调仍按**老文件**的续播位置 `startPlayback` | 回调首行加 `if (currentFile?.path != path) return@launch` |
+| 13 | 图片查看器轮播与横滑**取景框失同步** | 触摸横滑主图走 `switchImage()`（只改 `index`），而取景框跟随 `cursorIndex` | `switchImage()` 内同步 `cursorIndex = next` |
+
+**经核实「不算问题 / 属设计取舍」的 4 处**（未改动）：
+
+1. 播放器时间轴聚焦时 OK / Enter = **播放暂停**（非立即 seek）—— 时间轴整体即「播放暂停键」，拖动才 seek，
+   与既有交互约定一致；
+2. 时间线加粗 6→10dp、缩放 1.1、120ms（与需求文档写的 4→8px / 1.15 / 200ms 有出入）—— 实测观感更稳，
+   且 6→10dp 的相对增幅比 4→8px 更大，不构成弱化；
+3. `scanVolumes()` 的 API 21–23 回退路径已随 v1.14「纯 File + 多来源卷发现」重构为 `getWritableDevices()`，
+   旧函数不复存在；
+4. 媒体库首行按「上键」是**两段式**（内容区 → 工具条 → 顶部标签），设置页是一段式 —— 媒体库有工具条、
+   设置页没有，层级本就不同。
 
 ## 4. 构建与运行
 

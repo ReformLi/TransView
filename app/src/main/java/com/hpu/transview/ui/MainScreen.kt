@@ -263,6 +263,8 @@ fun MainScreen() {
                     // 设置页打开时不显示媒体标签的「选中」态，避免「其他」残留高亮
                     selected = !showSettings && tab == selected,
                     onNavigateDown = { contentFocusTicket++ },
+                    // 首个媒体标签是整行最左端（非紧凑态左侧的品牌标题不可聚焦）
+                    stayOnLeftEdge = index == 0,
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
                         .onFocusChanged { state ->
@@ -291,6 +293,8 @@ fun MainScreen() {
                 title = "设置",
                 selected = showSettings,
                 onNavigateDown = { settingsFocusTicket++ },
+                // 「设置」是整行最右端（右侧只剩不可聚焦的状态徽标）：吃掉 →，防环绕到最左标签
+                stayOnRightEdge = true,
                 modifier = Modifier
                     .focusRequester(settingsFocusRequester)
                     .onFocusChanged {
@@ -381,6 +385,10 @@ private fun TabChip(
     onNavigateDown: () -> Unit,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
+    /** 行首标签：吃掉 ←（见下方按键注释） */
+    stayOnLeftEdge: Boolean = false,
+    /** 行尾标签：吃掉 → */
+    stayOnRightEdge: Boolean = false,
     onClick: () -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
@@ -400,6 +408,12 @@ private fun TabChip(
                     // 焦点回退到整棵树第一个可聚焦元素 = 设置页左侧第一个分组
                     //（用户实测：按上键回「设置」标签后焦点自动掉回设置内容区）。
                     Key.DirectionUp -> true
+                    // 标签行**两端**必须显式吃掉越界方向键（v1.28）：Compose 的方向搜索在某个
+                    // 方向找不到候选时会「环绕」到另一个可聚焦元素，命中的往往是对端的标签，
+                    // 而标签是「聚焦即选中」→ 一命中就切页（最右「设置」按 → 环绕到最左「上传」）。
+                    // 媒体库网格卡片、上传页工具条早有同类拦截，标签行此前漏防。
+                    Key.DirectionLeft -> stayOnLeftEdge
+                    Key.DirectionRight -> stayOnRightEdge
                     else -> false
                 }
             }

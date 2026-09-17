@@ -119,7 +119,11 @@ class ZipExtractor(private val context: Context) {
             }
 
             // ——— 2. 流式解压到工作区（只写本分类的条目） ———
-            val report = extract(archive, category, destRoot, available)
+            // 运行时预算必须传 needed（= 预估体积 × 1.2），**不能传 available**（v1.28 修）：
+            // 元数据不可信的膨胀包（.zip 里写 1MB、实际解出 10GB）在前置校验里能骗过
+            // 「needed > available」，若运行时只卡在 available 上，就会一路写到把盘塞满才中止。
+            // 传 needed 则超出预估 20% 立刻停手（诚实元数据的包实际写出量恒等于估算值）。
+            val report = extract(archive, category, destRoot, needed)
             if (report.budgetExceeded) {
                 val kept = keepArchive(archive)
                 return Outcome(

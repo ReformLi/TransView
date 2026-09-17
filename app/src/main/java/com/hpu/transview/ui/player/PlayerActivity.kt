@@ -390,6 +390,10 @@ class PlayerActivity : ComponentActivity() {
         // 续播判断
         lifecycleScope.launch {
             val history = repository.get(path)
+            // 竞态防护：读库是挂起调用，返回时用户可能已经按「下一集 / 上一集」切走了
+            // （skipTo 只改 currentIndex，不改 path 这个局部量）。若不校验，等待中切集后
+            // 这里会拿**老文件**的续播位置再 startPlayback 一次，把刚切过去的片打断/顶掉。
+            if (currentFile?.path != path) return@launch
             if (history != null && history.position > 10_000 &&
                 (history.duration <= 0 || history.position < history.duration * 95 / 100)
             ) {
@@ -491,6 +495,10 @@ class PlayerActivity : ComponentActivity() {
         saveProgress()
         hideNextCard()
         currentIndex = index
+        // 跳到的这一集要解除「已看完」守卫（v1.28 修）：本会话内看完过的集已在 finishedPaths 里，
+        // 手动跳回来重看时若不解除，saveProgress 永远被拦（含 onStop），中途退出就丢续播位置，
+        // 「继续观看」也永远停在旧位置。togglePlayPause 的重播分支早有同样一处解除，这里补齐。
+        playlist.getOrNull(index)?.let { finishedPaths.remove(it.path) }
         postResult()
         ended = false
         prepareItem(index)
