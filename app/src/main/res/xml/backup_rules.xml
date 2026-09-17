@@ -1,13 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+   Auto Backup 规则（Android 11 / API 30 及以下；API 31+ 走 data_extraction_rules.xml）。
+
+   ⚠️ 不要留成 Studio 的空模板：空规则 = **全量备份**，会把数据库一起带走。
+   排除项与理由同 data_extraction_rules.xml（那里有完整说明）：
+   - database：media_items / playback_history 存的是卷根**绝对路径**，跨设备恢复后不可达；
+     upload_records 是过程日志。排除无副作用 —— 媒体库是磁盘索引，启动时由 SyncManager 重新对账。
+   - file / external：只有可再生的运行产物（upload_tmp/ 上传残留等）。
+
+   保留 sharedpref（设置页偏好）不排除，让用户换机后设置仍在。
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="database" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="external" path="." />
 </full-backup-content>

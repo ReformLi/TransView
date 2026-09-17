@@ -48,7 +48,6 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.dp
@@ -56,8 +55,8 @@ import com.hpu.transview.model.Category
 import com.hpu.transview.model.MainTab
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
-import com.hpu.transview.ui.common.COMPACT_SCREEN_HEIGHT_DP
 import com.hpu.transview.ui.common.CompactContentDensity
+import com.hpu.transview.ui.common.rememberTopBarTight
 import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.common.LocalIsTouchMode
 import com.hpu.transview.ui.library.LibraryScreen
@@ -106,11 +105,13 @@ fun MainScreen() {
     val contentAnchor = remember { FocusRequester() }
     val windowInfo = LocalWindowInfo.current
     val rootView = LocalView.current
-    val config = LocalConfiguration.current
-    // 手机横屏：高度方向 dp 较小（通常 < 480），顶部导航栏需紧凑化，否则在矮屏上占去半屏。
-    // TV/盒子高度 dp 一般 >= 720，不进入紧凑模式。
-    // 判据走共享常量 COMPACT_SCREEN_HEIGHT_DP：与上传页左面板、内容区整体缩放必须同阈值。
-    val isCompact = config.screenHeightDp < COMPACT_SCREEN_HEIGHT_DP
+    // 顶部导航栏是否收窄（判据集中在 rememberTopBarTight，与内容区缩放相互独立）：
+    //  ① 手机横屏（矮屏，高度 < 480dp）—— 否则顶部栏要占去半屏；
+    //  ② 平板竖屏 / 桌面窄窗口（宽度 < 960dp）—— 非紧凑态整行约需 1050dp，不收窄会把右侧
+    //     「设置」标签与状态徽标挤出屏幕（Android 16 起最小宽度 >= 600dp 的屏幕忽略
+    //     screenOrientation，详见该 helper 注释）。
+    // 判据门槛「严格小于电视标准最小宽度 960dp」，故标准电视 / 盒子上逐像素不变。
+    val topBarTight = rememberTopBarTight()
     LaunchedEffect(touchAnchorTick) {
         if (touchAnchorTick == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(150)
@@ -236,7 +237,7 @@ fun MainScreen() {
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = if (isCompact) 16.dp else 40.dp, vertical = if (isCompact) 8.dp else 20.dp)
+                .padding(horizontal = if (topBarTight) 16.dp else 40.dp, vertical = if (topBarTight) 8.dp else 20.dp)
                 // 跟踪「焦点是否在标签栏」：返回键据此区分「标签上的返回（回上传/退出）」与
                 // 「内容区的返回（回选中标签）」。hasFocus 含子树（四个媒体标签 + 设置标签）。
                 // 焦点离开标签栏（进入内容区 / 设置页）→ 取消未完成的「再按一次退出」确认。
@@ -246,7 +247,7 @@ fun MainScreen() {
                 },
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (!isCompact) {
+            if (!topBarTight) {
                 Text(
                     "传视 TransView",
                     style = MaterialTheme.typography.titleLarge,
@@ -256,7 +257,7 @@ fun MainScreen() {
             }
             MainTab.entries.forEachIndexed { index, tab ->
                 TabChip(
-                    compact = isCompact,
+                    compact = topBarTight,
                     title = tab.title,
                     // 设置页打开时不显示媒体标签的「选中」态，避免「其他」残留高亮
                     selected = !showSettings && tab == selected,
@@ -287,7 +288,7 @@ fun MainScreen() {
             // 功能不变：聚焦即打开设置页、焦点留在其上、按 ↓ 进入设置页选项、内容区按上键回到它。
             Spacer(Modifier.weight(1f))
             TabChip(
-                compact = isCompact,
+                compact = topBarTight,
                 title = "设置",
                 selected = showSettings,
                 onNavigateDown = { settingsFocusTicket++ },
@@ -300,7 +301,7 @@ fun MainScreen() {
                     }
             ) { showSettings = true }
             Spacer(Modifier.width(20.dp))
-            ServerStatusBadge(compact = isCompact)
+            ServerStatusBadge(compact = topBarTight)
         }
 
         // 内容区（返回键见上面的 BackHandler）

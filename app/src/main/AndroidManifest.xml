@@ -2,10 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- 网络 -->
+    <!-- 网络：INTERNET 供局域网 HTTP 服务器（NanoHTTPD）与 Coil 加载缩略图。
+         · ACCESS_NETWORK_STATE：本工程代码并未使用（全工程无 ConnectivityManager），但
+           media3-common / media3-exoplayer 各自声明了它（见 manifest 合并报告），删掉本行
+           APK 里照样存在，且 Coil 的 RealNetworkObserver 正依赖它 —— 不再重复声明。
+         · ACCESS_WIFI_STATE：曾是 NetUtils.wifiManager() 的需要，该方法已确认是死代码
+           （全工程零调用）并一并删除；且新系统上无定位权限时 getConnectionInfo() 的 SSID
+           恒为空占位值，本就无价值。 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- 前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -43,10 +47,26 @@
         android:banner="@drawable/banner"
         android:theme="@style/Theme.TransView">
 
+        <!-- ⚠️ 临时「安全网」，有保质期（API 37 失效），不是长久方案 ——
+             Android 16（API 36）起，最小宽度 >= 600dp 的屏幕（平板 / 大折叠内屏 / 桌面窗口模式）
+             会**忽略** screenOrientation：本应用三个 Activity 都锁了 landscape，届时会被强制
+             允许竖屏 / 任意尺寸窗口，顶部导航栏（非紧凑态约需 1050dp）会被挤出屏幕。
+             本属性让系统在 API 36 上继续尊重旧的横竖屏 / 尺寸限制。
+             为什么不能只靠它：① API 37 会移除本 opt-out；② 官方明确「桌面窗口模式下屏幕方向
+             限制即便 opt-out 也会被覆盖」。因此代码侧已同步做宽度自适应 + configChanges 兜底
+             （见 MainScreen 的 topBarTight 与 MainActivity 的 configChanges）。 -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+            android:value="true" />
+
+        <!-- 与 PlayerActivity / ImageViewerActivity 保持一致：自行处理配置变更，不重建 Activity。
+             Android 16 起大屏（sw >= 600dp）方向锁可能被忽略，旋转 / 改窗口尺寸会真正发生；
+             此前本 Activity 未声明 configChanges，旋转会重建并丢掉 showSettings 等普通 remember 状态。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:theme="@style/Theme.TransView">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

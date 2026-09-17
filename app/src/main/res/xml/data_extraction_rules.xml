@@ -1,19 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+   云备份 / 设备迁移规则（Android 12 / API 31 起生效，取代 backup_rules.xml）。
+
+   ⚠️ 不要留成 Studio 的空模板：空规则 = **全量备份**，会把数据库一起带走。
+   本应用显式排除「数据库」与「可再生目录」，只保留 sharedpref（用户设置）。
+
+   为什么排除 database：
+   - media_items.filePath / parentFolder 存的是**卷根绝对路径**
+     （如 /storage/0000-0000/TransView/Movies/a.mp4、/storage/emulated/0/...），
+     只在「当初那台设备 + 那张盘」上成立。恢复到另一台设备后全部不可达 —— 媒体库会显示
+     一批点不开的卡片，还得靠设置页「清理不可达索引」善后，属于自找麻烦。
+   - playback_history 以 filePath 为外键，同理。
+   - upload_records 是上传过程日志，跨设备毫无意义（表本身也只保留最近 200 条）。
+   排除掉没有任何副作用：媒体库本就是磁盘索引，SyncManager 启动时会重新对账补齐。
+
+   为什么排除 file / external：
+   两者下只有**可再生**的运行产物 ——
+   - file（getFilesDir）：当前无内容，留作防御，避免日后新增落盘物被无声备份；
+   - external（getExternalFilesDir）：上传临时目录 upload_tmp/ 就在这里，中断的上传可留下
+     几百 MB ~ 数 GB 残留，既大又无恢复价值。
+
+   注：cache 域（cacheDir，含 Coil 的 image_cache）系统本来就不备份，无需声明。
+   媒体沙盒 <卷>/TransView/ 属于公共存储，也不在备份范围内。
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
     </device-transfer>
-    -->
 </data-extraction-rules>

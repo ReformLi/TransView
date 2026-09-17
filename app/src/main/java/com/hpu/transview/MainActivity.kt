@@ -7,10 +7,13 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,8 +26,10 @@ import com.hpu.transview.service.ServerService
 import com.hpu.transview.ui.MainScreen
 import com.hpu.transview.ui.permission.PermissionScreen
 import com.hpu.transview.ui.common.ProvideTouchMode
+import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
 import com.hpu.transview.util.IntentUtils
+import com.hpu.transview.util.NotificationPermission
 import com.hpu.transview.util.StoragePermission
 
 class MainActivity : ComponentActivity() {
@@ -53,6 +58,28 @@ class MainActivity : ComponentActivity() {
     private fun AppRoot() {
         val context = LocalContext.current
         var granted by remember { mutableStateOf(StoragePermission.isGranted(context)) }
+
+        // ——— 通知权限（API 33+）———
+        // 前台服务的常驻通知是用户了解「服务器运行中 / 已休眠 / 已暂停」的**唯一**途径。清单早已
+        // 声明 POST_NOTIFICATIONS，但此前全工程没有运行时申请 → Android 13+ 上通知被系统静默丢弃。
+        //
+        // 两个刻意的取舍：
+        //  ① 放在**存储授权之后**申请 —— 存储是硬门槛（过不了连主界面都看不到），通知是可选增强，
+        //     不该和硬门槛抢用户看到的第一个授权框；
+        //  ② 用 SettingsStore.notifPermissionAsked 保证**只主动弹一次** —— 系统对同一权限只会展示
+        //     有限次授权框，反复申请只会变成「点了没反应」的无效操作。
+        // 申请结果不参与任何逻辑：拒绝只是通知不可见，服务器照常运行，故回调刻意留空。
+        val notifLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* 拒绝不影响服务器运行，无需处理 */ }
+        LaunchedEffect(granted) {
+            if (!granted) return@LaunchedEffect
+            if (Build.VERSION.SDK_INT < 33) return@LaunchedEffect
+            if (NotificationPermission.isGranted(context)) return@LaunchedEffect
+            if (SettingsStore.notifPermissionAsked) return@LaunchedEffect
+            SettingsStore.notifPermissionAsked = true
+            notifLauncher.launch(NotificationPermission.PERMISSION)
+        }
 
         // 从系统授权页返回后重新检查
         val lifecycleOwner = LocalLifecycleOwner.current

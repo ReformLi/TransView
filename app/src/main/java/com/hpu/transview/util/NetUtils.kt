@@ -2,7 +2,6 @@ package com.hpu.transview.util
 
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
 import androidx.core.content.ContextCompat
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -81,8 +80,24 @@ object StoragePermission {
             )
         }
     }
+}
 
-    @Suppress("DEPRECATION")
-    fun wifiManager(context: Context): WifiManager? =
-        context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+/**
+ * 通知权限统一入口（`POST_NOTIFICATIONS`，Android 13 / API 33 起才是运行时权限；
+ * 更低版本恒视为已授予）。
+ *
+ * 为什么需要：前台服务（[com.hpu.transview.service.ServerService]）的常驻通知是用户了解
+ * 服务器状态（运行中 / 已休眠 / 已暂停）的**唯一**途径。清单早已声明该权限，但此前全工程
+ * 没有运行时申请 —— Android 13+ 上通知被系统静默丢弃，用户看不到任何服务器状态。
+ *
+ * 注意：**通知被拒不影响服务器运行**，只是通知不可见，因此申请失败不得阻断任何流程。
+ */
+object NotificationPermission {
+
+    const val PERMISSION = "android.permission.POST_NOTIFICATIONS"
+
+    fun isGranted(context: Context): Boolean =
+        android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(
+            context, PERMISSION
+        ) == PackageManager.PERMISSION_GRANTED
 }

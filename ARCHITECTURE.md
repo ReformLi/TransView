@@ -1,7 +1,30 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.29　日期：2026-09-17
+> 版本：v1.30　日期：2026-09-17
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.30 变更：**权限配置与适配兼容性专项审查**（详见 §3.27）——
+> ① **权限缺口**：`POST_NOTIFICATIONS` 清单早已声明却**从未运行时申请** ⇒ Android 13+ 上通知被静默丢弃，
+> 而前台服务常驻通知是用户了解服务器状态（运行中 / 已休眠 / 已暂停）的**唯一**途径。新增
+> `util/NotificationPermission` + 在**存储授权通过后**申请一次（存储是硬门槛、通知是可选增强，不抢第一个
+> 授权框），`SettingsStore.notifPermissionAsked` 保证只主动弹一次，回调刻意留空（拒绝不影响服务器运行）；
+> ② **权限冗余**：删 `ACCESS_WIFI_STATE`（唯一使用者 `NetUtils.wifiManager()` 是死代码，且新系统无定位权限时
+> SSID 恒为空占位值）与重复声明的 `ACCESS_NETWORK_STATE`（media3 已声明且 Coil 的 `RealNetworkObserver` 依赖它，
+> 删本工程那行 APK 里照样存在，只是不再重复声明）；
+> ③ **适配·高危：Android 16 在大屏忽略 `screenOrientation`** —— 官方行为变更：最小宽度 ≥ 600dp 的屏幕忽略
+> screen orientation / aspect ratio / resizability 限制，且 **API 37 将移除 opt-out**。三个 Activity 均锁 `landscape`，
+> 而顶部导航栏是**不换行** `Row`、非紧凑态整行约需 **1050dp** ⇒ 平板竖屏 / 桌面窄窗口下右侧「设置」标签与
+> 状态徽标被**挤出屏幕**。修法**双管齐下**：(a) 清单声明 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY`
+> 恢复旧行为（**有保质期的安全网**）；(b) 新增 `TOP_BAR_FULL_WIDTH_DP = 960` + `rememberTopBarTight()`，
+> 宽度不足时真正收窄顶部栏（→ 约 470dp）。阈值**严格小于电视标准最小宽度 960dp** ⇒ 标准电视逐像素不变；
+> 内容区缩放仍由 `CompactContentDensity` 按高度独立负责，两者判据互不影响；
+> ④ **`MainActivity` 补 `configChanges`**（另两个 Activity 早有）—— 方向锁失效后旋转 / 改窗口尺寸会重建
+> Activity，`showSettings` 等普通 `remember` 状态会被丢掉（`selected` 有 `rememberSaveable` 所以能活）；
+> ⑤ **备份规则排除数据库**：`backup_rules.xml` / `data_extraction_rules.xml` 原为 Studio 空模板（= 全量备份），
+> 而 `media_items.filePath` 是**卷根绝对路径**，跨设备恢复后全部不可达 ⇒ 排除 `database` / `file` / `external`
+> 三个域，只保留 `sharedpref`（媒体库是磁盘索引，启动时由 `SyncManager` 重新对账补齐，排除无副作用）；
+> ⑥ **无硬编码分辨率**：全工程扫描确认无绝对分辨率数字与 `displayMetrics` 判布局写法（细节见 §3.27.4）。
+> **经核实不改**：`MANAGE_EXTERNAL_STORAGE` 是核心功能唯一可行解（工程硬约束「禁用 SAF / DocumentFile」），
+> 保留但需知悉 Google Play 有政策申报要求；FGS 三权限与 `ServerService` 的版本分支严格对应，**不要简化**。
 > v1.29 变更：**「清不掉的数据 / 死文件 / 冗余代码」专项清理**（详见 §3.26）——
 > ① **上传临时文件永久残留**：`Android/data/<包名>/files/upload_tmp/upload_*.tmp` 在「进程被杀 / 断电」时
 > 因 NanoHTTPD 的 `TempFileManager.clear()` 没机会执行而永久留下；该目录不在媒体沙盒内、Android 11+ 对文件
@@ -1158,10 +1181,130 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
   `Downloads/` 下会作为「其他」分类入库，**用户可在媒体库「其他」页直接打开或删除**；
 - **`Theme.TransView.Fullscreen` 用 `@android:color/black` 而非 `app_bg`**：播放器 / 图片查看器要纯黑底，
   刻意如此，不是漏改；
-- **`backup_rules.xml` / `data_extraction_rules.xml`**：被清单引用但内容全是注释掉的模板（等价于默认行为）。
-  删掉它们需同时改清单、行为不变，**无收益**，保留；
+- **`backup_rules.xml` / `data_extraction_rules.xml`**：v1.29 时判定为「空模板，删掉无收益」而保留。
+  **v1.30 重新评估后改为「保留文件、但补上排除规则」** —— 空模板等于**全量备份**，会把 Room 库一起带走，
+  而库里的 `filePath` 是卷根绝对路径、跨设备恢复后全部不可达，属于自找麻烦。详见 §3.27.5。
 - **`FileUtils.retrieverFor(context, path)` 的 `context` 形参未被使用**：仅 1 处调用、语义上无害，
   改动收益低于噪声，保留（记为可选项）。
+
+### 3.27 权限与适配兼容性审查（v1.30）
+
+审查范围：`AndroidManifest.xml` 全量权限 + **合并后的最终清单**（确认库注入项）+ 全工程权限调用点；
+适配侧正则扫描 ≥3 位数的 `.dp/.sp` 与 `1920/1080/1280/720/2160/3840/1440/2560` 等绝对分辨率数字，
+并检查 `displayMetrics` / `getRealMetrics` / `LocalDensity` 覆盖 / 资源限定符目录。
+
+#### 3.27.1 权限面盘点（本就干净）
+
+危险 / 特殊权限只有 3 个，全部与核心功能直接相关：
+
+| 权限 | 级别 | 判定 |
+| --- | --- | --- |
+| `MANAGE_EXTERNAL_STORAGE` | 特殊（所有文件访问） | **必需**：用 `java.io.File` 直读 U 盘卷根。工程硬约束「禁用 SAF / DocumentFile」下无替代方案。⚠️ Google Play 需政策申报（侧载不受限） |
+| `WRITE/READ_EXTERNAL_STORAGE` | 危险，`maxSdkVersion=29` | 必需：API 21~29 的传统路径。运行时只申请 WRITE，READ 由 STORAGE 权限组连带授予 |
+| `POST_NOTIFICATIONS` | 危险（API 33+） | 必需，但**此前从未申请** → 见 §3.27.2 |
+
+普通权限：`INTERNET`（HTTP 服务器 + Coil）、`RECEIVE_BOOT_COMPLETED`（设置页可开关）、
+`FOREGROUND_SERVICE` / `_DATA_SYNC` / `_SPECIAL_USE`。**未申请**相机、定位、通讯录、电话、录音、
+蓝牙、健康数据、`AD_ID` —— 一个都没有。
+
+#### 3.27.2 通知权限：声明了却从未申请（功能缺口）
+
+前台服务 `ServerService` 的常驻通知是用户了解「服务器运行中 / 已休眠 / 已暂停」的**唯一**途径
+（`updateNotification` 随 `ServerBus` 状态联动）。清单早在 v1.x 就声明了 `POST_NOTIFICATIONS`，
+但全工程 grep 只命中清单与文档 —— **没有任何运行时申请**。Android 13+ 上未授权时系统**静默丢弃**通知，
+用户既看不到服务器状态，也不知道「15 分钟无上传自动休眠」这类提示。
+
+实现要点（`MainActivity.AppRoot`）：
+
+- **申请时机放在存储授权之后**：存储是硬门槛（`PermissionScreen` 过不了连主界面都看不到），
+  通知是可选增强，不该和硬门槛抢用户看到的第一个授权框；
+- **只主动弹一次**：`SettingsStore.notifPermissionAsked` 标记。系统对同一权限本就只展示有限次授权框，
+  反复申请只会退化成「点了没反应」的无效操作；
+- **回调刻意留空**：拒绝只是通知不可见，**服务器照常运行**，不阻断任何流程、不改任何 state；
+- `NotificationPermission.isGranted` 在 API < 33 恒返回 true（那些版本没有该运行时权限）。
+
+#### 3.27.3 权限冗余：删掉 `ACCESS_WIFI_STATE` 与重复声明
+
+- **`ACCESS_WIFI_STATE` → 删除**。唯一使用者 `NetUtils.wifiManager()` 是**死代码**（全工程唯一引用就是
+  它自己的定义，实际取 IP 走 `NetUtils.getLocalIpAddress()` 的 `NetworkInterface` 枚举，不需要任何权限）。
+  且该权限只服务 `getConnectionInfo()`，而新系统上无定位权限时 SSID 恒为空占位值，本就拿不到有用信息。
+  合并后清单确认该权限**彻底消失**（无任何库声明它）。
+- **`ACCESS_NETWORK_STATE` → 删除本工程声明，但权限仍在**。本工程代码零使用（无 `ConnectivityManager`），
+  但 `media3-common` / `media3-exoplayer` 各自声明了它（manifest 合并报告可见），且 **Coil 的
+  `RealNetworkObserver` 正依赖它**（靠 media3 顺带满足）。所以删本工程那行只是「清单更诚实」，
+  APK 里的权限集合不变 —— 合并后该条目的来源从「本工程」变为 media3。
+- **FGS 三权限不动**：`FOREGROUND_SERVICE` / `_DATA_SYNC` / `_SPECIAL_USE` 与
+  `ServerService.startForegroundCompat` 的版本分支（<29 无类型 / 29~33 `dataSync` / 34+ `specialUse`）
+  严格对应，`PROPERTY_SPECIAL_USE_FGS_SUBTYPE` 也已声明。**这套组合是刻意设计，不要简化。**
+
+#### 3.27.4 无硬编码分辨率（结论：确实是干净的）
+
+扫描结果**全是误报**：命中的是缓冲区 `64*1024` / `128*1024`、端口范围 `1024..65535`、二维码默认边长
+`480`、以及共享常量 `COMPACT_SCREEN_HEIGHT_DP = 480`。全工程**没有**将 `1920/1080/720/3840` 等绝对值
+用于布局，也**没有** `displayMetrics` / `getRealMetrics` 取真实像素判布局的写法（那才是真正的适配杀手）。
+尺寸有三个层次，都是密度无关的：
+
+- 全部内联在 Compose 的 `.dp` / `.sp`（无 `dimens.xml`、无 `values-*` 限定符目录）；
+- 矮屏整体缩放走 `CompactContentDensity` 覆盖 `LocalDensity`；
+- 「按宽度决定个数」走 `rememberContentWidthDp()` + `effectiveColumns`，缩略图走 `aspectRatio(16f/9f)`，
+  弹框走 `BoxWithConstraints` 量可用高度 + 列表滚动兜底。
+
+#### 3.27.5 【高危】Android 16 在大屏忽略 `screenOrientation`
+
+官方行为变更原文：*Android 16 (API level 36) ignores screen orientation, aspect ratio, and app
+resizability restrictions* —— 适用于**最小宽度 ≥ 600dp** 的屏幕（平板、大折叠内屏、桌面窗口模式），
+且 **opt-out 将在 API 37 被移除**。本项目三个 Activity 全部写死 `android:screenOrientation="landscape"`。
+
+影响分级（关键：**不是所有设备都受影响**）：
+
+| 设备 | 最小宽度 | 是否受影响 |
+| --- | --- | --- |
+| 手机（含本项目的「矮屏」形态） | 360~450dp | **不受影响** —— 矮屏机制照旧有效 |
+| 电视 / 盒子 | 常见 960dp | 命中，但**电视天然不旋转**，实际无感 |
+| 平板 / 大折叠 / 桌面窗口 | ≥ 600dp | **真的会变竖屏 / 任意尺寸窗口** |
+
+具体后果（`MainScreen` 顶部导航栏）：该行是**不换行、不滚动**的 `Row`（品牌标题 + 5 个媒体标签 +
+`Spacer(weight)` + 设置标签 + 状态徽标）。按非紧凑态估算：行内边距 80 + 品牌标题约 150 + 标题后间距 28
++ 5 个标签约 460 + 标签间距 70 + 设置标签约 92 + 间距 20 + 状态徽标约 151 ≈ **1050dp**。
+平板竖屏可用宽约 800dp ⇒ **右侧「设置」标签与状态徽标被挤出屏幕**。
+
+> 为什么此前没人发现：紧凑态同一行只要约 **470dp**，手机横屏（640dp+）恰好装得下；
+> 而 lock landscape 让这一行在电视上永远是宽屏，1050dp 的需求从未被触碰。
+
+修法**双管齐下**（缺一不可）：
+
+1. **清单 opt-out（安全网，有保质期）**：`<application><property
+   android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY" android:value="true"/>`
+   让系统在 API 36 上继续尊重旧的横竖屏 / 尺寸限制。
+   **不能只靠它**：① API 37 移除该 opt-out；② 官方明确「**桌面窗口模式下即使 opt-out，屏幕方向限制
+   也会被覆盖**」，只剩可调整大小性被尊重。
+2. **代码侧真正具备宽度自适应（治本）**：新增常量与判据（`ui/common/CompactUi.kt`）——
+   `TOP_BAR_FULL_WIDTH_DP = 960` 与 `rememberTopBarTight()`：**高度 < 480dp（矮屏）或宽度 < 960dp**
+   任一成立即收窄顶部栏。收窄内容 = 隐藏品牌标题 + 标签改紧凑字号与内边距 + 徽标只留指示圆点
+   → 整行降到约 **470dp**。
+   **阈值为何取 960 而非 1050**：960dp 是 1080p 电视 / 盒子的标准最小宽度，取「严格小于」保证
+   **标准电视逐像素不变**；而一旦宽度 < 960dp 就必然装不下，此时收窄严格优于右侧被裁掉。
+3. **`MainActivity` 补 `configChanges`**：`PlayerActivity` / `ImageViewerActivity` 早已声明
+   `orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode`，主界面漏了 ——
+   方向锁失效后旋转 / 改窗口尺寸会**重建 Activity**。`selected` 用了 `rememberSaveable` 所以能活，
+   但 `showSettings` 等普通 `remember` 会被重置（表现为「旋转后莫名退出设置页」）。
+
+**判据分层（重要，别混）**：顶部栏用 `rememberTopBarTight()`（高度 **或** 宽度），
+内容区缩放用 `CompactContentDensity`（只看高度）。两者刻意独立 —— 平板竖屏（高约 1000dp）时
+内容区仍按电视尺度排版，但顶部栏必须收窄才不会溢出。
+
+#### 3.27.6 备份规则改为排除数据库
+
+`backup_rules.xml` / `data_extraction_rules.xml` 原为 Studio 空模板 ⇒ 等价于**全量备份**。
+问题在于库里的 `media_items.filePath` / `parentFolder` 是**卷根绝对路径**
+（如 `/storage/0000-0000/TransView/Movies/a.mp4`），只在「当初那台设备 + 那张盘」上成立；
+跨设备恢复后全部不可达，媒体库会显示一批点不开的卡片，还得靠设置页「清理不可达索引」善后。
+`playback_history` 以 `filePath` 为外键同理，`upload_records` 纯粹是过程日志。
+
+现排除 `database` / `file` / `external` 三个域，**只保留 `sharedpref`**（用户设置）——
+媒体库本就是磁盘索引，启动时由 `SyncManager` 重新对账补齐，排除**没有副作用**。
+`external` 域必须排除：上传临时目录 `upload_tmp/` 就落在 `getExternalFilesDir` 下，中断的上传可留下
+GB 级残留（见 §3.26.1）。`cache` 域（含 Coil 的 `image_cache`）系统本就不备份，无需声明。
 
 ## 4. 构建与运行
 

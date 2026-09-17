@@ -157,4 +157,17 @@ object SettingsStore {
     var appLogEnabled: Boolean
         get() = prefs()?.getBoolean("app_log_enabled", false) ?: false
         set(v) { prefs()?.edit()?.putBoolean("app_log_enabled", v)?.apply() }
+
+    // ——— 技术标记（非用户可调项；放在同一份 prefs 里便于统一查看与清理） ———
+
+    /**
+     * 是否已申请过通知权限（默认否）。**不是用户设置**，只是「问过就不再打扰」的去重标记。
+     *
+     * 前台服务的常驻通知是用户了解服务器状态的唯一途径（见 [com.hpu.transview.util.NotificationPermission]），
+     * 所以要在首次进入主界面后申请一次；但系统对同一权限只会弹有限次授权框，反复申请只会变成
+     * 「点了没反应」的无效操作 —— 由本标记保证只主动弹一次。
+     */
+    var notifPermissionAsked: Boolean
+        get() = prefs()?.getBoolean("notif_permission_asked", false) ?: false
+        set(v) { prefs()?.edit()?.putBoolean("notif_permission_asked", v)?.apply() }
 }

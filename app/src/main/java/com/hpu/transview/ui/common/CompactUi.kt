@@ -33,6 +33,27 @@ const val COMPACT_SCREEN_HEIGHT_DP = 480
 const val COMPACT_CONTENT_DENSITY_SCALE = 0.87f
 
 /**
+ * 顶部导航栏在**非紧凑态**下完整排布所需的宽度上限（dp）。窄于此值就必须收窄这一行。
+ *
+ * 非紧凑态整行 ≈ 行内边距 80 + 品牌标题「传视 TransView」约 150 + 标题后间距 28
+ * + 5 个媒体标签约 460（每个 30dp×2 padding + 2 个汉字）+ 标签间距 70
+ * + 「设置」标签约 92 + 间距 20 + 状态徽标约 151（圆点 + 「服务器运行中」+ 「· 智能」）
+ * ≈ **1050dp**，故本行在窄于 1050dp 时必然装不下。
+ *
+ * 阈值刻意取 **960**（而非 1050）：
+ * - 960dp 是 1080p 电视 / 盒子的**标准最小宽度**；取「严格小于」可保证标准电视**逐像素不变**；
+ * - 一旦宽度 < 960dp，就说明一定装不下，此时收窄（隐藏品牌标题、标签改用紧凑样式、徽标只留圆点
+ *   → 整行降到约 470dp）严格优于「右侧被裁掉」。
+ *
+ * 为什么必须有这条判据：Android 16（API 36）起，**最小宽度 >= 600dp 的屏幕会忽略
+ * `screenOrientation`** —— 本应用三个 Activity 都锁了 landscape，但平板竖屏 / 桌面窄窗口下
+ * 仍可能真的变竖屏，届时本行会被挤出屏幕（右侧「设置」标签与状态徽标直接丢失）。
+ * Manifest 里的 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` 只是 API 36 的临时安全网，
+ * **API 37 会失效**，所以宽度自适应必须真正具备。
+ */
+const val TOP_BAR_FULL_WIDTH_DP = 960
+
+/**
  * 矮屏（手机横屏）下把**内容区**整体等比缩小。
  *
  * ## 为什么是「缩放密度」而不是给每个页面加一套 compact 分支
@@ -102,5 +123,27 @@ fun rememberContentWidthDp(): Int {
     val confWidth = config.screenWidthDp
     return remember(compact, confWidth) {
         if (compact) (confWidth / COMPACT_CONTENT_DENSITY_SCALE).roundToInt() else confWidth
+    }
+}
+
+/**
+ * 顶部导航栏是否需要收窄。两种情形（任一成立即收窄）：
+ *
+ * ① **矮屏**（手机横屏，高度 < [COMPACT_SCREEN_HEIGHT_DP]）—— 原有判据，逐像素不变；
+ * ② **非矮屏但宽度不足**（宽度 < [TOP_BAR_FULL_WIDTH_DP]，即平板竖屏 / 桌面窄窗口）——
+ *    本次新增的兜底，防 Android 16 起大屏方向锁失效后整行被挤出屏幕。
+ *
+ * 收窄内容：隐藏品牌标题、标签改用紧凑内边距与字号、状态徽标只留指示圆点（详见 MainScreen）。
+ *
+ * 注意**只作用于顶部导航栏**：内容区的紧凑缩放由 [CompactContentDensity] 独立负责，两者判据不同、
+ * 互不影响 —— 例如平板竖屏（高 1000dp）内容区仍按电视尺度排版，但顶部栏必须收窄才不会溢出。
+ */
+@Composable
+fun rememberTopBarTight(): Boolean {
+    val config = LocalConfiguration.current
+    val compact = config.screenHeightDp < COMPACT_SCREEN_HEIGHT_DP
+    val confWidth = config.screenWidthDp
+    return remember(compact, confWidth) {
+        compact || confWidth < TOP_BAR_FULL_WIDTH_DP
     }
 }
