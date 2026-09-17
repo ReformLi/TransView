@@ -29,6 +29,15 @@
 > ⑥ **无硬编码分辨率**：全工程扫描确认无绝对分辨率数字与 `displayMetrics` 判布局写法（细节见 §3.27.4）。
 > **经核实不改**：`MANAGE_EXTERNAL_STORAGE` 是核心功能唯一可行解（工程硬约束「禁用 SAF / DocumentFile」），
 > 保留但需知悉 Google Play 有政策申报要求；FGS 三权限与 `ServerService` 的版本分支严格对应，**不要简化**。
+> **v1.30（上传链路）——修复上传大文件 `OutOfMemoryError / Map failed`**（详见 §3.1 / §3.23/§3.26.1）：
+> 真机传 1.74GB `.mp4` 触发 `java.io.IOException: Map failed` / `OOM`，根因是旧实现 `session.parseBody()`
+> 内部用 `FileChannel.map()` 把整个请求体**内存映射进虚拟内存**，电视盒子瞬间撑爆。**彻底重构**
+> `handleUpload / receiveAndSave`：禁用 `parseBody`，改为 `MultipartStreamParser` 手动流式解析——
+> 从 `session.getInputStream()` 直接读、按 boundary 切分，文件 part **128KiB 缓冲边读边写**进临时文件，
+> 全程堆占用 O(128KiB) 与文件大小无关；进度计数（`CountingInputStream`）、UTF-8 中文名、路径消毒、
+> 同名重命名、zip 自动解压全部保留。**防残余**：接收整段 try-catch-finally，失败/中断/**OOM** 由 finally
+> 物理删除临时文件（`consumed` 标记区分已移交/未移交），成功才 `UploadStorage` 原子移动；进程被杀/断电
+> 残留由 `purgeOrphanUploadTemps` 清扫。
 > v1.29 变更：**「清不掉的数据 / 死文件 / 冗余代码」专项清理**（详见 §3.26）——
 > ① **上传临时文件永久残留**：`Android/data/<包名>/files/upload_tmp/upload_*.tmp` 在「进程被杀 / 断电」时
 > 因 NanoHTTPD 的 `TempFileManager.clear()` 没机会执行而永久留下；该目录不在媒体沙盒内、Android 11+ 对文件
@@ -257,8 +266,8 @@ com.hpu.transview
 
 ### 3.1 上传链路（大文件安全，数据库驱动）
 1. 手机 `POST /upload`（每文件一个请求，XHR `upload.onprogress` 显示百分比）。
-2. NanoHTTPD 流式解析 multipart，临时文件写入**外部存储** `Android/data/…/files/upload_tmp`（避免占用内部空间，且与目标目录同卷）。解析前给请求 Content-Type 强制补 `charset=UTF-8`——NanoHTTPD 对不带 charset 的 multipart 头按 US-ASCII 解码，会损坏中文文件名（浏览器 FormData 从不带 charset）。
-3. **上传记录先入 Room**（upload_records，状态=上传中）；`CountingOutputStream` 累计写入字节，后台协程 600ms 节流换算百分比（已写字节/Content-Length）回写 DB——TV 端上传页经 Room Flow 实时看到进度条，切换标签页不中断（上传在 HTTP 服务器工作线程进行）。
+2. **手动流式 multipart 解析**（v1.30）：禁用 `session.parseBody()`（其内部 `FileChannel.map()` 把整个请求体内存映射进虚拟内存，电视盒子传 1.7GB 级文件会 `Map failed` / `OutOfMemoryError`）。改由 `MultipartStreamParser` 从 `session.getInputStream()`（即 `CountingInputStream`，计数自动生效）直接读，解析 Content-Type 的 `boundary` 手动切分——文件 part 用 **128KiB 缓冲「读一块、写一块」** 边读边写进临时文件 `Android/data/…/files/upload_tmp/upload_<时间戳>_<名>.tmp`（堆占用 O(128KiB)，与文件大小无关）。中文文件名按 UTF-8 解码（兼容 `filename=` / RFC5987 `filename*=`），不再依赖补 `charset=UTF-8`。**防残余**：整段 try-catch-finally，异常 / 断连 / OOM 时 finally 物理删除临时文件；只有全部接收完成才由 `UploadStorage` 原子移动。
+3. **上传记录先入 Room**（upload_records，状态=上传中）；`createClientHandler` 把套接字输入流包成 `CountingInputStream` 累计「已接收字节」，后台协程 600ms 节流换算百分比（已接收/Content-Length，请求头字节可忽略）回写 DB——TV 端上传页经 Room Flow 实时看到进度条，切换标签页不中断（上传在 HTTP 服务器工作线程进行）。
 4. `UploadStorage.save()`：消毒文件名/相对路径 → 逐级建目录（同名文件夹自动合并）→ 同名冲突加 `(n)` 后缀 → `renameTo` 同卷秒移（跨卷退化为 copy + delete；**刻意不用 `java.nio.file.Files`**——该 API 要求 API 26+，本工程 minSdk 21，低版本会抛 `NoClassDefFoundError` 导致全部上传「保存失败」），返回目标 File。
 5. 落盘成功后更新记录状态（成功/失败 + 100%），并在后台协程**立即写入 media_items 索引**（视频经 MediaMetadataRetriever 提时长），`UploadBus` 同时发事件驱动媒体库自动刷新与保活空闲计时；`MediaScannerConnection.scanFile` 通知系统媒体库。
 
@@ -575,9 +584,9 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 - 每个回调开头统一 `if (item.xhr !== xhr) return`：取消后重试会新建 xhr 对象，上一轮迟到的回调不得再改状态。
 
 **服务端（`TransHttpServer.handleUpload`）——中断必须兜底收尾**
-- 客户端 `abort` 会让 `parseBody` 抛出 `ResponseException` **之外**的异常（IO 中断）。原先只捕 `ResponseException`，这类异常会冒泡到 `serve()` 变成 500，**且该条上传记录永远停在「上传中」**（`finishRecord` 从未执行过）。
-- 修法：接收 + 落盘逻辑抽到 `receiveAndSave(...)`，`handleUpload` 用 `try / catch (e: Exception) / finally { monitorJob.cancel() }` 兜底——任何异常都收尾为 `FAILED` 并返回错误响应。
-- 实测：取消一次上传后 DB 中该记录为 `state=3`（失败），**全库无一条 `state=1`（上传中）残留**；`upload_tmp` 临时目录无残留文件（NanoHTTPD 在会话结束时调用 `tempFileManager.clear()`）。
+- 客户端 `abort` / 断连会让手动流式解析从底层套接字读入时抛出 IO 中断类异常。接收 + 落盘逻辑在 `receiveAndSave(...)`，`handleUpload` 用 `try / catch (e: Exception) / finally { monitorJob.cancel() }` 兜底——任何异常都收尾为 `FAILED` 并返回错误响应。
+- `receiveAndSave` 内部整段 **try-catch-finally**：finally 关写流并对「未移交存储」的临时文件 **物理删除**（`consumed` 标记区分已成功改名/交解压与失败的半截文件；finally 对抛出的任何 Throwable、含 `OutOfMemoryError` 都会执行，确保大文件中断 / OOM 也不留半截残留）。
+- 实测：取消一次上传后 DB 中该记录为 `state=3`（失败），**全库无一条 `state=1`（上传中）残留**；`upload_tmp` 临时目录无残留文件（成功即改名移走，失败由 finally 删除，进程被杀/断电由 `purgeOrphanUploadTemps` 清扫）。
 
 **静态资源路由**
 - `GET /icon.svg` / `GET /icon.png` → `serveAsset("web/icon.*", mime)`，从 assets 现读现发（换图后手机端刷新即生效，无需重启服务器）。
@@ -650,7 +659,7 @@ UTF-8 标志位，`ZipInputStream` 固定 UTF-8 解码（遇非法字节抛 `Zip
 
 - 比对统一 `trim + uppercase`（`checkToken`），与手机端输入框自动转大写对齐；取头走 `headerOf()` 兜一层大小写
   （NanoHTTPD 把头部名统一转小写存表，但不依赖它）。
-- **上传的校验放在 `handleUpload` 最前面**：此刻还没建上传记录、也没调 `parseBody` → **请求体一个字节都不落盘**，
+- **上传的校验放在 `handleUpload` 最前面**：此刻还没建上传记录、也没进入流式接收 → **请求体一个字节都不落盘**，
   电视端记录列表不会留下任何痕迹（否则未授权设备能靠刷请求把上传记录塞满）。
 
 **TV 端**（`UploadScreen`，v1.7.1 重做左面板视觉）
@@ -1104,6 +1113,10 @@ v1.19 起统一为 `effectiveColumns`（与 `GridCells.Fixed` 同源）。
 
 ### 3.23 上传进度计数（v1.23 / v1.24）
 
+> **v1.30 已被流式解析取代**：本节的「parseBody 落盘绕过计数器」根因仅适用于旧的 `parseBody` 实现；
+> v1.30 改手动流式解析后，`receiveAndSave` 直接从 `session.getInputStream()`（即 `CountingInputStream`）
+> 读取，计数天然生效，不再依赖 `TempFile` 流。本节保留为历史变更记录。
+
 **症状**：手机网页进度正常，TV 端上传页进度条一直停在 0%，成功才跳 100%。
 
 **根因（两层）**：
@@ -1175,10 +1188,10 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 
 | 项 | 说明 |
 |---|---|
-| 落点 | `Android/data/<包名>/files/upload_tmp/upload_<nanoTime>_<名>.tmp`（[TransHttpServer] 的 `ExternalTempFileManager`；刻意放外部私有目录，与 `/sdcard` 同卷才能 `renameTo` 零拷贝移入沙盒） |
-| 正常清理 | NanoHTTPD 在每次连接收尾调 `TempFileManager.clear()` → `created.forEach { it.delete() }` |
-| **泄漏窗口** | **进程被杀 / 断电 / 系统回收**时 `clear()` 根本没机会跑 → 半个上传永久留在盘上 |
-| 为什么以前无人能清 | ① 该目录**不在媒体沙盒**（`TransView/`）内 —— 对账的 `.temp_unzip` 清理、媒体库扫描、`FileUtils.purgeDirectory`（带 `isInsideSandbox` 断言）全都碰不到它；② **Android 11+ 起 `Android/data/` 对文件管理器不可见**，用户连手动删都做不到；③ 每次 `TransHttpServer` 构造都会 new 一个新的 `ExternalTempFileManager`（`created` 列表为空），上一实例的残留不会被新实例清理 |
+| 落点 | `Android/data/<包名>/files/upload_tmp/upload_<nanoTime>_<safe>.tmp`（[TransHttpServer] 的 `newUploadTempFile()` 自建，刻意放外部私有目录，与 `/sdcard` 同卷才能 `renameTo` 零拷贝移入沙盒） |
+| 正常清理 | 成功落盘 → `UploadStorage` 改名/移走；失败 / 中断 / OOM → `receiveAndSave` 的 **finally** 物理删除「未移交」的临时文件 |
+| **泄漏窗口** | **进程被杀 / 断电 / 系统回收**时 finally 没机会跑 → 半个上传永久留在盘上 |
+| 为什么以前无人能清 | ① 该目录**不在媒体沙盒**（`TransView/`）内 —— 对账的 `.temp_unzip` 清理、媒体库扫描、`FileUtils.purgeDirectory`（带 `isInsideSandbox` 断言）全都碰不到它；② **Android 11+ 起 `Android/data/` 对文件管理器不可见**，用户连手动删都做不到；③ v1.30 起已改为 `newUploadTempFile()` 自建临时文件 + 进程被杀/断电由 `purgeOrphanUploadTemps` 兜底清扫（下方修法） |
 
 **修法**：`TransHttpServer.companion` 新增 `tempDirOf(context)` 与 `purgeOrphanUploadTemps(context, skipActiveWithinMs)`，三处调用：
 

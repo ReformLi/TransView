@@ -24,11 +24,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
+import java.net.URLDecoder
 import java.util.concurrent.atomic.AtomicLong
 
 /** 上传网页模板里的设备名占位符（assets/web/index.html） */
@@ -84,15 +87,17 @@ class TransHttpServer(
     private val inputCounterThreadLocal = ThreadLocal<AtomicLong>()
 
     init {
-        // 临时文件放在应用外部私有目录，与 /sdcard 同卷，移动零拷贝
-        val tempDir = tempDirOf(appContext).apply { mkdirs() }
-        // 每次启动服务器顺手清一次遗留：进程被杀 / 断电时 NanoHTTPD 的
-        // TempFileManager.clear() 没机会执行，半个上传会以 `upload_*.tmp` 永久留在
-        // `Android/data/<包名>/files/upload_tmp/`（Android 11+ 用户连文件管理器都进不去）。
-        // 带保护窗口：「停服务器 → 立刻再启动」的瞬间，上一实例的工作线程可能还在写自己的临时文件。
+        // 上传临时文件直接写在应用外部私有目录（与 /sdcard 同卷，落盘移动零拷贝）。
+        // v1.30：改用手动流式 multipart 解析后，文件 part 由 [MultipartStreamParser]
+        // 自建临时文件，不再借助 NanoHTTPD 的 TempFile 体系（那套是 parseBody 内部用的）——
+        // 故这里不再 setTempFileManagerFactory。
+        runCatching { tempDirOf(appContext).apply { mkdirs() } }
+        // 每次启动服务器顺手清一次遗留：进程被杀 / 断电时没机会执行的清理，
+        // 半个上传会以 `upload_*.tmp` 永久留在 `Android/data/<包名>/files/upload_tmp/`
+        //（Android 11+ 用户连文件管理器都进不去）。带保护窗口：
+        //「停服务器 → 立刻再启动」的瞬间，上一实例的工作线程可能还在写自己的临时文件。
         val purged = runCatching { purgeOrphanUploadTemps(appContext) }.getOrDefault(0)
         if (purged > 0) AppLogger.d(TAG, "服务器启动时清理遗留上传临时文件 $purged 个")
-        setTempFileManagerFactory { ExternalTempFileManager(tempDir) }
     }
 
     override fun serve(session: IHTTPSession): Response {
@@ -133,11 +138,10 @@ class TransHttpServer(
     /**
      * 包装每个连接的套接字输入流，累计「已读字节数」，这是获得真实上传进度的唯一可靠挂接点。
      *
-     * 为什么必须在这里计数：NanoHTTPD 2.3.1 在 `parseBody` 阶段先把**整个请求体**读进内存 /
-     * 暂存临时文件，再在 `decodeMultipartFormData → saveTmpFile` 里用
-     * `new FileOutputStream(tempFile.getName())` 按**文件名**直接写盘——文件 part 从不经过
-     * `TempFile.open()` 返回的流，故原先挂在 TempFile 上的 `bytesWritten` 计数器恒为 0，进度永远是 0%。
-     * 只有从「输入流」这一层计数才准（请求头字节相对文件体可忽略）。
+     * 为什么必须在这里计数：v1.30 起上传不再调用 `parseBody`，而是由
+     * [receiveAndSave] 直接从 [NanoHTTPD.IHTTPSession.getInputStream]（即本方法包装后的
+     * 这个流）手动读 multipart。只要新解析器也从这里读，计数就自动生效；请求头字节相对
+     * 文件体可忽略。
      */
     override fun createClientHandler(socket: Socket, inputStream: InputStream): ClientHandler {
         // 不在这里 set ThreadLocal：本方法跑在「接收连接线程」，handleUpload 在「工作线程」，
@@ -229,8 +233,8 @@ class TransHttpServer(
             return jsonError(Response.Status.FORBIDDEN, "认证失败")
         }
 
-        // 手机网页把分类/文件名/相对路径放 URL query（请求头阶段即可用——multipart 字段
-        // 必须等 parseBody 接收完整个请求体后才会填充，此前读取只会拿到回退值）
+        // 手机网页把分类/文件名/相对路径放 URL query（请求头阶段即可用——文件随请求体流式传输，
+        // 需接收完 body 才能拿到；分类在入队时即定好，放 query 能先建记录、立即显示进度）
         val query = session.parameters
         val category = when (query["category"]?.firstOrNull()) {
             "image" -> Category.IMAGE
@@ -257,20 +261,20 @@ class TransHttpServer(
         )
 
         // 2. 进度监视：已接收字节数 / Content-Length → 回写百分比（节流）。
-        //    计数来自「套接字输入流」包装（见 createClientHandler）——NanoHTTPD 2.3.1 把文件 part
-        //    按文件名直接写盘，不经过 TempFile.open() 的流，故挂在那里的字节计数恒为 0。
+        //    计数来自「套接字输入流」包装（见 createClientHandler）——v1.30 改手动流式解析后，
+        //    receiveAndSave 从 session.getInputStream() 读的就是这个计数流。
         //    此处把计数器清零，保证 keep-alive 同连接多文件依次上传互不干扰。
         val counter = inputCounterThreadLocal.get()
         counter?.set(0)
         val monitorJob = startProgressMonitor(recordId, contentLength, counter)
 
         // 3. 接收 → 落盘 → 收尾。**必须兜底**：手机端「取消上传」= abort 连接，会让
-        //    parseBody 抛出 ResponseException 之外的异常（IO 中断）；不在这里收尾的话，
+        //    手动解析 / 流式写入抛出 IO 中断类异常；不在这里收尾的话，
         //    该条上传记录会永远停在「上传中」，异常还会冒泡到 serve() 变成 500。
         return try {
             receiveAndSave(session, recordId, busId, displayName, relPath, category)
         } catch (e: Exception) {
-            // 手机端「取消上传」= abort 连接，会让 parseBody 抛出 IO 中断类异常。
+            // 手机端「取消上传」= abort 连接，会让流式解析抛出 IO 中断类异常。
             // 这是「文件传了一半就没了」最直接的现场记录，务必留下
             AppLogger.w(TAG, "上传中断：$displayName（$contentLength 字节）", e)
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
@@ -280,7 +284,20 @@ class TransHttpServer(
         }
     }
 
-    /** 流式接收 multipart → 落盘 → 更新记录 → 建媒体索引（成功/失败路径都由本函数收尾） */
+    /** 流式接收 multipart → 落盘 → 更新记录 → 建媒体索引（成功/失败路径都由本函数收尾）
+     *
+     * ## 为什么必须手工解析（v1.30，修复上传大文件 OOM）
+     * 旧实现走 [NanoHTTPD.IHTTPSession.parseBody]，它内部用 `FileChannel.map()` 把请求体整体
+     * 内存映射进**虚拟内存**——1.74GB 的 .mp4 在电视盒子上瞬间撑爆虚拟内存，报
+     * `java.io.IOException: Map failed` / `OutOfMemoryError`。
+     *
+     * 这里改为从 [NanoHTTPD.IHTTPSession.getInputStream] 直接读（NanoHTTPD 的 `execute()`
+     * 在调 `serve()` 前已把该流定位到请求体开头），按 Content-Type 里的 boundary 手动切分
+     * multipart：文件 part 用 128KiB 缓冲「读一块、写一块」流式落到临时文件，绝不整包读进内存。
+     * 全程堆内存占用 O(UPLOAD_BUFFER_SIZE)，与文件大小无关——1GB 与 1MB 一样不会 OOM。
+     *
+     * 进度计数仍生效：session.getInputStream() 就是 [createClientHandler] 包装过的
+     * [CountingInputStream]，手动读取同样累积字节数。 */
     private fun receiveAndSave(
         session: IHTTPSession,
         recordId: Long,
@@ -289,85 +306,127 @@ class TransHttpServer(
         relPath: String,
         category: Category
     ): Response {
-        val files = HashMap<String, String>()
-        val parseError: ResponseException? = try {
-            // NanoHTTPD 对不带 charset 的 multipart 请求按 US-ASCII 解析 part 头，
-            // 会把浏览器以 UTF-8 发送的中文文件名解码损坏（落盘即乱码）。
-            session.headers["content-type"] = session.headers["content-type"]
-                ?.let { if (it.contains("charset=", ignoreCase = true)) it else "$it; charset=UTF-8" }
-            session.parseBody(files)
-            null
-        } catch (e: ResponseException) {
-            e
-        }
-
-        if (parseError != null) {
-            AppLogger.w(TAG, "上传请求解析失败：$displayName（${parseError.status}）", parseError)
+        val contentLength = session.headers["content-length"]?.trim()?.toLongOrNull() ?: 0L
+        val boundary = parseBoundary(headerOf(session, "content-type"))
+        if (boundary == null) {
+            AppLogger.w(TAG, "上传失败：请求不是 multipart/form-data（$displayName）")
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
-            return jsonError(parseError.status, parseError.message ?: "请求解析失败")
+            return jsonError(Response.Status.BAD_REQUEST, "缺少 multipart boundary")
         }
 
-        val tempPath = files["file"]
-        if (tempPath == null) {
-            AppLogger.w(TAG, "上传失败：请求里没有 file 字段（$displayName）")
-            finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
-            return jsonError(Response.Status.BAD_REQUEST, "缺少文件")
-        }
-        val tempFile = File(tempPath)
-        if (!tempFile.isFile || tempFile.length() == 0L) {
-            // 典型成因：手机端中断后仍发出了结束请求，或临时文件中途被清掉
-            AppLogger.w(TAG, "上传失败：临时文件无效（$displayName，${tempFile.length()} 字节）")
-            finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
-            return jsonError(Response.Status.BAD_REQUEST, "上传内容无效")
-        }
+        val parser = MultipartStreamParser(session.getInputStream(), boundary)
+        var output: BufferedOutputStream? = null
+        var tempFile: File? = null
+        var finalName = displayName
+        // 临时文件是否已「移交存储」：成功落盘（改名到分类目录）或已交解压工作区后为 true。
+        // finally 只删「未移交」的临时文件 —— 成功时它已不在原临时路径，delete 是 no-op；
+        // 失败 / 中断 / OOM 时它仍是半截文件，必须物理删掉。
+        var consumed = false
+        try {
+            // 跳过开头的 `--boundary` 行
+            if (!parser.open()) {
+                AppLogger.w(TAG, "上传失败：multipart 起始行无效（$displayName）")
+                finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
+                return jsonError(Response.Status.BAD_REQUEST, "multipart 格式错误")
+            }
 
-        // 4. 落盘 + 更新记录 + 建媒体索引
-        // 落盘文件名以 multipart 头为准（服务端可信源）；缺失时回退 URL query 的 filename
-        val multipartName = session.parameters["file"]?.firstOrNull()?.takeIf { it.isNotBlank() }
-        val finalName = multipartName ?: displayName
+            var finished = false
+            while (!finished) {
+                val header = parser.readPartHeader() ?: break
+                if (header.isFile) {
+                    // 文件 part：文件名以 multipart 头为准（服务端可信源），缺失/伪 blob 时回退 URL query
+                    if (header.fileName.isNotBlank() && header.fileName != "blob") {
+                        finalName = UploadStorage.sanitizeFileName(header.fileName)
+                    }
+                    tempFile = newUploadTempFile(finalName)
+                    output = BufferedOutputStream(FileOutputStream(tempFile), UPLOAD_BUFFER_SIZE)
+                    // 边读边写：读到边界返回 true，提前 EOF（中断/取消）返回 false
+                    if (!parser.streamBody(output)) throw IOException("上传中断：文件 part 未读到结束边界")
+                    output.flush()
+                    finished = parser.atEnd()
+                } else {
+                    // 非文件 part（前端只发 file，这里兜底消费掉，避免污染后续解析）
+                    parser.streamBody(NullOutputStream)
+                    finished = parser.atEnd()
+                }
+                if (!finished) parser.consumePartSeparator() // 非最终边界后有一段 CRLF，消费掉再接下一 part
+            }
+            output?.close()
+            output = null
 
-        // 压缩包自动解压（固定行为，无设置开关）：视频 / 图片分类上传 .zip 即走
-        // 「暂存 → 解压 → 按分类归位」，不把 .zip 原样落进分类目录——分类本身就是意图表达，
-        // 想保留 zip 原样就选「其他」分类（「其他」的 .zip 仍然直接存 Downloads，不解压）
-        if (category != Category.OTHER &&
-            finalName.endsWith(".zip", ignoreCase = true)
-        ) {
-            return receiveZipAndExtract(tempFile, recordId, busId, finalName, category)
-        }
+            // 耗尽剩余请求体（final boundary 之后可能还有尾部 CRLF）→ keep-alive 连接保持干净
+            parser.drainRemaining(contentLength)
 
-        val result = storage.save(tempFile, finalName, relPath, category)
-        val savedFile = result.getOrNull()
-        finishRecord(
-            recordId, busId,
-            if (result.isSuccess) UploadStateCode.SUCCESS else UploadStateCode.FAILED,
-            if (result.isSuccess) 100 else 0
-        )
-        if (result.isSuccess) {
-            AppLogger.i(TAG, "上传成功：${savedFile?.path ?: finalName}")
-        } else {
-            // 落盘这一步把「磁盘满 / 掉盘 / 权限不足 / 跨卷复制出半截」压成同一个异常。
-            // 不记堆栈就永远分不清是哪一种 —— 这是「文件传了一半消失」的唯一现场
-            AppLogger.e(
-                TAG,
-                "上传落盘失败：$finalName（${category.name}）",
-                result.exceptionOrNull()
+            if (tempFile == null || !tempFile.isFile || tempFile.length() == 0L) {
+                // 典型成因：手机端中断后仍发出了结束请求，或临时文件中途被清掉。
+                // 半截临时文件交给 finally 删除
+                AppLogger.w(TAG, "上传失败：没有收到有效的 file 字段（$displayName）")
+                finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
+                return jsonError(Response.Status.BAD_REQUEST, "缺少文件")
+            }
+
+            // 压缩包自动解压（固定行为，无设置开关）：视频 / 图片分类上传 .zip 即走
+            // 「暂存 → 解压 → 按分类归位」，不把 .zip 原样落进分类目录——分类本身就是意图表达，
+            // 想保留 zip 原样就选「其他」分类（「其他」的 .zip 仍然直接存 Downloads，不解压）
+            if (category != Category.OTHER && finalName.endsWith(".zip", ignoreCase = true)) {
+                consumed = true // 临时文件已交由 ZipExtractor 移动归位，finally 不再删
+                return receiveZipAndExtract(tempFile, recordId, busId, finalName, category)
+            }
+
+            val result = storage.save(tempFile, finalName, relPath, category)
+            consumed = result.isSuccess // 成功->临时已改名到分类目录；失败->仍残留待 finally 删
+            val savedFile = result.getOrNull()
+            finishRecord(
+                recordId, busId,
+                if (result.isSuccess) UploadStateCode.SUCCESS else UploadStateCode.FAILED,
+                if (result.isSuccess) 100 else 0
             )
+            if (result.isSuccess) {
+                AppLogger.i(TAG, "上传成功：${savedFile?.path ?: finalName}")
+            } else {
+                // 落盘这一步把「磁盘满 / 掉盘 / 权限不足 / 跨卷复制出半截」压成同一个异常。
+                // 不记堆栈就永远分不清是哪一种 —— 这是「文件传了一半消失」的唯一现场
+                AppLogger.e(
+                    TAG, "上传落盘失败：$finalName（${category.name}）", result.exceptionOrNull()
+                )
+            }
+            if (savedFile != null) indexMediaAsync(savedFile)
+
+            return if (result.isSuccess) {
+                val json = JSONObject()
+                    .put("status", "ok")
+                    .put("filename", savedFile?.name ?: "")
+                newFixedLengthResponse(Response.Status.OK, "application/json", json.toString())
+            } else {
+                jsonError(Response.Status.INTERNAL_ERROR, result.exceptionOrNull()?.message ?: "保存失败")
+            }
+        } catch (e: Exception) {
+            // 网络中断 / 客户端取消 / 解析失败：记现场并收尾（临时文件的物理删除在 finally，
+            // 保证连 OutOfMemoryError 这种 Error 也逃不过 finally 清理，绝不残留半截大文件）
+            AppLogger.w(TAG, "上传中断：$displayName（$contentLength 字节）", e)
+            finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
+            return jsonError(Response.Status.INTERNAL_ERROR, e.message ?: "上传中断")
+        } finally {
+            // 关闭写流 + 物理删除「未移交」的临时文件。finally 对抛出的**任何** Throwable
+            // （含 OutOfMemoryError）都会执行——这正是「一旦 IO 异常 / OOM / 断连就删临时文件」
+            // 的兜底点。成功路径下临时文件已被改名/移走，此处 delete 是 no-op。
+            runCatching { output?.close() }
+            if (!consumed) runCatching { tempFile?.delete() }
         }
-        if (savedFile != null) {
-            indexMediaAsync(savedFile)
+    }
+
+    /** 从 `Content-Type` 里取 multipart boundary（形如 `multipart/form-data; boundary=----xxx`） */
+    private fun parseBoundary(contentType: String?): String? =
+        contentType?.let { ct ->
+            Regex("""boundary\s*=\s*"?"?([^;"\s]+)""")
+                .find(ct)?.groupValues?.get(1)
         }
 
-        return if (result.isSuccess) {
-            val json = JSONObject()
-                .put("status", "ok")
-                .put("filename", savedFile?.name ?: "")
-            newFixedLengthResponse(Response.Status.OK, "application/json", json.toString())
-        } else {
-            jsonError(
-                Response.Status.INTERNAL_ERROR,
-                result.exceptionOrNull()?.message ?: "保存失败"
-            )
-        }
+    /** 为本次上传建一个唯一的临时文件（与 /sdcard 同卷 → 落盘 renameTo 零拷贝） */
+    private fun newUploadTempFile(name: String): File {
+        val safe = name.replace(Regex("[^\\w.-]"), "_").takeLast(60)
+        val dir = tempDirOf(appContext).apply { mkdirs() }
+        return File(dir, "upload_${System.nanoTime()}_$safe.tmp")
     }
 
     /**
@@ -495,32 +554,162 @@ class TransHttpServer(
         return newFixedLengthResponse(status, "application/json", json.toString())
     }
 
-    /** 把上传临时文件放到指定目录（外部存储），代替默认的系统临时目录。
-     *  进度计数已改到「套接字输入流」一层（见 [createClientHandler]）：NanoHTTPD 2.3.1 把文件 part
-     *  按文件名直接写盘，不经过 open() 返回的流，TempFile 内部做字节计数毫无意义，这里只提供落盘位置。 */
-    private class ExternalTempFileManager(private val dir: File) : NanoHTTPD.TempFileManager {
-        private val created = mutableListOf<File>()
-        init { dir.mkdirs() }
-        override fun createTempFile(filename: String?): NanoHTTPD.TempFile {
-            val safe = (filename ?: "").replace(Regex("[^\\w.-]"), "_").takeLast(40)
-            val file = File(dir, "upload_${System.nanoTime()}_$safe.tmp")
-            created += file
-            return object : NanoHTTPD.TempFile {
-                private var stream: OutputStream? = null
-                override fun delete() { runCatching { stream?.close() }; file.delete() }
-                override fun getName(): String = file.absolutePath
-                override fun open(): OutputStream {
-                    if (stream == null) {
-                        stream = BufferedOutputStream(FileOutputStream(file), 128 * 1024)
-                    }
-                    return stream!!
+    /**
+     * 手动 multipart/form-data 流式解析器（v1.30，替换 NanoHTTPD `parseBody` 的内存映射方案）。
+     *
+     * 直接从输入流读 multipart，用 boundary 分隔；文件 part 由调用方提供输出流，这里
+     * 「读一块、写一块」。为在固定大小的窗口里发现分隔符，内部保留最多 `delim-1` 字节的
+     * 「悬空尾」，绝不会把整个文件缓冲进内存——堆占用 O(UPLOAD_BUFFER_SIZE)，与文件大小无关。
+     *
+     * 输入流即 [CountingInputStream]（见 [createClientHandler]），本类所有 `read` 都经过它，
+     * 上传进度自动累计。
+     */
+    private class MultipartStreamParser(
+        private val ins: InputStream,
+        private val boundary: String
+    ) {
+        /** 数据段的结束标记：`\r\n--boundary`（此 CRLF 是分隔符的一部分，不属于数据） */
+        private val delim: ByteArray = ("\r\n--$boundary").toByteArray(Charsets.US_ASCII)
+        private val keep: Int = delim.size - 1
+        private val readBuf = ByteArray(UPLOAD_BUFFER_SIZE)
+        private val pending = ByteArrayOutputStream(keep + 4096)
+        var consumed: Long = 0
+            private set
+
+        /** 跳过开头的 `--boundary` 行；成功返回 true */
+        fun open(): Boolean {
+            val first = readLine() ?: return false
+            return String(first, Charsets.US_ASCII) == "--$boundary"
+        }
+
+        /** 一个 part 的头部：字段名 + 文件名 */
+        data class PartHeader(val fieldName: String?, val fileName: String) {
+            val isFile: Boolean get() = fieldName == "file"
+        }
+
+        /** 读一个 part 的头块（到空行为止），返回字段名 / 文件名 */
+        fun readPartHeader(): PartHeader? {
+            var fieldName: String? = null
+            var fileName = ""
+            while (true) {
+                val line = readLine() ?: return null
+                if (line.isEmpty()) break // 空行 = 头部结束
+                val s = String(line, Charsets.US_ASCII)
+                if (s.startsWith("content-disposition", ignoreCase = true)) {
+                    fieldName = dispositionValue(s, "name")
+                    fileName = dispositionFileName(line)
+                }
+            }
+            return PartHeader(fieldName, fileName)
+        }
+
+        /** 流式写当前 part 的数据体到 [out]，直到遇到结束标记；读到边界返回 true，
+         *  提前 EOF（客户端中断 / 取消）返回 false。绝不会把 boundary 字节写进 [out]。 */
+        fun streamBody(out: OutputStream): Boolean {
+            while (true) {
+                val b = pending.toByteArray()
+                val i = indexOfDelim(b)
+                if (i >= 0) {
+                    if (i > 0) out.write(b, 0, i) // 分隔符之前都是数据
+                    resetFrom(i + delim.size)       // 消费分隔符，留下其后的字节
+                    return true
+                }
+                val emit = (b.size - keep).coerceAtLeast(0)
+                if (emit > 0) out.write(b, 0, emit)  // 只保留可能切开分隔符的悬空尾
+                resetFrom(emit)
+                if (!pull()) return false // EOF，没等来结束边界
+            }
+        }
+
+        /** 刚消费的边界之后是否就是最终边界（`--boundary--` 的开头 `--`） */
+        fun atEnd(): Boolean {
+            val b = pending.toByteArray()
+            return b.size >= 2 && b[0] == '-'.code.toByte() && b[1] == '-'.code.toByte()
+        }
+
+        /** 非最终边界后紧接一段 CRLF（boundary 行的收尾），消费掉使下一个 part 从头读起 */
+        fun consumePartSeparator() {
+            val b = bytes()
+            var off = 0
+            if (b.size > off && b[off] == '\r'.code.toByte()) off++
+            if (b.size > off && b[off] == '\n'.code.toByte()) off++
+            resetFrom(off)
+        }
+
+        /** 耗尽剩余请求体（final boundary 后可能还有尾部 CRLF），让 keep-alive 连接保持干净 */
+        fun drainRemaining(contentLength: Long) {
+            if (contentLength <= 0) return
+            while (consumed < contentLength) if (!pull()) break
+        }
+
+        // ---- 底层 ----
+
+        private fun pull(): Boolean {
+            val n = ins.read(readBuf, 0, readBuf.size)
+            if (n > 0) { consumed += n; pending.write(readBuf, 0, n); return true }
+            return false
+        }
+
+        private fun bytes(): ByteArray = pending.toByteArray()
+
+        private fun resetFrom(idx: Int) {
+            val b = bytes()
+            pending.reset()
+            if (idx < b.size) pending.write(b, idx, b.size - idx)
+        }
+
+        private fun readLine(): ByteArray? {
+            while (true) {
+                val b = bytes()
+                var nl = -1
+                for (i in b.indices) if (b[i] == '\n'.code.toByte()) { nl = i; break }
+                if (nl >= 0) {
+                    val line = b.copyOfRange(0, nl)
+                    resetFrom(nl + 1)
+                    return if (line.isNotEmpty() && line.last() == '\r'.code.toByte())
+                        line.copyOf(line.size - 1) else line
+                }
+                if (!pull()) {
+                    return if (b.isEmpty()) null else { val all = b; resetFrom(all.size); all }
                 }
             }
         }
-        override fun clear() {
-            created.forEach { it.delete() }
-            created.clear()
+
+        private fun indexOfDelim(b: ByteArray): Int {
+            if (b.size < delim.size) return -1
+            var i = 0
+            while (i <= b.size - delim.size) {
+                var j = 0
+                while (j < delim.size && b[i + j] == delim[j]) j++
+                if (j == delim.size) return i
+                i++
+            }
+            return -1
         }
+
+        private fun dispositionValue(s: String, target: String): String? {
+            Regex("""$target\s*=\s*"([^"]*)"""").find(s)?.let { return it.groupValues[1] }
+            Regex("""$target\s*=\s*([^;\s]+)""").find(s)?.let { return it.groupValues[1] }
+            return null
+        }
+
+        /** 从 Content-Disposition 取 UTF-8 文件名（兼容 `filename=` 与 RFC5987 `filename*=`） */
+        private fun dispositionFileName(line: ByteArray): String {
+            val s = String(line, Charsets.UTF_8)
+            Regex("filename\\*\\s*=\\s*[^;]*['']([^;]+)").find(s)?.let { m ->
+                return runCatching { URLDecoder.decode(m.groupValues[1], "UTF-8") }
+                    .getOrDefault(m.groupValues[1])
+            }
+            Regex("""filename\s*=\s*"([^"]*)"""").find(s)?.let { m -> return m.groupValues[1] }
+            Regex("filename\\s*=\\s*([^;]+)").find(s)?.let { m -> return m.groupValues[1].trim() }
+            return ""
+        }
+    }
+
+    /** 丢弃型输出流：非文件 part 直接消费掉，不落盘 */
+    private object NullOutputStream : OutputStream() {
+        override fun write(b: Int) = Unit
+        override fun write(b: ByteArray, off: Int, len: Int) = Unit
     }
 
     /** 字节计数输入流：每 read 一字节 / 一块就累加到 [counter]，用于上报真实上传进度。
@@ -556,6 +745,9 @@ class TransHttpServer(
     companion object {
 
         private const val TAG = "TransHttpServer"
+
+        /** 上传 I/O 缓冲（128KiB）：读缓冲 / 写缓冲共用，单次读一块写一块，内存占用与文件大小无关 */
+        private const val UPLOAD_BUFFER_SIZE = 128 * 1024
 
         /** 上传临时目录名（位于应用外部私有目录 `files/` 下，与 /sdcard 同卷） */
         private const val TEMP_DIR_NAME = "upload_tmp"

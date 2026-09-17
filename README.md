@@ -12,6 +12,8 @@
 > **⑤【数据】备份规则排除数据库**：`backup_rules.xml` / `data_extraction_rules.xml` 是 Studio 空模板 ⇒ **全量备份**，会把 Room 库一起带走 —— 而 `media_items.filePath` 是**卷根绝对路径**，跨设备恢复后全部不可达（反倒变成「不可达索引」要用户手动清）。现排除 `database` / `file` / `external` 三个域，只保留 `sharedpref`（用户设置）；媒体库本就是磁盘索引，启动时由 `SyncManager` 重新对账补齐，排除无副作用。
 > **经核实「不是问题」**：`ACCESS_NETWORK_STATE` 的删除对 APK 无影响（media3 带着）；FGS 三个权限与 `ServerService` 的版本分支严格对应（<29 无类型 / 29~33 `dataSync` / 34+ `specialUse`），**不要简化**；`MANAGE_EXTERNAL_STORAGE` 是核心功能的唯一可行解（工程硬约束「禁用 SAF / DocumentFile」），保留但需知悉 Google Play 对其有政策申报要求（侧载不受限）。（详见 ARCHITECTURE §3.27）
 
+> v1.30 变更：**上传大文件 OOM 修复（手动流式 multipart 解析）** —— 修复真机上传 1.74GB `.mp4` 报 `java.io.IOException: Map failed` / `OutOfMemoryError`。根因：NanoHTTPD 2.3.1 的 `session.parseBody()` 内部用 `FileChannel.map()` 把**整个请求体**内存映射进虚拟内存，大文件在电视盒子上直接撑爆（曾见 §4.1「内存占用 ≤100MB」的旧指标，实为经不起大文件检验）。修法：**彻底重构 `TransHttpServer.receiveAndSave`，禁用 `parseBody()`**，新增私有 `MultipartStreamParser` 从套接字输入流按 boundary 手动流式解析——文件 part 用 **128KiB 缓冲边读边写**进 `Android/data/<包名>/files/upload_tmp/upload_*.tmp`（应用外部私有目录 + BufferedOutputStream），全程解析器堆占用 O(128KiB)，**与文件大小无关**。保留了进度计数（`CountingInputStream` 在网络接收层计数自动生效）、UTF-8 中文文件名解码（兼容 `filename=` / RFC5987 `filename*=`）、路径消毒、同名重命名、zip 自动解压等全部行为。接收整段 **try-catch-finally + `consumed` 标记**：成功才原子移入分类目录，失败 / 中断 / **哪怕是 `OutOfMemoryError`** 都在 finally 里物理删除临时文件（防残余）；NanoHTTPD 的 `TempFileManager` 体系（`parseBody` 专用）与迁移后无用的 `ExternalTempFileManager` 一并废弃，临时文件由解析器自建、`purgeOrphanUploadTemps()` 启动清扫兜底。（见 §3.2 / ARCHITECTURE §3.1、§3.23、§3.26.1）
+
 > v1.29 变更：**「清不掉的数据 / 死文件 / 冗余代码」专项排查与清理** —— 逐类核实后修掉 5 处「前端无法清理」的实质问题，并删掉 1 份整死文件 + 4 处无用资源/代码。
 > **① 上传临时文件永久残留（最严重，会吃 GB 级空间）**：NanoHTTPD 的临时文件靠 `TempFileManager.clear()` 在每次连接收尾删除，但**进程被杀 / 断电 / 系统回收**时它根本没机会跑 —— 半个上传就以 `upload_*.tmp` 永久留在 `Android/data/<包名>/files/upload_tmp/`。该目录**不在媒体沙盒内**（对账的 `.temp_unzip` 清理与媒体库都碰不到），**Android 11+ 用户连文件管理器都进不去**，此前**没有任何清理路径**。修法：新增 `TransHttpServer.purgeOrphanUploadTemps()`，在 **App 启动**（进程刚起 ⇒ 本进程不可能有在途上传，保护窗口取 0）与**服务器启动 / 设置页「清理缓存」**（保护窗口 10 分钟，避开「停服立刻重启」「清理时正在上传」两种竞态）三处清扫。
 > **② 不可达索引前端无出口**：对账按「读不到 ≠ 被删」原则（防拔盘误删）**永不删除**「所属卷已不在设备上」的索引，媒体库又按活动沙盒过滤显示不到它们 —— 这些记录只能永远躺在库里。修法：设置页新增「**清理不可达索引**」：点开先统计条数（0 条直接提示），确认弹框写清风险，确认后连同级联的播放历史一并删除（判据是「连所属卷都不在卷列表里」，比「卷在位但已拔出」更严格，临时拔出的盘不在清理范围）。
@@ -291,8 +293,8 @@
 * 根路径 `/` 返回上传网页（每次请求现读模板并注入当前设备名）；**根路径不校验访问码** —— 网页得先加载出来，才有地方显示「输入访问码」界面。
 * 访问码校验接口 `GET /verify?token=xxxxxx`：匹配返回 200，缺失或不匹配返回 403（大小写不敏感）。
 * 上传接口 `/upload` 接收 POST 请求，解析 `multipart/form-data`；**需带请求头 `X-Upload-Token`，缺失或不匹配直接 403**（`{"status":"error","message":"认证失败"}`），且**不接收任何文件**——校验放在函数最前面，此时既没建上传记录也没读请求体。详见 §3.2.6。
-* 解析前强制补 `charset=UTF-8`（NanoHTTPD 对不带 charset 的请求按 US-ASCII 解码，会损坏中文文件名）。
-* 支持大文件上传，不限制文件大小（受电视存储限制）；上传临时文件写入外部存储私有目录（与目标目录同卷，保存时零拷贝移动）。
+* **手动流式解析 multipart**（v1.30，禁用 `session.parseBody()` 的内存映射方案）：从输入流按 boundary 切分，文件 part 用 **128KiB 缓冲边读边写**进临时文件——全程堆占用 O(128KiB)，与文件大小无关，修复了旧实现 `FileChannel.map()` 对大文件撑爆虚拟内存的 `OutOfMemoryError / Map failed`。中文文件名按 UTF-8 解码（兼容 `filename=` / RFC5987 `filename*=`）。
+* 支持大文件上传，不限制文件大小（受电视存储限制）；上传临时文件写入外部存储私有目录（与目标目录同卷，保存时零拷贝移动）；接收整段 **try-catch-finally**，失败/中断/OOM 物理删除临时文件（防残余），成功才原子移入分类目录。
 * 文件名与相对路径服务端消毒：过滤 `../`、路径分隔符、控制字符，防路径穿越。
 * 返回 JSON 响应：`{"status":"ok","filename":"xxx.mp4"}` 或 `{"status":"error","message":"..."}`。
 
@@ -644,7 +646,7 @@ v1.11 那个「导出存储诊断日志」（已随 v1.17 一并移除、实现�
 
 ### 4.1 性能
 
-* 上传大文件（如 2GB MP4）时，内存占用不超过 100MB。
+* 上传大文件（如 2GB MP4）时，App 内存占用保持在低水位（v1.30 起 multipart 手动流式解析：文件 part 以 **128KiB 缓冲边读边写**进临时文件，解析器堆占用 O(128KiB)，与文件大小无关；旧实现的 `FileChannel.map()` 内存映射对大文件会撑爆虚拟内存报 `Map failed` / `OutOfMemoryError`，已弃用）。
 * 上传速度受局域网带宽限制，应尽可能接近满速。
 * 媒体库**增量对账**（无新增 / 变更文件）1000 个文件 ≤5 秒；**首次全量入库**需为每个新视频提取时长（MediaMetadataRetriever，约 20~50ms/个），1000 个新视频约 10~50 秒，属一次性成本——期间媒体库随 Room Flow 逐条推送**逐步显示**，无需等待扫描结束（与 Kodi / Plex 首扫「先出列表、后补元数据」的主流做法一致）。
 
