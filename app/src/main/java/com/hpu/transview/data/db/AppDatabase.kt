@@ -11,8 +11,8 @@ import androidx.room.RoomDatabase
         PlaybackHistoryEntity::class,
         UploadRecordEntity::class
     ],
-    version = 2,
-    exportSchema = false
+    version = 1,
+    exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
 
@@ -31,9 +31,11 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "transview.db"
                 )
-                    // v1（path 主键的旧播放历史）→ v2（MediaItem 外键体系）schema 不兼容；
-                    // 开发期直接重建，播放历史会清空一次
-                    .fallbackToDestructiveMigration()
+                    // 封板约定：从 v1 起，任何 schema 变更必须显式写 Migration；
+                    // 仅在降级（装了高版本又装回低版本，异常情况）时允许清库重建。
+                    // 禁止使用无参数的 fallbackToDestructiveMigration()，
+                    // 避免升级时静默清空用户数据。
+                    .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                     .also { instance = it }
             }
