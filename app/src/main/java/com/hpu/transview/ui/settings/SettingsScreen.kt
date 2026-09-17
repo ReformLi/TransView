@@ -172,6 +172,9 @@ private fun sandboxSizeText(): String = runCatching {
  */
 private const val GROUP_ANCHOR_PREFIX = "@group:"
 
+/** 本页日志标签（AppLogger 落盘用） */
+private const val TAG = "SettingsScreen"
+
 private fun speedLabel(speed: Float): String = when (speed) {
     1.25f -> "1.25x"
     1.5f -> "1.5x"
@@ -225,6 +228,8 @@ fun SettingsScreen(
 
     // 「App 调试日志」开关的界面显示值（写 SharedPreferences 不会触发本页重组）
     var appLogValue by remember { mutableStateOf(SettingsStore.appLogEnabled) }
+    // 「详细日志」开关的界面显示值（v1.31）：只在上面总闸开启时有意义
+    var detailedLogValue by remember { mutableStateOf(SettingsStore.detailedLogEnabled) }
     // 日志目录提示文案：随活动存储（内部存储 / U 盘）变化
     val appLogDir = AppLogger.logDirLabel()
 
@@ -245,7 +250,7 @@ fun SettingsScreen(
     val rowFocused = remember { mutableStateMapOf<String, Boolean>() }
     var detailTicket by remember { mutableIntStateOf(0) }
     // 左/右两栏各自一份滚动状态。矮屏（手机横屏）下**两栏**都可能高于可视区：
-    // 左栏是「设置」标题 + 5 个分组，右栏「存储与数据」有 9 行设置 + 小字提示 + 信息条目。
+    // 左栏是「设置」标题 + 5 个分组，右栏「存储与数据」有 10 行设置 + 小字提示 + 信息条目。
     // 原先两栏都是固定高度布局（左栏 `Arrangement.Center`、右栏仅「关于」组内部滚动），
     // 内容一超出就被裁掉、且无法滚动（用户实测：左侧末项「关于」看不到，
     // 右侧「存储与数据」只能看到「存储空间占用」为止）。
@@ -1038,8 +1043,10 @@ fun SettingsScreen(
                             // 打开后 AppLogger 把运行日志异步落盘到
                             // <活动沙盒>/TransView/Downloads/app_log/<yyyy-MM-dd>/<HH-mm-ss>.log；
                             // 该目录属于「其他」分类 → 对账后可在「其他」页直接翻看。
-                            // focusKey 固定为 :3（:4~:8 为其余各项，ID 稳定、不随行序变化）。
-                            // 分组末行现在是 :8「清理不可达索引」（bottomEdge = true）。
+                            // focusKey 固定为 :3（:4~:9 为其余各项，ID 稳定、不随行序变化）；
+                            // 其下紧随的「详细日志」是它的**子开关**，编号 :9（新增行只追加编号，
+                            // 不重排既有 ID）。分组末行仍是 :8「清理不可达索引」（bottomEdge = true）
+                            // —— :9 的渲染位置落在 :3 之后、:4 之前，不改变末行。
                             SettingRow(
                                 "${g.title}:3", "App 调试日志",
                                 if (appLogValue) "开启" else "关闭",
@@ -1061,6 +1068,33 @@ fun SettingsScreen(
                                         if (on) "已开启调试日志，写入 $appLogDir"
                                         else "已关闭调试日志",
                                         Toast.LENGTH_LONG
+                                    ).show()
+                                })
+                            }
+                            // 「详细日志」开关（默认关，v1.31）：总闸开启后额外落盘 V 级
+                            //（UI 操作轨迹、逐次存储探测、逐文件索引等可高频的诊断细节）。
+                            // focusKey 取 :9 而非 :4 —— 按本页约定，**新增行一律分配未占用的新编号，
+                            // 绝不重排既有 ID**（focusKey 是稳定标识，只用于焦点锚定 / 复位，
+                            // 不参与几何导航，故渲染位置与前缀编号不一致是安全的）。
+                            SettingRow(
+                                "${g.title}:9", "详细日志",
+                                if (detailedLogValue) "开启" else "关闭",
+                                subtitle = "额外记录操作轨迹等细节；日志量较大，建议仅在排查时开启"
+                            ) {
+                                openChoice("${g.title}:9", ChoiceState(
+                                    "详细日志",
+                                    listOf("开启", "关闭"),
+                                    if (detailedLogValue) 0 else 1
+                                ) { i ->
+                                    val on = i == 0
+                                    detailedLogValue = on
+                                    SettingsStore.detailedLogEnabled = on
+                                    // 立即生效：只翻转标志，不重启写盘引擎（见 AppLogger.setDetailed）
+                                    AppLogger.setDetailed(on)
+                                    Toast.makeText(
+                                        context,
+                                        if (on) "已开启详细日志" else "已关闭详细日志",
+                                        Toast.LENGTH_SHORT
                                     ).show()
                                 })
                             }
@@ -1256,6 +1290,9 @@ fun SettingsScreen(
                                     } else Modifier
                                 ) {
                                     choiceState = null
+                                    // 操作轨迹（V，仅详细日志）：设置项变更（弹框标题 + 新选值）。
+                                    // 覆盖本页所有单选设置，一处即可记住「谁在什么时候改了什么」。
+                                    AppLogger.v(TAG, "设置变更：${cs.title} → ${cs.options.getOrNull(i)}")
                                     cs.onPick(i)
                                 }
                                 // 逐项说明（灰色小字，对齐选项文字起点）：仅当调用方提供了 descriptions 时渲染
@@ -1293,6 +1330,9 @@ fun SettingsScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         TvButton(cf.confirmText) {
                             confirmState = null
+                            // 破坏性 / 清理操作留痕（I）：确认执行时落一条（含标题，如「清理缓存」
+                            // 「清理不可达索引」），便于事后核对「谁在何时清过什么」。
+                            AppLogger.i(TAG, "确认执行：${cf.title}")
                             cf.onConfirm()
                         }
                         TvButton("取消") { confirmState = null }

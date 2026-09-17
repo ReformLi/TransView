@@ -92,6 +92,7 @@ import com.hpu.transview.ui.common.OptionRow
 import com.hpu.transview.ui.common.TvButton
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.mediaUri
@@ -148,6 +149,7 @@ import kotlinx.coroutines.withContext
 class PlayerActivity : ComponentActivity() {
 
     companion object {
+        private const val TAG = "PlayerActivity"
         const val EXTRA_PATH = "path"
         /** 返回给媒体库：最后播放的视频路径，用于焦点定位 */
         const val EXTRA_RESULT_PATH = "last_viewed_path"
@@ -298,9 +300,15 @@ class PlayerActivity : ComponentActivity() {
                 if (hasNext && SettingsStore.autoPlayNext) {
                     // 自动连播开启且还有下一集：弹「下一集预告卡」倒计时 5 秒
                     // （主流做法：给用户反悔/立即播放的机会，而不是无感硬切）
+                    AppLogger.i(TAG, "播放结束：${file?.name ?: "未知"} → 触发自动连播预告卡")
                     showNextCard()
                 } else {
                     // 最后一集 / 自动连播关闭：停在片尾由用户决定「重播」还是离开
+                    AppLogger.i(
+                        TAG,
+                        "播放结束：${file?.name ?: "未知"} → 停在片尾" +
+                            (if (!hasNext) "（已是最后一集）" else "（自动连播已关闭）")
+                    )
                     showBadge(
                         null,
                         if (hasNext) "播放结束（自动连播已关闭）" else "播放结束"
@@ -321,11 +329,21 @@ class PlayerActivity : ComponentActivity() {
             if (file != null && !FileLocations.existsForPath(file.path)) {
                 // 文件被外部删除（FileNotFoundException / 文档 URI 失效兜底）：删索引并提示，
                 // UI 经 Room Flow 自动刷新
+                AppLogger.w(TAG, "播放失败：文件已丢失（${file.path}）")
                 lifecycleScope.launch {
                     SyncManager.getInstance(this@PlayerActivity).reportMissingFile(file.path)
                 }
                 Toast.makeText(this@PlayerActivity, "文件已丢失，已从列表移除", Toast.LENGTH_LONG).show()
             } else {
+                // **播放错误的唯一现场**：errorCodeName 才是最有价值的诊断信息
+                //（编码不支持 / 文件损坏 / 源失效 / 解码器初始化失败），此前只弹一个 Toast，
+                // 用户一退出就全丢了
+                AppLogger.e(
+                    TAG,
+                    "播放失败：${error.errorCodeName}（错误码 ${error.errorCode}），" +
+                        "文件=${file?.name ?: "未知"}",
+                    error
+                )
                 Toast.makeText(this@PlayerActivity, "播放失败：${error.errorCodeName}", Toast.LENGTH_LONG).show()
             }
             finish()
@@ -347,6 +365,7 @@ class PlayerActivity : ComponentActivity() {
         val path = intent.getStringExtra(EXTRA_PATH)
         if (path == null || !FileLocations.existsForPath(path)) {
             // 入口即发现文件丢失：上报对账引擎清理索引（残留记录随之移除）
+            AppLogger.w(TAG, "打开播放器失败：${path ?: "未传入路径"} 不存在或当前不可达")
             if (path != null) {
                 lifecycleScope.launch {
                     SyncManager.getInstance(this@PlayerActivity).reportMissingFile(path)

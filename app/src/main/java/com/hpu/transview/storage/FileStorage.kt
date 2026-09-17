@@ -1,6 +1,7 @@
 package com.hpu.transview.storage
 
 import android.net.Uri
+import com.hpu.transview.util.AppLogger
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -110,7 +111,10 @@ class FileStorage(private val rootDir: File) : IStorage {
             src.delete()
             true
         } catch (e: Exception) {
-            // 跨卷复制中途失败（磁盘满 / 掉盘）：清掉半截文件，避免「半个视频」被对账入库
+            // 跨卷复制中途失败（磁盘满 / 掉盘 / 权限）：清掉半截文件，避免「半个视频」被对账入库。
+            // **这是上传落盘失败的最底层现场** —— 返回 false 后被 UploadStorage 折成一条 IOException、
+            // 再被上层折成一句「保存失败」，到这里就分不清是空间不够还是盘掉了，故必须留堆栈
+            AppLogger.e(TAG, "搬运文件失败（已清理半截文件）：$relativePath", e)
             runCatching { if (target.exists()) target.delete() }
             false
         }
@@ -128,6 +132,8 @@ class FileStorage(private val rootDir: File) : IStorage {
     }
 
     private companion object {
+        private const val TAG = "FileStorage"
+
         const val BUFFER_SIZE = 64 * 1024
     }
 }

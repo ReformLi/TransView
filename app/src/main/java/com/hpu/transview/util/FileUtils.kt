@@ -337,8 +337,15 @@ object FileLocations {
 
         // 仅「运行期」的降级/恢复才发事件（首次检测、设置页主动切换不发，避免开机误弹 Toast）
         if (previous.activeIsRemovable && newState.degraded) {
+            // 降级/恢复是「媒体库内容突然变化」的根因，必须能在日志里和当时的时间点对上
+            AppLogger.i(
+                TAG,
+                "存储降级：${previous.activeLabel} 已断开，活动存储切到「${newState.activeLabel}」" +
+                    "（索引全部保留，插回自动恢复）"
+            )
             _storageEvents.tryEmit(StorageEvent.UsbDetached(previous.activeLabel))
         } else if (previous.degraded && newState.activeIsRemovable && !newState.degraded) {
+            AppLogger.i(TAG, "存储恢复：${newState.activeLabel} 已插回，活动存储切回该盘")
             _storageEvents.tryEmit(StorageEvent.UsbAttached(newState.activeLabel))
         }
         return newState
@@ -647,6 +654,9 @@ fun mimeTypeOf(name: String): String = when (name.substringAfterLast('.', "").lo
 
 object FileUtils {
 
+    /** 本对象日志标签（AppLogger 落盘用） */
+    private const val TAG = "FileUtils"
+
     // ————— 文件树遍历 —————
 
     /**
@@ -699,7 +709,13 @@ object FileUtils {
         stack.addLast(root)
         while (stack.isNotEmpty()) {
             val dir = stack.removeLast()
-            val children = runCatching { dir.listFiles(categoryFilter(category)) }.getOrNull() ?: continue
+            val children = runCatching { dir.listFiles(categoryFilter(category)) }.getOrNull()
+            if (children == null) {
+                // 目录读不到（权限 / 拔盘 / ROM 限制）→ 跳过该目录。**必须留痕**：
+                // 对账漏扫这里，下一步「同步外部删除」就会把其中的文件索引判为失效而删除
+                AppLogger.w(TAG, "目录读取失败，已跳过：${dir.absolutePath}")
+                continue
+            }
             for (child in children) {
                 if (child.isDirectory) stack.addLast(child) else out.add(toStorageFile(child, prefix))
             }
@@ -840,6 +856,10 @@ object FileUtils {
             retriever.setDataSource(path)
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
         } catch (t: Throwable) {
+            // 时长提取失败被彻底吞掉时，表现出来只是「时长恒为 0」，完全看不出原因。
+            // 留一条 W（含路径与堆栈）：既能对上 v1.28 那个 use{} 兼容性坑，
+            // 也能识别出损坏/编码异常的视频文件
+            AppLogger.w(TAG, "视频时长提取失败：$path", t)
             0L
         } finally {
             // 释放原生资源；失败也不外抛（时长提取是尽力而为）
@@ -898,6 +918,9 @@ object FileUtils {
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             IntentUtils.startSafely(context, intent, "无法打开此文件类型，请安装对应应用")
         } catch (e: Exception) {
+            // FileProvider 配置错误 / 系统里没有能处理该 MIME 的应用：用户只看到一个 Toast，
+            // 事后完全无从下手
+            AppLogger.w(TAG, "调用外部应用打开文件失败：$name", e)
             Toast.makeText(context, "无法打开文件：${e.message}", Toast.LENGTH_LONG).show()
         }
     }
@@ -937,7 +960,12 @@ object FileUtils {
         if (!FileLocations.isInsideSandbox(file)) return false
         if (!file.exists()) return true
         return runCatching {
-            if (!file.delete()) return false
+            if (!file.delete()) {
+                // 删不掉（被占用 / 权限 / 只读盘）：媒体库里的索引删了、物理文件却还在，
+                // 下一次对账会把它重新扫回来 —— 留痕才能解释「删了又自己出现了」
+                AppLogger.w(TAG, "物理文件删除失败：${file.absolutePath}")
+                return false
+            }
             deleteEmptyAncestors(file)
             true
         }.getOrDefault(false)

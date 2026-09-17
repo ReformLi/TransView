@@ -10,6 +10,7 @@ import com.hpu.transview.data.UploadRecordRepository
 import com.hpu.transview.data.UploadStateCode
 import com.hpu.transview.model.Category
 import com.hpu.transview.ui.settings.SettingsStore
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileUtils
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
@@ -89,7 +90,8 @@ class TransHttpServer(
         // TempFileManager.clear() 没机会执行，半个上传会以 `upload_*.tmp` 永久留在
         // `Android/data/<包名>/files/upload_tmp/`（Android 11+ 用户连文件管理器都进不去）。
         // 带保护窗口：「停服务器 → 立刻再启动」的瞬间，上一实例的工作线程可能还在写自己的临时文件。
-        runCatching { purgeOrphanUploadTemps(appContext) }
+        val purged = runCatching { purgeOrphanUploadTemps(appContext) }.getOrDefault(0)
+        if (purged > 0) AppLogger.d(TAG, "服务器启动时清理遗留上传临时文件 $purged 个")
         setTempFileManagerFactory { ExternalTempFileManager(tempDir) }
     }
 
@@ -119,6 +121,9 @@ class TransHttpServer(
                 )
             }
         } catch (e: Exception) {
+            // 此前这里只回 500、服务端一行不留：手机端看到「服务器错误」，电视端什么也不知道。
+            // 记 method + uri 即可定位是哪条路由出的问题（无需记请求体，可能很大）
+            AppLogger.e(TAG, "请求处理异常：${session.method} ${session.uri}", e)
             newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Server Error: ${e.message}"
             )
@@ -148,6 +153,9 @@ class TransHttpServer(
      */
     private fun handleVerify(session: IHTTPSession): Response {
         if (!checkToken(session.parameters["token"]?.firstOrNull())) {
+            // 未授权的访问码尝试。「手机总是连不上」时，这条是区分
+            // 「用户输错码」与「电视端显示的码与服务器认的不一致」的关键依据
+            AppLogger.w(TAG, "访问码校验失败（/verify），来自 ${session.remoteIpAddress}")
             return jsonError(Response.Status.FORBIDDEN, "认证失败")
         }
         return newFixedLengthResponse(Response.Status.OK, "application/json", """{"status":"ok"}""")
@@ -215,6 +223,9 @@ class TransHttpServer(
         // 必须放在函数最前面：此刻还没建上传记录、也没调 parseBody —— 请求体一个字节都不会落盘，
         // 不会在电视端记录列表里留下任何痕迹（否则未授权设备能靠刷请求塞满上传记录）。
         if (!checkToken(headerOf(session, "X-Upload-Token"))) {
+            // 被拒的上传请求：同样不接收任何字节。记一条 W 便于发现「有人一直连不上」
+            // 或「未授权设备在刷请求」
+            AppLogger.w(TAG, "上传被拒（访问码无效），来自 ${session.remoteIpAddress}")
             return jsonError(Response.Status.FORBIDDEN, "认证失败")
         }
 
@@ -237,6 +248,13 @@ class TransHttpServer(
             uploadRecords.insert(displayName, contentLength, MediaType.fromCategory(category))
         }
         val busId = UploadBus.start(displayName, contentLength)
+        // 上传开始：文件名 / 大小 / 分类 / 来源 IP。**刻意不记进度** —— 进度是 600ms 一次的高频事件，
+        // 记它会把有界队列打满并挤掉真正有用的日志（而丢弃是静默的，事后无从察觉）
+        AppLogger.i(
+            TAG,
+            "上传开始：$displayName（$contentLength 字节，${category.name}），" +
+                "来自 ${session.remoteIpAddress}"
+        )
 
         // 2. 进度监视：已接收字节数 / Content-Length → 回写百分比（节流）。
         //    计数来自「套接字输入流」包装（见 createClientHandler）——NanoHTTPD 2.3.1 把文件 part
@@ -252,6 +270,9 @@ class TransHttpServer(
         return try {
             receiveAndSave(session, recordId, busId, displayName, relPath, category)
         } catch (e: Exception) {
+            // 手机端「取消上传」= abort 连接，会让 parseBody 抛出 IO 中断类异常。
+            // 这是「文件传了一半就没了」最直接的现场记录，务必留下
+            AppLogger.w(TAG, "上传中断：$displayName（$contentLength 字节）", e)
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
             jsonError(Response.Status.INTERNAL_ERROR, e.message ?: "上传中断")
         } finally {
@@ -281,17 +302,21 @@ class TransHttpServer(
         }
 
         if (parseError != null) {
+            AppLogger.w(TAG, "上传请求解析失败：$displayName（${parseError.status}）", parseError)
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
             return jsonError(parseError.status, parseError.message ?: "请求解析失败")
         }
 
         val tempPath = files["file"]
         if (tempPath == null) {
+            AppLogger.w(TAG, "上传失败：请求里没有 file 字段（$displayName）")
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
             return jsonError(Response.Status.BAD_REQUEST, "缺少文件")
         }
         val tempFile = File(tempPath)
         if (!tempFile.isFile || tempFile.length() == 0L) {
+            // 典型成因：手机端中断后仍发出了结束请求，或临时文件中途被清掉
+            AppLogger.w(TAG, "上传失败：临时文件无效（$displayName，${tempFile.length()} 字节）")
             finishRecord(recordId, busId, UploadStateCode.FAILED, 0)
             return jsonError(Response.Status.BAD_REQUEST, "上传内容无效")
         }
@@ -317,6 +342,17 @@ class TransHttpServer(
             if (result.isSuccess) UploadStateCode.SUCCESS else UploadStateCode.FAILED,
             if (result.isSuccess) 100 else 0
         )
+        if (result.isSuccess) {
+            AppLogger.i(TAG, "上传成功：${savedFile?.path ?: finalName}")
+        } else {
+            // 落盘这一步把「磁盘满 / 掉盘 / 权限不足 / 跨卷复制出半截」压成同一个异常。
+            // 不记堆栈就永远分不清是哪一种 —— 这是「文件传了一半消失」的唯一现场
+            AppLogger.e(
+                TAG,
+                "上传落盘失败：$finalName（${category.name}）",
+                result.exceptionOrNull()
+            )
+        }
         if (savedFile != null) {
             indexMediaAsync(savedFile)
         }
@@ -351,6 +387,7 @@ class TransHttpServer(
         val outcome = runBlocking(Dispatchers.IO) {
             runCatching { zipExtractor.process(tempFile, zipName, category) }
                 .getOrElse { e ->
+                    AppLogger.e(TAG, "解压异常：$zipName（${category.name}）", e)
                     ZipExtractor.Outcome(
                         ZipExtractor.Kind.FAILED, emptyList(), null,
                         "解压失败：${e.message ?: "未知错误"}，请重新上传"
@@ -359,6 +396,17 @@ class TransHttpServer(
         }
 
         finishRecord(recordId, busId, UploadStateCode.SUCCESS, 100)
+        // 解压结果：终态 + 归位文件数 + 是否保留了原包 + **Outcome.message 原文**。
+        // 带上 message 是刻意的：ZipExtractor 有 8 条失败/降级分支（工作区建不出、暂存失败、
+        // 无法解析、空间不足、无目标文件、运行时预算超限、归位失败、异常兜底），它们都压进
+        // Kind.FAILED / NO_SPACE / NO_TARGET 三个值里 —— 只有 message 能区分究竟是哪一种。
+        // 这样 ZipExtractor 内部就**不需要**再撒一遍日志，一处打点覆盖全部原因。
+        AppLogger.i(
+            TAG,
+            "解压结束：$zipName → ${outcome.kind.name}，归位 ${outcome.movedFiles.size} 个" +
+                (if (outcome.keptZip != null) "，原包已保留在 Downloads" else "") +
+                "｜${outcome.message}"
+        )
         // 归位后的文件立即建媒体索引（视频后台提取时长）
         outcome.movedFiles.forEach { indexMediaAsync(it) }
         // 解压失败 / 空间不足 / 未找到目标文件时保留到 Downloads 的原压缩包也要立即入库，
@@ -430,6 +478,10 @@ class TransHttpServer(
                     lastModified = saved.lastModified,
                     duration = duration
                 )
+            }.onFailure { e ->
+                // 「上传成功，但媒体库里没有」的唯一线索：索引写入或时长提取失败。
+                // 此前整段 runCatching 静默 —— 网页端说成功、媒体库却是空的，两边都对不上
+                AppLogger.w(TAG, "上传后建媒体索引失败：${saved.name}", e)
             }
         }
     }
@@ -502,6 +554,8 @@ class TransHttpServer(
     }
 
     companion object {
+
+        private const val TAG = "TransHttpServer"
 
         /** 上传临时目录名（位于应用外部私有目录 `files/` 下，与 /sdcard 同卷） */
         private const val TEMP_DIR_NAME = "upload_tmp"

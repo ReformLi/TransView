@@ -28,8 +28,9 @@ class TransViewApp : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         // 崩溃日志落盘：电视端拿不到 logcat，「一闪就退出」只能靠这份文件定位。
-        // 放在最前面，越早装越不会漏掉启动期的崩溃。
-        runCatching { CrashLogger.install(this) }
+        // 放在最前面，越早装越不会漏掉启动期的崩溃。失败**先把异常记下**，
+        // 等下面日志引擎启动后再补写 —— 此刻 AppLogger 尚未启用，直接写只会进 logcat。
+        val crashLoggerError = runCatching { CrashLogger.install(this) }.exceptionOrNull()
         // 设置项存储尽早初始化：端口 / 设备名 / 开机自启等配置在后台拉起（BootReceiver）
         // 与服务器启动时都要读取，不能依赖某个页面先组合（幂等，重复调用无副作用）
         SettingsStore.init(this)
@@ -41,15 +42,28 @@ class TransViewApp : Application(), ImageLoaderFactory {
         // 进程刚起 ⇒ 本进程内不可能有在途上传，遗留的必是死文件，故保护窗口取 0。
         // 必须有人清：该目录不在媒体沙盒内、Android 11+ 也对文件管理器不可见，
         // 否则「上传途中断电 / 进程被杀」留下的半个大文件会永久占着磁盘且无人可见。
-        runCatching { TransHttpServer.purgeOrphanUploadTemps(this, skipActiveWithinMs = 0L) }
+        val orphanTemps = runCatching {
+            TransHttpServer.purgeOrphanUploadTemps(this, skipActiveWithinMs = 0L)
+        }.getOrDefault(0)
         // App 调试日志（默认关）：按持久化偏好决定是否启动异步落盘引擎。
         // 必须放在 FileLocations.init **之后** —— 日志落点 = 活动沙盒的 Downloads/app_log/，
         // 依赖活动存储状态（U 盘 / 内部存储）已检测完成；否则首次会落到兜底路径。
         runCatching { AppLogger.setEnabled(SettingsStore.appLogEnabled) }
-        AppLogger.i(TAG, "App 启动：v${BuildConfig.VERSION_NAME}，调试日志=${if (AppLogger.isEnabled) "开" else "关"}")
+        // 详细日志（默认关）：开启后额外落盘 V 级。同样须在 FileLocations.init 之后
+        runCatching { AppLogger.setDetailed(SettingsStore.detailedLogEnabled) }
+        AppLogger.i(
+            TAG,
+            "App 启动：v${BuildConfig.VERSION_NAME}，" +
+                "日志=${if (AppLogger.isEnabled) "开" else "关"}" +
+                (if (AppLogger.isEnabled && AppLogger.isDetailed) "（详细）" else "")
+        )
+        // 启动期兜底项的落盘记录（刻意放在引擎启动**之后**，保证写进文件而不止 logcat）
+        crashLoggerError?.let { AppLogger.w(TAG, "崩溃日志安装失败，崩溃兜底可能不可用", it) }
+        if (orphanTemps > 0) AppLogger.d(TAG, "启动清理上传残留：$orphanTemps 个")
         // 启动对账（IO 线程，绝不阻塞主线程）；正在同步时 sync() 内部互斥直接返回
         appScope.launch {
             runCatching { SyncManager.getInstance(this@TransViewApp).sync() }
+                .onFailure { AppLogger.w(TAG, "启动对账失败", it) }
         }
     }
 

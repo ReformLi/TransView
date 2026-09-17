@@ -158,6 +158,20 @@ object SettingsStore {
         get() = prefs()?.getBoolean("app_log_enabled", false) ?: false
         set(v) { prefs()?.edit()?.putBoolean("app_log_enabled", v)?.apply() }
 
+    /**
+     * 详细日志（默认**关**）。**只在「App 调试日志」开启时有意义**——开启后 `AppLogger`
+     * 额外落盘 V 级：UI 操作轨迹、逐次存储探测、逐文件索引这类**可高频**的诊断细节。
+     *
+     * 为什么不并进上面那个开关：V 级日志量比常规大一个数量级，日常开着既占磁盘又淹没关键信息；
+     * 常规模式（I/W/E/D）已经覆盖状态跃迁与全部失败，多数排查用不到 V。
+     *
+     * 已接入运行时：`TransViewApp.onCreate` 按本项调用 `AppLogger.setDetailed`；
+     * 设置页切换时**立即**生效（只翻转标志，不重启写盘引擎，见 `AppLogger.setDetailed`）。
+     */
+    var detailedLogEnabled: Boolean
+        get() = prefs()?.getBoolean("detailed_log_enabled", false) ?: false
+        set(v) { prefs()?.edit()?.putBoolean("detailed_log_enabled", v)?.apply() }
+
     // ——— 技术标记（非用户可调项；放在同一份 prefs 里便于统一查看与清理） ———
 
     /**

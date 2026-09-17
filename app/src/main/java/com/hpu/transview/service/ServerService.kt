@@ -82,8 +82,16 @@ class ServerService : Service() {
         usbRefreshJob = scope.launch {
             delay(USB_REFRESH_DEBOUNCE_MS)
             // 重检含文件系统探测（/storage 列卷 + canWrite），放 IO 线程
-            withContext(Dispatchers.IO) { FileLocations.refresh() }
+            AppLogger.i(TAG, "检测到 U 盘插拔，重检存储状态")
+            val state = withContext(Dispatchers.IO) { FileLocations.refresh() }
+            // 降级/恢复是「媒体库内容突然变了」的根因，必须在日志里能对上
+            AppLogger.i(
+                TAG,
+                "存储重检完成：活动存储=${state.activeLabel}" +
+                    (if (state.degraded) "（降级：${state.preferredLabel}不在位）" else "")
+            )
             runCatching { SyncManager.getInstance(applicationContext).sync() }
+                .onFailure { AppLogger.w(TAG, "U 盘插拔后对账失败", it) }
         }
     }
 
@@ -135,6 +143,7 @@ class ServerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        AppLogger.i(TAG, "前台服务销毁（foregroundReady=$foregroundReady）")
         usbRefreshJob?.cancel()
         if (foregroundReady) {
             runCatching { unregisterReceiver(screenReceiver) }

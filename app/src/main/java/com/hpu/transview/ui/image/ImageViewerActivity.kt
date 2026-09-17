@@ -61,12 +61,16 @@ import com.hpu.transview.model.MediaRef
 import com.hpu.transview.ui.common.requestFocusNextFrame
 import com.hpu.transview.ui.theme.PrimaryBlue
 import com.hpu.transview.ui.theme.TransViewTheme
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.nameIsImageFile
 import com.hpu.transview.util.naturalCompare
 import com.hpu.transview.util.toUri
 import kotlinx.coroutines.flow.first
 import kotlin.math.roundToInt
+
+/** 本页日志标签（AppLogger 落盘用） */
+private const val TAG = "ImageViewer"
 
 /**
  * 图片查看器：
@@ -119,6 +123,8 @@ class ImageViewerActivity : ComponentActivity() {
 
         val path = intent.getStringExtra(EXTRA_PATH)
         if (path == null || !FileLocations.existsForPath(path)) {
+            // 进入即丢失（文件被删 / 卷已拔出 / 索引失效）：留一条 W，避免「点图片一闪就退」无据可查
+            AppLogger.w(TAG, "打开图片失败：文件不存在 path=${path ?: "null"}")
             Toast.makeText(this, "文件不存在", Toast.LENGTH_SHORT).show()
             finish()
             return
@@ -159,6 +165,8 @@ class ImageViewerActivity : ComponentActivity() {
         val next = index + delta
         if (next in images.indices) {
             index = next
+            // 操作轨迹（D）：切图（遥控器 ←/→ 与触摸横滑共用此入口）
+            AppLogger.d(TAG, "切换图片：${images.getOrNull(next)?.name ?: next.toString()}")
             // 取景框游标必须跟着主图走（v1.28）：轮播可见时 ←/→ 只移动 cursorIndex（设计如此，
             // 「焦点框不动、滑动的是缩略图」），但**触摸横滑主图**走的是这里、只改 index。
             // 不同步的话，横滑后取景框仍框着旧缩略图，此时按确定会跳回旧图 —— 即用户看到的

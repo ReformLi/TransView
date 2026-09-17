@@ -16,6 +16,8 @@ import android.widget.Toast
  */
 object IntentUtils {
 
+    private const val TAG = "IntentUtils"
+
     fun startSafely(context: Context, intent: Intent, failMessage: String): Boolean {
         return try {
             var toStart = intent
@@ -29,6 +31,9 @@ object IntentUtils {
             context.startActivity(toStart)
             true
         } catch (e: Exception) {
+            // 启动外部 Activity 失败（系统里没有对应应用 / ROM 拦截 / Intent 不合法）：
+            // 用户只看到一个 Toast，事后无法复现
+            AppLogger.w(TAG, "启动 Activity 失败：$failMessage（action=${intent.action}）", e)
             Toast.makeText(context, failMessage, Toast.LENGTH_LONG).show()
             false
         }

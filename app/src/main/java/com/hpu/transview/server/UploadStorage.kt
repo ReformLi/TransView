@@ -5,6 +5,7 @@ import android.media.MediaScannerConnection
 import com.hpu.transview.model.Category
 import com.hpu.transview.storage.FileStorage
 import com.hpu.transview.storage.StorageFile
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import java.io.File
 import java.io.IOException
@@ -86,6 +87,9 @@ class UploadStorage(private val context: Context) {
                     }
                     used += name
                     name = uniqueName(name0, used)
+                    // 同名冲突换名：解释「文件名为什么凭空多了 (1)(2) 后缀」——
+                    // 成因是同目录下已有同名文件，或两台手机正在并发传同名文件
+                    AppLogger.d(TAG, "同名冲突，换名：$name0 → $name（目录 $relDir）")
                     if (++guard > MAX_NAME_RETRY) throw IOException("写入存储失败")
                 }
             }
@@ -119,12 +123,16 @@ class UploadStorage(private val context: Context) {
     private fun scanToMediaStore(file: File) {
         try {
             MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
-        } catch (_: Exception) {
-            // 扫描失败不影响上传结果（媒体库索引由 TransHttpServer / SyncManager 另行维护）
+        } catch (e: Exception) {
+            // 扫描失败不影响上传结果（媒体库索引由 TransHttpServer / SyncManager 另行维护）。
+            // 记 V 级：纯诊断信息，只有「系统相册里看不到刚传的图片」这种问题才需要它
+            AppLogger.v(TAG, "MediaStore 扫描失败（无害）：${file.name}", e)
         }
     }
 
     companion object {
+
+        private const val TAG = "UploadStorage"
 
         /** 并发撞名时的换名重试上限（正常最多 1~2 次；超过即判为真实 I/O 失败） */
         private const val MAX_NAME_RETRY = 50

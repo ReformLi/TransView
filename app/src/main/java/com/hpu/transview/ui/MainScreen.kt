@@ -65,10 +65,14 @@ import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.upload.UploadScreen
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileLocations.StorageEvent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+/** 本页日志标签（AppLogger 落盘用） */
+private const val TAG = "MainScreen"
 
 /** 主界面：顶部四标签导航 + 内容区 */
 @Composable
@@ -146,6 +150,15 @@ fun MainScreen() {
     // 省电模式：仅上传页可见时允许服务器运行
     LaunchedEffect(selected) {
         ServerController.setUploadPageVisible(selected == MainTab.UPLOAD)
+        // 操作轨迹（V，仅详细日志）：标签切换是用户最高频的动作，且「聚焦即选中」曾被误触发
+        // 导致过焦点跳页的顽疾，记录下来便于事后判断「页面为什么变了」。
+        // 首次组合也会落一条（即进入 App 时的初始标签），属预期。
+        AppLogger.v(TAG, "切换标签：${selected.title}")
+    }
+
+    // 操作轨迹（V，仅详细日志）：进入 / 退出设置页
+    LaunchedEffect(showSettings) {
+        AppLogger.v(TAG, if (showSettings) "打开设置页" else "关闭设置页")
     }
 
     // ——— 外接盘插拔全局提示（Toast）———

@@ -90,6 +90,7 @@ import com.hpu.transview.ui.image.ImageViewerActivity
 import com.hpu.transview.ui.player.PlayerActivity
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.OnDarkDim
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.isImageFile
@@ -104,6 +105,9 @@ import java.io.File
 
 // 网格列数由「设置 → 界面设置 → 网格列数」决定（4/5/6），见 LibraryScreen 内 gridColumns。
 // 电视端一律多列网格，严禁单列列表。
+
+/** 本页日志标签（AppLogger 落盘用） */
+private const val TAG = "LibraryScreen"
 
 /** 焦点还原「返回上级」卡片的哨兵路径 */
 private const val FOCUS_UP = "__up__"
@@ -403,20 +407,32 @@ fun LibraryScreen(
                 val hadFocus = gridHasFocus
                 parkFocusSafe()
                 currentDir = entry.path
+                // 操作轨迹（V，仅详细日志）：进入文件夹
+                AppLogger.v(TAG, "进入文件夹：${entry.name}")
                 // 仅遥控器路径做焦点还原；touch 点按路径焦点本来就空，无需还原。
                 // 进入子目录后焦点直接落第一个条目（FOCUS_FIRST），不再落「返回上级」：
                 // 用户反馈 UpCard 抢焦点会形成「第一个文件闪一下再跳回上级」的可见两段跳。
                 if (hadFocus) pendingFocusPath = FOCUS_FIRST
             }
-            entry.isVideoFile() -> mediaLauncher.launch(
-                Intent(context, PlayerActivity::class.java)
-                    .putExtra(PlayerActivity.EXTRA_PATH, entry.path)
-            )
-            entry.isImageFile() -> mediaLauncher.launch(
-                Intent(context, ImageViewerActivity::class.java)
-                    .putExtra(ImageViewerActivity.EXTRA_PATH, entry.path)
-            )
-            else -> FileUtils.openExternal(context, entry.path, entry.name)
+            entry.isVideoFile() -> {
+                // 操作轨迹（V，仅详细日志）：播放器全链路的入口
+                AppLogger.v(TAG, "打开视频：${entry.path}")
+                mediaLauncher.launch(
+                    Intent(context, PlayerActivity::class.java)
+                        .putExtra(PlayerActivity.EXTRA_PATH, entry.path)
+                )
+            }
+            entry.isImageFile() -> {
+                AppLogger.v(TAG, "打开图片：${entry.path}")
+                mediaLauncher.launch(
+                    Intent(context, ImageViewerActivity::class.java)
+                        .putExtra(ImageViewerActivity.EXTRA_PATH, entry.path)
+                )
+            }
+            else -> {
+                AppLogger.v(TAG, "外部打开：${entry.path}")
+                FileUtils.openExternal(context, entry.path, entry.name)
+            }
         }
     }
 
@@ -427,6 +443,8 @@ fun LibraryScreen(
             parkFocusSafe()
             val leaving = currentDir
             currentDir = storage.parentNode(leaving) ?: rootPath
+            // 操作轨迹（V，仅详细日志）：返回上一级
+            AppLogger.v(TAG, "返回上一级：$leaving")
             // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过
             if (hadFocus) pendingFocusPath = leaving
         }
@@ -457,8 +475,12 @@ fun LibraryScreen(
                 // touch 路径跳过焦点还原（见 openEntry 注释）
                 if (hadFocus) pendingFocusPath = nextPath
                 dirRefreshKey++ // 父目录可能被连带清空
+                // 破坏性操作留痕（I）：删除最不可逆，是事后排查「文件怎么没了」的唯一线索
+                AppLogger.i(TAG, "删除成功：${entry.path}")
                 Toast.makeText(context, "已删除「${entry.name}」", Toast.LENGTH_SHORT).show()
             } else {
+                // 删除失败（W）：文件可能被占用 / 卷已拔出 / 权限受限
+                AppLogger.w(TAG, "删除失败（文件可能被占用或存储已断开）：${entry.path}")
                 Toast.makeText(context, "删除失败，文件可能被占用", Toast.LENGTH_LONG).show()
             }
         }
@@ -467,6 +489,8 @@ fun LibraryScreen(
     val refreshLibrary: () -> Unit = {
         scope.launch {
             syncing = true
+            // 操作轨迹（D）：手动触发对账（明细统计由 SyncManager 落一条 I）
+            AppLogger.d(TAG, "手动触发对账：${category.name}")
             runCatching {
                 val result = SyncManager.getInstance(context).sync()
                 dirRefreshKey++

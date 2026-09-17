@@ -24,11 +24,16 @@ object Constants {
 
 object NetUtils {
 
+    private const val TAG = "NetUtils"
+
     /** 获取本机局域网 IPv4（优先 Wi-Fi 网卡），无网络时返回 null */
     fun getLocalIpAddress(): String? {
-        return runCatching {
+        val ip = runCatching {
             val candidates = mutableListOf<String>()
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            // 原先这里是 `?: return null` 直接静默返回（连异常都不会记），改成抛出让下面的
+            // onFailure 统一留痕，否则「接口枚举拿到 null」这种情况在日志里永远是空白
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+                ?: error("NetworkInterface.getNetworkInterfaces() 返回 null")
             for (ni in interfaces) {
                 if (!ni.isUp || ni.isLoopback || ni.isVirtual) continue
                 for (addr in ni.interfaceAddresses) {
@@ -41,7 +46,13 @@ object NetUtils {
             // 优先常见局域网段
             candidates.firstOrNull { it.startsWith("192.168.") || it.startsWith("10.") || it.startsWith("172.") }
                 ?: candidates.firstOrNull()
-        }.getOrNull()
+        }.onFailure { AppLogger.w(TAG, "枚举网络接口失败", it) }.getOrNull()
+        if (ip == null) {
+            // 返回 null 时上传页只显示「无法获取网络地址」占位。留一条 W，
+            // 让「网卡没起来 / 该网络只分配了 IPv6 / 接口枚举异常」这三种情况事后可分
+            AppLogger.w(TAG, "未找到可用的局域网 IPv4 地址（无网卡，或该网络只分配了 IPv6）")
+        }
+        return ip
     }
 }
 

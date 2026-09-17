@@ -164,7 +164,11 @@ class SyncManager private constructor(context: Context) {
             val hasLiveUpload = ServerBus.running.value &&
                 UploadBus.records.value.any { it.state == UploadState.RUNNING }
             if (!hasLiveUpload) {
-                uploadRecordRepository.reapZombieRunning()
+                val reaped = uploadRecordRepository.reapZombieRunning()
+                // 进程被杀 / 断电留下的死记录，条数即为「上次为什么有记录卡在上传中」的答案
+                if (reaped > 0) {
+                    AppLogger.w(TAG, "清扫僵尸「上传中」记录 $reaped 条（进程被杀或断电遗留）")
+                }
             }
 
             // 1. 清理空文件夹（只扫活动存储的三个分类目录）
@@ -182,6 +186,7 @@ class SyncManager private constructor(context: Context) {
             }
             if (safLegacy.isNotEmpty()) {
                 withContext(Dispatchers.IO) { mediaRepository.deleteByPaths(safLegacy) }
+                AppLogger.w(TAG, "清理 SAF 时代遗留的 content:// 索引 ${safLegacy.size} 条")
             }
 
             // 2. 同步外部删除（防"有索引无文件"）。
@@ -212,6 +217,16 @@ class SyncManager private constructor(context: Context) {
                     }
                     mediaRepository.deleteByPaths(missing)
                     deletedMissing = missing.size
+                    // 删索引是**破坏性动作**，而库里存的又是绝对路径：用户报「卡片莫名消失」时，
+                    // 必须能立刻对上「是不是这一步删的、删的是哪几个文件」。取前 3 条做样例即可，
+                    // 不整列（大库一次删几百条会把这条日志撑成几 KB）
+                    if (deletedMissing > 0) {
+                        AppLogger.w(
+                            TAG,
+                            "同步外部删除：移除 $deletedMissing 条失效索引" +
+                                "｜例：${missing.take(3).joinToString("，")}"
+                        )
+                    }
                 }
             }
 
@@ -269,6 +284,17 @@ class SyncManager private constructor(context: Context) {
             durationMs = System.currentTimeMillis() - startAt,
             degraded = degraded
         )
+        // 对账**正常完成**时的统计。此前只有异常路径（上方 catch）有日志，跑完时
+        // 「删了多少条失效索引 / 清了多少空目录 / 是否降级跳过」全都算出来就扔了 ——
+        // 而「媒体库卡片莫名消失」恰恰是最需要复盘的事：没有这条，就无法区分
+        // 「正常清理」与「误删」
+        AppLogger.i(
+            TAG,
+            "对账完成：新增 $inserted，更新 $updated，清理失效 $deletedMissing，" +
+                "空目录 $removedEmptyFolders，耗时 ${result.durationMs}ms" +
+                (if (degraded) "（降级：$preferredLabel 不在位，已跳过删除核对）" else "") +
+                (if (result.changed) "" else "，无变更")
+        )
         _syncState.value = SyncState.SyncComplete(result)
         return result
     }
@@ -286,7 +312,14 @@ class SyncManager private constructor(context: Context) {
             if (!FileLocations.isManagedPath(path)) return@withContext false
             durationCache.remove(path)
             mediaRepository.deleteByPath(path)
-        }.also {
+        }.also { deleted ->
+            // 播放器起播失败兜底删索引：删与不删都是重要结论 —— 返回 false 表示该路径
+            // 已不在任何可达沙盒内，正是「播放中拔掉 U 盘」的特征，此时**刻意保留**索引与播放历史
+            AppLogger.w(
+                TAG,
+                if (deleted) "播放失败上报：已删除索引 $path"
+                else "播放失败上报：路径不在可达沙盒内，保留索引 $path"
+            )
             // Room 的 observeByType Flow 会自动推送，UI 监听即可刷新
         }
 

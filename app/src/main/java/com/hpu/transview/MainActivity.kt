@@ -28,11 +28,16 @@ import com.hpu.transview.ui.permission.PermissionScreen
 import com.hpu.transview.ui.common.ProvideTouchMode
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.IntentUtils
 import com.hpu.transview.util.NotificationPermission
 import com.hpu.transview.util.StoragePermission
 
 class MainActivity : ComponentActivity() {
+
+    private companion object {
+        private const val TAG = "MainActivity"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,6 +49,7 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
+        AppLogger.d(TAG, "启动前台服务（ServerService）")
         ServerService.start(this)
         setContent {
             TransViewTheme {
@@ -78,6 +84,7 @@ class MainActivity : ComponentActivity() {
             if (NotificationPermission.isGranted(context)) return@LaunchedEffect
             if (SettingsStore.notifPermissionAsked) return@LaunchedEffect
             SettingsStore.notifPermissionAsked = true
+            AppLogger.i(TAG, "首次申请通知权限（POST_NOTIFICATIONS）")
             notifLauncher.launch(NotificationPermission.PERMISSION)
         }
 
@@ -86,7 +93,13 @@ class MainActivity : ComponentActivity() {
         DisposableEffect(lifecycleOwner) {
             val observer = LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_RESUME) {
-                    granted = StoragePermission.isGranted(context)
+                    val now = StoragePermission.isGranted(context)
+                    // 只在**真的变化**时记录并赋值（赋相同值本来也不会触发重组）：
+                    // 能从系统授权页回来就说明用户刚操作过，留痕便于对齐「为什么这时候才进主界面」
+                    if (now != granted) {
+                        AppLogger.i(TAG, "存储权限状态变更：$granted → $now")
+                        granted = now
+                    }
                 }
             }
             lifecycleOwner.lifecycle.addObserver(observer)
@@ -109,6 +122,7 @@ class MainActivity : ComponentActivity() {
                             "无法打开授权页面"
                         )
                         if (!ok) {
+                            AppLogger.w(TAG, "打开「所有文件访问」授权页失败，改跳应用详情页兜底")
                             // 兜底：引导到应用详情页手动开启
                             IntentUtils.startSafely(
                                 this,

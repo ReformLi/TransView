@@ -5,6 +5,7 @@ import com.hpu.transview.data.db.AppDatabase
 import com.hpu.transview.data.db.MediaItemDao
 import com.hpu.transview.data.db.MediaItemEntity
 import com.hpu.transview.model.Category
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.nameIsImageFile
 import com.hpu.transview.util.nameIsVideoFile
@@ -141,7 +142,12 @@ class MediaRepository(context: Context) {
         // 一旦 roots 为空，下面的 `none {}` 恒为 true，会把**全表索引**都判成孤儿 ——
         // 用户点一次「清理不可达索引」就删光整个媒体库索引，且外键级联**连播放历史一起删**。
         // 索引能靠重新对账扫回来，播放进度**不能**，所以这里宁可什么都不做。
-        if (roots.isEmpty()) return@withContext emptyList()
+        if (roots.isEmpty()) {
+            // 存储状态尚未就绪（卷列表为空）→ 判据恒真，宁可什么都不做。
+            // 记一条 W：这条路径以前是静默 return，出问题时完全看不出「为什么清理没生效」
+            AppLogger.w(TAG, "不可达索引判定已跳过：当前卷列表为空（存储状态未就绪）")
+            return@withContext emptyList()
+        }
         dao.getAllPaths().filter { path ->
             roots.none { root -> path == root || path.startsWith("$root${File.separator}") }
         }
@@ -165,10 +171,21 @@ class MediaRepository(context: Context) {
     suspend fun purgeOrphanIndexes(): Int = withContext(Dispatchers.IO) {
         val paths = orphanIndexPaths()
         paths.chunked(SQL_BIND_CHUNK).forEach { dao.deleteByPaths(it) }
+        // 破坏性操作留痕：删了多少条、哪些。级联会一并清掉这些文件的播放历史，
+        // 事后若用户反馈「记录/进度不见了」，必须能立刻对上是这一步干的
+        if (paths.isNotEmpty()) {
+            AppLogger.i(
+                TAG,
+                "清理不可达索引：删除 ${paths.size} 条（含级联播放历史）" +
+                    "｜例：${paths.take(3).joinToString("，")}"
+            )
+        }
         paths.size
     }
 
     private companion object {
+        private const val TAG = "MediaRepository"
+
         /** 单条 SQL 的绑定参数上限保险值（SQLite 旧上限 999；取一半留余量） */
         const val SQL_BIND_CHUNK = 400
     }

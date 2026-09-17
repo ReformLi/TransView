@@ -88,6 +88,7 @@ import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.NetUtils
@@ -95,6 +96,9 @@ import com.hpu.transview.util.QrCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** 本页日志标签（AppLogger 落盘用） */
+private const val TAG = "UploadScreen"
 
 /**
  * 上传页：宽屏左右分栏 —— 左侧固定区（二维码 + 地址 + 服务器状态，不滚动），
@@ -213,9 +217,18 @@ fun UploadScreen(
             withContext(Dispatchers.Default) {
                 // 二维码直接带上访问码：扫码进来的手机端解析 URL 后自动通过，用户完全无感；
                 // 屏幕上另有大号「访问码」文字，供无法扫码、只能手输 IP 的用户使用
-                QrCode.generate("http://$host:$port/?token=$code", 480)
+                runCatching { QrCode.generate("http://$host:$port/?token=$code", 480) }
+                    .onFailure { AppLogger.w(TAG, "二维码生成失败：http://$host:$port", it) }
+                    .getOrNull()
             }
-        } else null
+        } else {
+            // 地址或访问码缺失（Wi-Fi 未连 / 服务器未起）：二维码区显示占位方块，不弹错
+            AppLogger.d(
+                TAG,
+                "跳过二维码：ip=${host ?: "无"}，访问码=${if (code == null) "无" else "有"}"
+            )
+            null
+        }
     }
 
     // 宽屏左右分栏：左侧固定区（二维码 + 地址 + 服务器状态）不滚动，右侧上传记录可滚动。

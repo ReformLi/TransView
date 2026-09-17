@@ -7,6 +7,7 @@ import android.os.Looper
 import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.UploadState
 import com.hpu.transview.ui.settings.SettingsStore
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.Constants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +40,8 @@ import java.util.concurrent.Executors
  * 生成后注入 [TransHttpServer] 实例，服务器据此拦截未授权的上传请求。
  */
 object ServerController {
+
+    private const val TAG = "ServerController"
 
     /** 智能模式空闲休眠时长 */
     private const val IDLE_TIMEOUT_MS = 15 * 60 * 1000L
@@ -144,6 +147,7 @@ object ServerController {
         mode = newMode
         prefs?.edit()?.putString("mode", newMode.name)?.apply()
         ServerBus.setMode(newMode)
+        AppLogger.i(TAG, "保活模式切换为：${newMode.label}")
         if (newMode != ServerMode.SMART) {
             hibernated = false
             mainHandler.removeCallbacks(idleRunnable)
@@ -157,6 +161,7 @@ object ServerController {
         if (screenOn == on) return
         screenOn = on
         if (on && hibernated) hibernated = false
+        AppLogger.d(TAG, "屏幕${if (on) "点亮" else "熄灭"}")
         evaluate()
     }
 
@@ -164,6 +169,7 @@ object ServerController {
     fun setPlaying(p: Boolean) {
         if (playing == p) return
         playing = p
+        AppLogger.d(TAG, "播放状态变更：${if (p) "播放中（智能模式暂停服务器）" else "已停止播放"}")
         evaluate()
     }
 
@@ -174,6 +180,7 @@ object ServerController {
         uploadPageVisible = visible
         if (!visible) manualWake = false
         if (visible && hibernated) hibernated = false
+        AppLogger.d(TAG, "上传页可见性：$visible")
         evaluate()
     }
 
@@ -190,6 +197,7 @@ object ServerController {
                 evaluate()
             }
         }
+        AppLogger.d(TAG, "手动唤醒服务器（模式=${mode.label}）")
     }
 
     /** 由 ServerService.onDestroy 调用 */
@@ -201,6 +209,7 @@ object ServerController {
             ServerBus.update(false, hibernated)
         }
         initialized = false
+        AppLogger.i(TAG, "服务器引擎已释放（前台服务销毁）")
     }
 
     /**
@@ -250,6 +259,9 @@ object ServerController {
                 port = newPort
                 SettingsStore.serverPort = newPort
                 ServerBus.setPort(newPort)
+                AppLogger.i(TAG, "端口切换成功：$previous → $newPort")
+            } else {
+                AppLogger.e(TAG, "端口切换失败：$newPort 起不来，已用 $previous 恢复监听")
             }
             publishState()
             mainHandler.post { onResult(ok) }
@@ -278,7 +290,10 @@ object ServerController {
             // 传输不中断保护（与空闲休眠的豁免同一条规则）：任何原因的停服
             // （熄屏/播放中/离开上传页）遇到在途上传都顺延，传完最后一个文件才停。
             // 暂缓的停服由 init 里对 UploadBus 的收集在最后一个上传结束时补评估归位。
-            if (UploadBus.records.value.any { it.state == UploadState.RUNNING }) return
+            if (UploadBus.records.value.any { it.state == UploadState.RUNNING }) {
+                AppLogger.d(TAG, "有在途上传，暂缓停服（传输不中断保护）")
+                return
+            }
             stopServer()
         }
         publishState()
@@ -296,9 +311,16 @@ object ServerController {
         val code = token ?: generateToken()
         val started = runCatching {
             TransHttpServer(context, targetPort, code).also { it.start() }
+        }.onFailure { e ->
+            // **最需要现场的一类失败**：端口被占用 / NanoHTTPD 内部异常。此前静默返回 null，
+            // 表现出来只是「状态灯不亮」，连是端口冲突还是别的原因都判不出来。
+            AppLogger.e(TAG, "服务器启动失败（端口 $targetPort）", e)
         }.getOrNull() ?: return null
         token = code
         ServerBus.setToken(code)
+        // 只记端口不记访问码：码在电视屏幕上随时可见，排查时看一眼即可，
+        // 没必要往可长期保留的日志文件里写一份副本
+        AppLogger.i(TAG, "服务器已启动：端口 $targetPort")
         return started
     }
 
@@ -307,6 +329,7 @@ object ServerController {
         val server = httpServer
         httpServer = null
         runCatching { server?.stop() }
+            .onFailure { AppLogger.w(TAG, "停止监听异常（通常无害）", it) }
         // 必须显式 shutdown：每个 TransHttpServer 实例自带一个 bgScope（进度轮询 + 落盘后建索引）。
         // 智能模式每次熄屏 / 播放 / 休眠恢复都走一轮 stop→start，只 stop() 不 cancel 的话，
         // 每个被丢弃的实例都会遗留一个永不取消的协程作用域，随启停次数累积（v1.28 修）。
@@ -314,6 +337,7 @@ object ServerController {
         // 的情况会被取消掉，但媒体索引是可重建数据，下一次对账会补上，不危及文件与播放历史。
         runCatching { server?.shutdown() }
         ServerBus.setToken(null)
+        if (server != null) AppLogger.i(TAG, "服务器已停止")
     }
 
     /** 生成一个 6 位访问码：字符集 A-Z + 0-9，密码学随机源 */

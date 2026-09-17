@@ -3,6 +3,7 @@ package com.hpu.transview.server
 import android.content.Context
 import android.os.Build
 import com.hpu.transview.model.Category
+import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileUtils
 import com.hpu.transview.util.IMAGE_EXTS
@@ -270,8 +271,14 @@ class ZipExtractor(private val context: Context) {
         if (utf8 != null && !looksGarbled(utf8)) return utf8
         // 走到这里有两类情况：① UTF-8 解码出替换字符（宽松解码器）；② 直接抛异常（严格解码器）。
         // 两者都判为 GBK 压缩包，用 GBK 重开一次。
+        // 记一条 D：这是「中文压缩包解出来全是乱码 / 干脆解不开」的唯一线索
+        AppLogger.d(TAG, "ZIP 条目名按 UTF-8 解码异常，回退 GBK：${file.name}")
         val gbk = runCatching { ZipFile(file, Charset.forName(CHARSET_GBK)) }.getOrNull()
-        if (gbk == null) return utf8 ?: ZipFile(file) // GBK 也不行：退回 UTF-8 结果 / 交由调用方抛
+        if (gbk == null) {
+            // GBK 也不行：退回 UTF-8 结果 / 交由调用方抛（上层会把 message 记进「解压结束」）
+            AppLogger.w(TAG, "ZIP 按 GBK 也无法打开，沿用默认解码：${file.name}")
+            return utf8 ?: ZipFile(file)
+        }
         if (utf8 != null) runCatching { utf8.close() }
         return gbk
     }
@@ -322,6 +329,10 @@ class ZipExtractor(private val context: Context) {
         src.copyTo(dst, overwrite = true)
         src.delete()
         dst.isFile
+    }.onFailure { e ->
+        // 搬运异常（磁盘满 / 权限 / 跨卷拷贝中断）。返回 false 时上层只能回一句
+        // 「压缩包暂存失败」，分不清究竟为什么，故这里必须留下堆栈
+        AppLogger.w(TAG, "压缩包搬运异常：${src.name}", e)
     }.getOrDefault(false)
 
     /**
@@ -347,6 +358,8 @@ class ZipExtractor(private val context: Context) {
         if (kept != null) "，已保留原压缩包" else "，且原压缩包未能保留"
 
     private companion object {
+        private const val TAG = "ZipExtractor"
+
         /** 流式缓冲区 64KiB：解压全程内存占用与之同量级（远低于 20MB 要求） */
         const val BUFFER_SIZE = 64 * 1024
 
