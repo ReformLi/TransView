@@ -76,6 +76,10 @@ Desktop.ini
 # ==================== 8. 日志和性能分析文件 ====================
 *.log
 *.hprof
+# 临时产物（构建脚本 / 排查用的中间文件，不应进仓库）
+*.tmp
+.tmp_test/
+.trash/
 example/
 .workbuddy
 AGENTS.md

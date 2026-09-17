@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 窗口背景色（themes.xml 的三个系统栏/窗口背景都用它）。
+         图标配色不在这里：启动图标是 mipmap 里的 webp + 自绘背景 drawable，不引用本文件。 -->
     <color name="app_bg">#FF0E1116</color>
-    <color name="ic_launcher_tint">#FF4FC3F7</color>
 </resources>

@@ -6,6 +6,7 @@ import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
 import coil.memory.MemoryCache
 import com.hpu.transview.data.sync.SyncManager
+import com.hpu.transview.server.TransHttpServer
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.CrashLogger
@@ -36,6 +37,11 @@ class TransViewApp : Application(), ImageLoaderFactory {
         // 覆盖边界场景：App 在降级期间被关闭，下次启动时若U盘仍不在位 → 继续降级；
         // U盘已插回 → 状态自动恢复为U盘。此后的插拔由 ServerService 的广播监听接管。
         runCatching { FileLocations.init(this) }
+        // 清掉上一轮生命周期遗留的上传临时文件（`Android/data/<包名>/files/upload_tmp/`）。
+        // 进程刚起 ⇒ 本进程内不可能有在途上传，遗留的必是死文件，故保护窗口取 0。
+        // 必须有人清：该目录不在媒体沙盒内、Android 11+ 也对文件管理器不可见，
+        // 否则「上传途中断电 / 进程被杀」留下的半个大文件会永久占着磁盘且无人可见。
+        runCatching { TransHttpServer.purgeOrphanUploadTemps(this, skipActiveWithinMs = 0L) }
         // App 调试日志（默认关）：按持久化偏好决定是否启动异步落盘引擎。
         // 必须放在 FileLocations.init **之后** —— 日志落点 = 活动沙盒的 Downloads/app_log/，
         // 依赖活动存储状态（U 盘 / 内部存储）已检测完成；否则首次会落到兜底路径。

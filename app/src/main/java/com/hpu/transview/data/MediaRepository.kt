@@ -5,6 +5,7 @@ import com.hpu.transview.data.db.AppDatabase
 import com.hpu.transview.data.db.MediaItemDao
 import com.hpu.transview.data.db.MediaItemEntity
 import com.hpu.transview.model.Category
+import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.nameIsImageFile
 import com.hpu.transview.util.nameIsVideoFile
 import kotlinx.coroutines.Dispatchers
@@ -107,7 +108,52 @@ class MediaRepository(context: Context) {
         true
     }
 
+    /**
+     * 按路径批量删除索引（播放历史经外键级联删除）。
+     *
+     * **必须分批**：Room 把 `filePath IN (:paths)` 展开成**等量**的 `?` 绑定参数，
+     * 条目一多就会撞上 SQLite 的宿主参数上限（旧版 SQLite 只有 999）。超限时整批语句直接抛异常，
+     * 而调用方（对账「同步外部删除」）在 `try/catch` 里把它兜成「对账异常，已兜底结束」——
+     * 表现就是**一次删掉上千个文件后，媒体库里的僵尸卡片永远清不掉且毫无提示**。
+     * 每批 [SQL_BIND_CHUNK] 条留足余量，超大批量也只是一次多循环。
+     */
     suspend fun deleteByPaths(paths: List<String>) = withContext(Dispatchers.IO) {
-        if (paths.isNotEmpty()) dao.deleteByPaths(paths)
+        paths.chunked(SQL_BIND_CHUNK).forEach { dao.deleteByPaths(it) }
+    }
+
+    /**
+     * 「不属于任何当前已知卷」的索引路径 —— 那块存储已经彻底不在设备上了
+     * （盘被永久移除 / 换了盘符 / 换了盘），索引再也无法生效。
+     *
+     * ## 与对账判据的区别（关键）
+     * 对账走 [FileLocations.existsForPath]，对「读不到」一律判**存在**（防拔盘误删，见其注释）；
+     * 本方法是给**用户主动清理**用的，判据换成「连所属卷都不在设备的卷列表里」——
+     * 比「卷在位但不可用（已拔出的首选盘）」更严格：后者插回就能复活，**不在此列**。
+     *
+     * 这类记录在媒体库里看不到（展示按活动沙盒过滤），对账又永不删，因此**前端原本没有任何
+     * 出口能清掉它们**，只能一直躺在库里。
+     */
+    suspend fun orphanIndexPaths(): List<String> = withContext(Dispatchers.IO) {
+        val roots = FileLocations.storageState.value.volumes.map { it.root.absolutePath }
+        dao.getAllPaths().filter { path ->
+            roots.none { root -> path == root || path.startsWith("$root${File.separator}") }
+        }
+    }
+
+    /** 不可达索引的条数（设置页展示用） */
+    suspend fun countOrphanIndexes(): Int = orphanIndexPaths().size
+
+    /**
+     * 删除全部不可达索引（播放历史经外键级联删除）。@return 实际删除的条数
+     */
+    suspend fun purgeOrphanIndexes(): Int = withContext(Dispatchers.IO) {
+        val paths = orphanIndexPaths()
+        paths.chunked(SQL_BIND_CHUNK).forEach { dao.deleteByPaths(it) }
+        paths.size
+    }
+
+    private companion object {
+        /** 单条 SQL 的绑定参数上限保险值（SQLite 旧上限 999；取一半留余量） */
+        const val SQL_BIND_CHUNK = 400
     }
 }

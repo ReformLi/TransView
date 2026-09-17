@@ -1,7 +1,29 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.28　日期：2026-09-17
+> 版本：v1.29　日期：2026-09-17
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.29 变更：**「清不掉的数据 / 死文件 / 冗余代码」专项清理**（详见 §3.26）——
+> ① **上传临时文件永久残留**：`Android/data/<包名>/files/upload_tmp/upload_*.tmp` 在「进程被杀 / 断电」时
+> 因 NanoHTTPD 的 `TempFileManager.clear()` 没机会执行而永久留下；该目录不在媒体沙盒内、Android 11+ 对文件
+> 管理器也不可见 ⇒ **此前没有任何清理路径**（一次中断的大文件上传可留下 GB 级不可见占用）。新增
+> `TransHttpServer.purgeOrphanUploadTemps()`，App 启动（窗口 0，进程刚起必无在途上传）与服务器启动 /
+> 设置页清缓存（窗口 10 分钟，避「停服立刻重启」「清理时正在上传」竞态）三处清扫；
+> ② **不可达索引无出口**：对账按「读不到 ≠ 被删」永不删「所属卷已不在设备上」的索引、媒体库又显示不到它们，
+> 这些记录只能永远躺在库里 → 设置页新增「**清理不可达索引**」（先报条数、确认弹框写明风险、`destructive` 红字，
+> 删除时经外键 CASCADE 连带播放历史；判据比「卷在位但已拔出的首选盘」更严格，后者不清理）；
+> ③ **应用缓存无入口**：反编译确认 Coil 2.7 未配 `diskCache` 时默认建 `cacheDir/image_cache`
+> （`SingletonDiskCache`，目录名常量 `image_cache`），不在媒体沙盒、「存储空间占用」也统计不到 →
+> 新增 `FileUtils.cacheSizeBytes/clearAppCache` + 设置页「**清理缓存**」行；
+> ④ **上传记录尾部长尾**：表保留 500 条而 UI 只读 200 条 ⇒ 最多 300 条查不到也删不掉单条 →
+> `MAX_RECORDS` 与 UI 上限对齐 200；
+> ⑤ **批量删索引撞 SQLite 宿主参数上限**（旧版 999）：Room 把 `IN (:paths)` 展开成等量绑定参数，超限整条语句抛异常、
+> 被对账兜底 `catch` 吞成「对账异常」⇒「一次删掉上千个文件后僵尸卡片永远清不掉且无提示」→
+> `MediaRepository.deleteByPaths` 分批（400/批）；
+> ⑥ **冗余清理**：删除整份死文件 `ui/common/VideoMeta.kt`（零引用）、无用资源 `@color/ic_launcher_tint`、
+> 8 处未使用 import、工程根目录 4 项临时产物（`apk_info.tmp` / `tv_scroll_mem.py` / `.tmp_test/` / `.trash/`），
+> `.gitignore` 补 `*.tmp`、`.tmp_test/`、`.trash/`。
+> **经核实无需改**：`.temp_unzip` 已有「自我 purge + 对账兜底」回收链；`app_log` 按天保留 7 天且可在「其他」页
+> 直接打开/删除；`Fullscreen` 主题用系统黑底是刻意设计；`backup_rules`/`data_extraction_rules` 是清单引用的空模板。
 > v1.28 变更：**代码审查（5 份报告）核实与修复** —— 逐条读码验证后修掉 3 个严重 + 6 个中等 + 4 个轻微问题：
 > ① **并发同名上传覆盖丢数据**（`UploadStorage` 的「列目录 → 唯一名 → 移入」非原子 + `FileStorage.moveFileInto` 走
 > `renameTo` 在同卷**静默覆盖**已存在目标）→ 加 `synchronized` 名称分配锁 + `moveFileInto` 改为**永不覆盖**
@@ -1039,7 +1061,7 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 |---|------|------|------|
 | 1 | 并发同名上传**覆盖丢数据** | `UploadStorage` 的「列目录 → 取唯一名 → `moveFileInto`」三步非原子；且同卷 `renameTo`（`rename(2)`）**静默覆盖**已存在目标 | `synchronized(名称分配锁)` 串行化 + 最多 50 次唯一名重试；`FileStorage.moveFileInto` 改为**永不覆盖**：目标已存在直接 `false`，`copyTo(overwrite=false)` 兜底，失败删残块 |
 | 2 | 对账**主线程**提取视频时长（ANR） | `SyncManager` 逐文件 `upsertFile` 直接在调用线程跑 | 整段循环包进 `withContext(Dispatchers.IO)` |
-| 3 | **API 21–28 时长恒 0 + native 泄漏** | `MediaMetadataRetriever.close()` 是 API 29+，`.use{}` 编译成 `close()` → 低版本 `NoSuchMethodError`，被 `runCatching` 静默吞掉且 `release()` 永不执行 | 改显式 `try/catch/finally { release() }`（`FileUtils.extractVideoDuration`、`VideoMeta.getDuration`） |
+| 3 | **API 21–28 时长恒 0 + native 泄漏** | `MediaMetadataRetriever.close()` 是 API 29+，`.use{}` 编译成 `close()` → 低版本 `NoSuchMethodError`，被 `runCatching` 静默吞掉且 `release()` 永不执行 | 改显式 `try/catch/finally { release() }`（`FileUtils.extractVideoDuration`；同时改的 `VideoMeta.getDuration` 在 v1.29 查明是零引用死代码，该文件**已整体删除**，见 §3.26.6） |
 | 4 | 对账拔 U 盘**竞态误删整盘索引** | 拔出广播有 2s 去抖，窗口内卷快照仍 `available=true` | 删除步前重新 `refresh()`、降级中跳过删除；`existsForPath` 增加「外接盘卷根此刻不存在 → 判存在」 |
 | 5 | `finishedPaths` 残留 | 重看已看完的集数时该路径仍在「已看完」集合里 → 进度不再保存 | `skipTo(index)` / 重播时 `finishedPaths.remove(path)` |
 | 6 | `TransHttpServer.bgScope` 泄漏 | 智能模式每次熄屏 / 播放 / 休眠恢复都 stop→start，只 `stop()` 不取消协程作用域 | `ServerController.stopServer()` 补 `runCatching { server?.shutdown() }` |
@@ -1061,6 +1083,85 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
    旧函数不复存在；
 4. 媒体库首行按「上键」是**两段式**（内容区 → 工具条 → 顶部标签），设置页是一段式 —— 媒体库有工具条、
    设置页没有，层级本就不同。
+
+### 3.26 死数据 / 不可清理文件 / 冗余代码专项清理（v1.29）
+
+按「**前端清不掉的数据与文件**」与「**没被用到的文件与代码**」两条线逐类排查，结论与处置如下。
+
+#### 3.26.1 上传临时文件永久残留（最严重，可吃 GB 级不可见空间）
+
+| 项 | 说明 |
+|---|---|
+| 落点 | `Android/data/<包名>/files/upload_tmp/upload_<nanoTime>_<名>.tmp`（[TransHttpServer] 的 `ExternalTempFileManager`；刻意放外部私有目录，与 `/sdcard` 同卷才能 `renameTo` 零拷贝移入沙盒） |
+| 正常清理 | NanoHTTPD 在每次连接收尾调 `TempFileManager.clear()` → `created.forEach { it.delete() }` |
+| **泄漏窗口** | **进程被杀 / 断电 / 系统回收**时 `clear()` 根本没机会跑 → 半个上传永久留在盘上 |
+| 为什么以前无人能清 | ① 该目录**不在媒体沙盒**（`TransView/`）内 —— 对账的 `.temp_unzip` 清理、媒体库扫描、`FileUtils.purgeDirectory`（带 `isInsideSandbox` 断言）全都碰不到它；② **Android 11+ 起 `Android/data/` 对文件管理器不可见**，用户连手动删都做不到；③ 每次 `TransHttpServer` 构造都会 new 一个新的 `ExternalTempFileManager`（`created` 列表为空），上一实例的残留不会被新实例清理 |
+
+**修法**：`TransHttpServer.companion` 新增 `tempDirOf(context)` 与 `purgeOrphanUploadTemps(context, skipActiveWithinMs)`，三处调用：
+
+| 调用点 | 保护窗口 | 依据 |
+|---|---|---|
+| `TransViewApp.onCreate` | **0** | 进程刚起 ⇒ 本进程内不可能有在途上传（服务器尚未启动），遗留的必是死文件 |
+| `TransHttpServer.init`（每次启动服务器） | 10 分钟 | 避开「停服务器 → 立刻再启动」时上一实例工作线程仍在写的瞬间竞态 |
+| 设置页「清理缓存」 | 10 分钟 | 避开「用户点清理时正好有上传在途」 |
+
+窗口与 [SyncManager] 保护在途解压工作区的 `ACTIVE_WORKSPACE_GRACE_MS` 同值（同一类竞态）。
+
+#### 3.26.2 不可达索引（Room `media_items` + 级联 `playback_history`）
+
+| 项 | 说明 |
+|---|---|
+| 场景 | 曾把 U 盘设为存储位置并入库，之后该盘被**永久移除 / 换盘**（或用户改选内部存储后再也不插回） |
+| 为什么以前清不掉 | 对账的「同步外部删除」走 [FileLocations.existsForPath]，判据是「读不到 ≠ 被删」——路径**不属于任何已知卷**时也恒返回 `true`；媒体库展示又按活动沙盒过滤 → 这些记录**既看不到、也永不清理** |
+| 修法 | `MediaRepository` 新增 `orphanIndexPaths()`：判据换成「路径连**所属卷都不在** `storageState.volumes` 里」——比「卷在位但 `available=false`（首选盘已拔出）」**更严格**，后者插回即可复活，**不在清理范围**。设置页「存储与数据」新增「**清理不可达索引**」：点开先 `countOrphanIndexes()` 报条数（0 条直接 Toast 提示），确认弹框（`destructive = true`）写明风险后 `purgeOrphanIndexes()` 删除（经外键 CASCADE 连带播放历史） |
+
+> 设计取舍：**没有**做成自动清理。因为「盘只是临时拔出」与「盘已永久移除」在系统层面无法区分，
+> 自动删会直接违反本项目的核心不变式。故只提供**用户显式触发 + 二次确认**的出口。
+
+#### 3.26.3 应用缓存（`cacheDir`）无清理入口
+
+反编译确认 **Coil 2.7 未显式配置 `diskCache` 时确实会建默认磁盘缓存**：
+`ImageLoader$Builder.build$lambda$34` → `coil.util.SingletonDiskCache.get(context)`，
+目录名常量 `DIRECTORY = "image_cache"`（即 `cacheDir/image_cache`，LRU 有上限）。
+它不在媒体沙盒里、「存储空间占用」统计不到、前端无入口 → 新增 `FileUtils.cacheSizeBytes(context)` /
+`clearAppCache(context)`（只删 `cacheDir` 的**子项**，目录本身保留），设置页新增「**清理缓存**」行
+（显示当前占用，确认后清理并在同一批里顺带清上传残留）。
+
+#### 3.26.4 上传记录表留下「看不见也删不掉」的尾巴
+
+`UploadRecordRepository.MAX_RECORDS = 500`，而 UI 读取上限（`UploadRecordDao.observeRecent` 默认 `limit = 200`）
+只有 200 —— 第 201~500 条**查不到、也就删不掉单条**（只能「清空全部」）。原先注释称「多留余量供翻查」，
+但**根本没有翻查入口**。修法：上限对齐为 200，并在 DAO 注释里写明两者**必须同值**的约束。
+
+#### 3.26.5 批量删索引撞 SQLite 宿主参数上限
+
+`MediaItemDao.deleteByPaths(paths)` 的 `filePath IN (:paths)` 会被 Room 展开成**等量**的 `?` 绑定参数；
+条目超过 SQLite 宿主参数上限（旧版为 999）时整条语句直接抛异常。调用方是对账的「同步外部删除」，
+异常被 `sync()` 的兜底 `catch` 吞成「对账过程异常，已兜底结束」——表现为
+**一次删掉上千个文件（如用电脑清空了 Movies 目录）后，僵尸卡片永远清不掉且毫无提示**。
+修法：`MediaRepository.deleteByPaths` 内部按 `SQL_BIND_CHUNK = 400` 分批（`purgeOrphanIndexes` 同理）。
+
+#### 3.26.6 冗余文件与冗余代码（已清除）
+
+| 对象 | 判定依据 | 处置 |
+|---|---|---|
+| `ui/common/VideoMeta.kt`（整个文件） | `object VideoMeta` / `getDuration()` 全仓库零引用；时长提取实际走 `FileUtils.extractVideoDuration`（对账与上传入库各一处） | **删除** |
+| `@color/ic_launcher_tint` | 全仓库零引用（图标是 mipmap webp + 自绘背景 drawable） | 删除 |
+| 8 处未使用 import | `IStorage.mediaUri`、`MainScreen.height` / `onKeyEvent` / `Graphics.Color`、`FileTypeIcon.Color`、`TvComponents.View`、`Theme.Color` | 删除（**保留** `getValue` / `setValue` —— 那是 `by remember` 委托的 operator import，删了会编译失败） |
+| 工程根目录 4 项 | `apk_info.tmp`（APK 体积排查残留）、`tv_scroll_mem.py`（一次性写记忆的脚本）、`.tmp_test/`（空目录）、`.trash/`（`gradle updateDaemonJvm` 的废弃残留，且 `gradle/gradle-daemon-jvm.properties` 并不存在 ⇒ 无任何作用） | 删除；`.gitignore` 补 `*.tmp`、`.tmp_test/`、`.trash/` |
+
+#### 3.26.7 经核实「无需清 / 属设计取舍」
+
+- **`.temp_unzip/`**：解压工作区，`ZipExtractor` 每次 `finally { purge() }` 自清，断电残留由每次对账
+  `purgeDirectory(skipActiveWithinMs = 10min)` 兜底 —— 已有完整回收链，**不需要**额外入口；
+- **`app_log/`**：按天分目录、单文件 2MB 切割、`AppLogger.start()` 清理 7 天前的日期目录；因位于
+  `Downloads/` 下会作为「其他」分类入库，**用户可在媒体库「其他」页直接打开或删除**；
+- **`Theme.TransView.Fullscreen` 用 `@android:color/black` 而非 `app_bg`**：播放器 / 图片查看器要纯黑底，
+  刻意如此，不是漏改；
+- **`backup_rules.xml` / `data_extraction_rules.xml`**：被清单引用但内容全是注释掉的模板（等价于默认行为）。
+  删掉它们需同时改清单、行为不变，**无收益**，保留；
+- **`FileUtils.retrieverFor(context, path)` 的 `context` 形参未被使用**：仅 1 处调用、语义上无害，
+  改动收益低于噪声，保留（记为可选项）。
 
 ## 4. 构建与运行
 
@@ -1090,3 +1191,6 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 - [x] ~~U 盘上「其他」文件无法打开（`FileProvider` 路径未覆盖可移动卷）~~（v1.15 已完成，见 §3.17）
 - [x] ~~对账扫描改为「目录即分类 + 格式严格过滤」并做扫描性能/内存优化~~（v1.16 已完成，见 §3.3.7）
 - [x] ~~「导出存储诊断日志」重构为「App 运行日志本地化」（App 调试日志开关，默认关）~~（v1.17 已完成，见 §3.19）
+- [x] ~~「清不掉的数据 / 死文件 / 冗余代码」专项清理~~（v1.29 已完成：上传临时残留三处自动清扫、设置页新增「清理缓存」「清理不可达索引」、上传记录上限与 UI 对齐、`deleteByPaths` 分批、删除死文件与无用资源/import，见 §3.26）
+- [ ] （可选）`FileUtils.retrieverFor(context, path)` 的 `context` 形参未被使用，可顺手去掉（收益低，见 §3.26.7）
+- [ ] （可选）Room `fallbackToDestructiveMigration()`：潜在隐患非现网缺陷，改用显式 Migration 或 `fallbackToDestructiveMigrationOnDowngrade()` 更稳

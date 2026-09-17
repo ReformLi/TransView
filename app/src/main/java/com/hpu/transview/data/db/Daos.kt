@@ -85,6 +85,9 @@ interface UploadRecordDao {
      * 列表排序：进行中（等待 0 / 上传中 1）置顶，成功 2 / 失败 3 沉底；
      * 组内按上传时间倒序（新的在上），同秒以 id 稳定排序。
      * (state <= 1) 为 1/0 布尔值，DESC 让进行中分组排最前。
+     *
+     * [limit] 默认值必须与仓储的保留上限（`UploadRecordRepository.MAX_RECORDS`）保持一致：
+     * 表里多于这个数的行 UI 永远查不到，也就永远删不掉单条。
      */
     @Query(
         "SELECT * FROM upload_records " +

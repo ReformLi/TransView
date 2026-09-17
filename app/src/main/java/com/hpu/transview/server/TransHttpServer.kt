@@ -84,9 +84,12 @@ class TransHttpServer(
 
     init {
         // 临时文件放在应用外部私有目录，与 /sdcard 同卷，移动零拷贝
-        val tempDir = File(
-            appContext.getExternalFilesDir(null) ?: appContext.cacheDir, "upload_tmp"
-        ).apply { mkdirs() }
+        val tempDir = tempDirOf(appContext).apply { mkdirs() }
+        // 每次启动服务器顺手清一次遗留：进程被杀 / 断电时 NanoHTTPD 的
+        // TempFileManager.clear() 没机会执行，半个上传会以 `upload_*.tmp` 永久留在
+        // `Android/data/<包名>/files/upload_tmp/`（Android 11+ 用户连文件管理器都进不去）。
+        // 带保护窗口：「停服务器 → 立刻再启动」的瞬间，上一实例的工作线程可能还在写自己的临时文件。
+        runCatching { purgeOrphanUploadTemps(appContext) }
         setTempFileManagerFactory { ExternalTempFileManager(tempDir) }
     }
 
@@ -496,5 +499,59 @@ class TransHttpServer(
         override fun available(): Int = delegate.available()
         override fun skip(n: Long): Long = delegate.skip(n)
         override fun close() { delegate.close() }
+    }
+
+    companion object {
+
+        /** 上传临时目录名（位于应用外部私有目录 `files/` 下，与 /sdcard 同卷） */
+        private const val TEMP_DIR_NAME = "upload_tmp"
+
+        /**
+         * 遗留临时文件的保护窗口：最近该时长内仍被改动过的文件视为「可能正在上传」，跳过不删。
+         *
+         * 取 10 分钟与 [com.hpu.transview.data.sync.SyncManager] 保护在途解压工作区的窗口一致
+         * —— 两者面对的是同一类竞态（一轮动作刚结束、下一轮就已经开始清扫）。
+         */
+        const val ORPHAN_TEMP_GRACE_MS = 10 * 60 * 1000L
+
+        /** 上传临时文件目录（不存在时返回其应有路径，不创建） */
+        fun tempDirOf(context: Context): File =
+            File(context.applicationContext.getExternalFilesDir(null) ?: context.cacheDir, TEMP_DIR_NAME)
+
+        /**
+         * 清理**遗留**的上传临时文件，返回删除的文件数。
+         *
+         * ## 为什么必须清
+         * NanoHTTPD 的临时文件由 `TempFileManager.clear()` 在每次连接收尾时删除，正常路径不会残留；
+         * 但**进程被杀 / 断电 / 系统回收**时 `clear()` 根本没机会跑，半个上传就以
+         * `upload_*.tmp` 的形式永久留在 `Android/data/<包名>/files/upload_tmp/`。这个目录：
+         * - 不在媒体沙盒（`TransView/`）内 → 对账的 `.temp_unzip` 清理与媒体库都碰不到它；
+         * - Android 11+ 起 `Android/data/` 对文件管理器不可见 → 用户**没有任何**手动清理途径；
+         * - 一次中断的大文件上传就能留下几百 MB ~ 数 GB 的不可见占用。
+         *
+         * ## 调用点与保护窗口
+         * - [com.hpu.transview.TransViewApp.onCreate]：传 `skipActiveWithinMs = 0`
+         *   —— 进程刚起，本进程内不可能有在途上传（服务器尚未启动），遗留下来的必是死文件；
+         * - 服务器启动（本类 `init`）与设置页「清理缓存」：用默认的 [ORPHAN_TEMP_GRACE_MS]，
+         *   避开「停服务器 → 立刻重启」/「清理时正在上传」的竞态。
+         *
+         * 全程 `runCatching`：删不掉（被占用 / 权限）留在原地即可，绝不打断服务器启动。
+         */
+        fun purgeOrphanUploadTemps(
+            context: Context,
+            skipActiveWithinMs: Long = ORPHAN_TEMP_GRACE_MS
+        ): Int {
+            val dir = tempDirOf(context)
+            if (!dir.isDirectory) return 0
+            val cutoff = System.currentTimeMillis() - skipActiveWithinMs
+            var removed = 0
+            runCatching {
+                dir.listFiles()?.forEach { f ->
+                    if (skipActiveWithinMs > 0 && f.lastModified() >= cutoff) return@forEach
+                    runCatching { if (f.delete()) removed++ }
+                }
+            }
+            return removed
+        }
     }
 }

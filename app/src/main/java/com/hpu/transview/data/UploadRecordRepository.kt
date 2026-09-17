@@ -21,15 +21,21 @@ object UploadStateCode {
  * HTTP 服务器收到请求时 insert(等待/上传中)，落盘完成后 update(成功/失败)。
  *
  * 防死数据两道闸：
- * - [insert] 后自动裁剪：表只保留最近 [MAX_RECORDS] 条（UI 最多显示 200 条，
- *   200 名之外的行永远不会被查询到，留着只会无限膨胀）；
+ * - [insert] 后自动裁剪：表只保留最近 [MAX_RECORDS] 条；
  * - [reapZombieRunning]：进程被杀后残留的「上传中」记录统一标失败（见方法注释）。
  */
 class UploadRecordRepository(context: Context) {
 
-    /** 表内保留条数上限（UI observeRecent 只取 200，多留余量供翻查） */
+    /**
+     * 表内保留条数上限。
+     *
+     * **必须与 UI 的读取上限一致**（[observeRecent] 默认 200）：表里多留的行 UI 永远查不到，
+     * 用户既看不到也删不掉单条（只能「清空全部」）。此前取 500（注释称「多留余量供翻查」），
+     * 但**根本没有翻查入口** → 最多 300 条不可见记录白占着库。现在两边同值：
+     * 库里有多少条，上传页就能看到并逐条删除多少条。
+     */
     private companion object {
-        const val MAX_RECORDS = 500
+        const val MAX_RECORDS = 200
     }
 
     private val dao: UploadRecordDao = AppDatabase.getInstance(context).uploadRecordDao()

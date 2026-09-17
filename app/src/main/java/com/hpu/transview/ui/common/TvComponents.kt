@@ -22,7 +22,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.ui.platform.LocalView
-import android.view.View
 import android.view.ViewTreeObserver.OnTouchModeChangeListener
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed

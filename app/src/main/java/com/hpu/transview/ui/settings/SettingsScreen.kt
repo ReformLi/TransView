@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.hpu.transview.BuildConfig
+import com.hpu.transview.data.MediaRepository
 import com.hpu.transview.data.PlaybackRepository
 import com.hpu.transview.data.UploadRecordRepository
 import com.hpu.transview.data.sync.SyncManager
@@ -65,6 +66,7 @@ import com.hpu.transview.model.ServerMode
 import com.hpu.transview.model.SortOrder
 import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
+import com.hpu.transview.server.TransHttpServer
 import com.hpu.transview.ui.common.COMPACT_CONTENT_DENSITY_SCALE
 import com.hpu.transview.ui.common.COMPACT_SCREEN_HEIGHT_DP
 import com.hpu.transview.ui.common.OptionRow
@@ -243,7 +245,7 @@ fun SettingsScreen(
     val rowFocused = remember { mutableStateMapOf<String, Boolean>() }
     var detailTicket by remember { mutableIntStateOf(0) }
     // 左/右两栏各自一份滚动状态。矮屏（手机横屏）下**两栏**都可能高于可视区：
-    // 左栏是「设置」标题 + 5 个分组，右栏「存储与数据」有 7 行设置 + 小字提示 + 信息条目。
+    // 左栏是「设置」标题 + 5 个分组，右栏「存储与数据」有 9 行设置 + 小字提示 + 信息条目。
     // 原先两栏都是固定高度布局（左栏 `Arrangement.Center`、右栏仅「关于」组内部滚动），
     // 内容一超出就被裁掉、且无法滚动（用户实测：左侧末项「关于」看不到，
     // 右侧「存储与数据」只能看到「存储空间占用」为止）。
@@ -299,7 +301,23 @@ fun SettingsScreen(
 
     val uploadRepo = remember { UploadRecordRepository(context) }
     val playbackRepo = remember { PlaybackRepository(context) }
+    val mediaRepo = remember { MediaRepository(context) }
     val syncManager = remember { SyncManager.getInstance(context) }
+
+    // 应用缓存占用（cacheDir：Coil 图片/视频首帧磁盘缓存等）。
+    // 它不在媒体沙盒里，「存储空间占用」统计不到，媒体库也看不到 —— 单独给一行可查可清。
+    var cacheLabel by remember { mutableStateOf("计算中…") }
+    var cacheComputing by remember { mutableStateOf(false) }
+    val refreshCache: () -> Unit = {
+        scope.launch {
+            cacheComputing = true
+            cacheLabel = withContext(Dispatchers.IO) {
+                FileUtils.formatSize(FileUtils.cacheSizeBytes(context))
+            }
+            cacheComputing = false
+        }
+    }
+    LaunchedEffect(Unit) { refreshCache() }
 
 
     // 右侧每行的焦点入口（goToDetail 触发后请求当前分组第一行）
@@ -1020,7 +1038,8 @@ fun SettingsScreen(
                             // 打开后 AppLogger 把运行日志异步落盘到
                             // <活动沙盒>/TransView/Downloads/app_log/<yyyy-MM-dd>/<HH-mm-ss>.log；
                             // 该目录属于「其他」分类 → 对账后可在「其他」页直接翻看。
-                            // focusKey 固定为 :3（:4/:5/:6 为其余三项，ID 稳定、不随行序变化）。
+                            // focusKey 固定为 :3（:4~:8 为其余各项，ID 稳定、不随行序变化）。
+                            // 分组末行现在是 :8「清理不可达索引」（bottomEdge = true）。
                             SettingRow(
                                 "${g.title}:3", "App 调试日志",
                                 if (appLogValue) "开启" else "关闭",
@@ -1074,8 +1093,7 @@ fun SettingsScreen(
                                 })
                             }
                             SettingRow(
-                                "${g.title}:6", "手动触发对账", "刷新媒体库",
-                                bottomEdge = true
+                                "${g.title}:6", "手动触发对账", "刷新媒体库"
                             ) {
                                 scope.launch {
                                     val r = syncManager.sync()
@@ -1089,6 +1107,70 @@ fun SettingsScreen(
                                             "清理失效 ${r.deletedMissing}，空文件夹 ${r.removedEmptyFolders}$extra",
                                         Toast.LENGTH_LONG
                                     ).show()
+                                }
+                            }
+                            // 应用缓存（cacheDir）：不在媒体沙盒内，「存储空间占用」统计不到；
+                            // 清理时顺带扫一次**遗留的上传临时文件**（带保护窗口，不会打断在途上传）。
+                            SettingRow(
+                                "${g.title}:7", "清理缓存",
+                                if (cacheComputing) "…" else cacheLabel,
+                                subtitle = "缩略图等应用缓存与上传残留，可随时清理；不影响已上传的文件"
+                            ) {
+                                openConfirm("${g.title}:7", ConfirmState(
+                                    "清理缓存",
+                                    "确定清理应用缓存吗？（当前 $cacheLabel）\n" +
+                                        "仅清理缩略图等可再生成的缓存与上传残留，已上传的文件、播放记录不受影响。",
+                                    "清理"
+                                ) {
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            // 先清上传残留（10 分钟保护窗口：正在上传的临时文件不会被删），
+                                            // 再清 cacheDir —— 两者互不重叠（upload_tmp 在 files/ 下，不在 cacheDir）
+                                            val leftovers = TransHttpServer.purgeOrphanUploadTemps(context)
+                                            FileUtils.clearAppCache(context) to leftovers
+                                        }
+                                        refreshCache()
+                                        Toast.makeText(
+                                            context,
+                                            "已清理缓存，释放 ${FileUtils.formatSize(result.first)}" +
+                                                if (result.second > 0) "，另清除 ${result.second} 个上传残留" else "",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                })
+                            }
+                            // 不可达索引：指向「已彻底不在设备上」的存储的历史记录。
+                            // 对账按「读不到 ≠ 被删」原则永不清理这些记录，媒体库又按活动沙盒过滤
+                            // 显示不到它们 —— 此前前端**没有任何出口**能清掉，只能一直躺在库里。
+                            // 条数按需查询（点开才算），避免每次进页面都全表扫一遍。
+                            SettingRow(
+                                "${g.title}:8", "清理不可达索引", "清理失效记录",
+                                subtitle = "仅清理已不在设备上的存储（如已永久移除的 U 盘）留下的索引",
+                                bottomEdge = true
+                            ) {
+                                scope.launch {
+                                    val n = mediaRepo.countOrphanIndexes()
+                                    if (n <= 0) {
+                                        Toast.makeText(
+                                            context, "没有不可达的索引记录，无需清理", Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@launch
+                                    }
+                                    openConfirm("${g.title}:8", ConfirmState(
+                                        "清理不可达索引",
+                                        "有 $n 条索引指向已不在设备上的存储，清理会连同其播放历史一并删除。\n" +
+                                            "若那块盘只是临时拔出，请先插回再操作 —— 否则插回后需要重新扫描，" +
+                                            "且这些文件的播放进度会丢失。",
+                                        "清理 $n 条",
+                                        destructive = true
+                                    ) {
+                                        scope.launch {
+                                            val removed = mediaRepo.purgeOrphanIndexes()
+                                            Toast.makeText(
+                                                context, "已清理 $removed 条不可达索引", Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    })
                                 }
                             }
                         }

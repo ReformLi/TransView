@@ -1,7 +1,6 @@
 package com.hpu.transview.storage
 
 import android.net.Uri
-import com.hpu.transview.util.mediaUri
 import java.io.InputStream
 
 /**

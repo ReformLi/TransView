@@ -940,4 +940,35 @@ object FileUtils {
             true
         }.getOrDefault(false)
     }
+
+    // ————————————————— 应用缓存（cacheDir） —————————————————
+
+    /**
+     * 应用缓存目录当前占用（字节）。
+     *
+     * 缓存目录由系统托管、内容随时可丢，**不含任何用户数据**：目前主要是 Coil 的图片/视频首帧
+     * 磁盘缓存（`cacheDir/image_cache`，Coil 2.x 未显式配置 diskCache 时的默认落点，LRU 上限
+     * 约为可用空间的 2%）。它不占用媒体沙盒，媒体库/上传页都看不到，**前端原本没有任何入口能清它**
+     * —— 排查「磁盘空间去哪了」时它是唯一的盲区，因此单独给一个可查可清的口子。
+     * 取不到时返回 0（不抛异常）。
+     */
+    fun cacheSizeBytes(context: Context): Long = runCatching {
+        context.cacheDir?.walkTopDown()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
+    }.getOrDefault(0L)
+
+    /**
+     * 清空应用缓存目录，返回实际释放的字节数。
+     *
+     * 只删 [Context.getCacheDir] 的**子项**，目录本身保留（系统与 Coil 都需要它继续存在）；
+     * 全程 `runCatching` —— 正在被占用的缓存文件删不掉也不影响其余项，更不抛异常。
+     *
+     * **与上传临时目录无关**：上传残留放在 `files/upload_tmp/`（不属 cacheDir），
+     * 因此本方法**不会**打断任何在途上传（见 [com.hpu.transview.server.TransHttpServer.purgeOrphanUploadTemps]）。
+     */
+    fun clearAppCache(context: Context): Long {
+        val dir = context.cacheDir ?: return 0L
+        val before = cacheSizeBytes(context)
+        runCatching { dir.listFiles()?.forEach { it.deleteRecursively() } }
+        return (before - cacheSizeBytes(context)).coerceAtLeast(0L)
+    }
 }
