@@ -33,23 +33,34 @@ const val COMPACT_SCREEN_HEIGHT_DP = 480
 const val COMPACT_CONTENT_DENSITY_SCALE = 0.87f
 
 /**
- * 顶部导航栏在**非紧凑态**下完整排布所需的宽度上限（dp）。窄于此值就必须收窄这一行。
+ * 顶部导航栏在**非紧凑态**下完整排布所需的宽度（dp）。窄于此值就必须收窄这一行。
  *
- * 非紧凑态整行 ≈ 行内边距 80 + 品牌标题「传视 TransView」约 150 + 标题后间距 28
- * + 5 个媒体标签约 460（每个 30dp×2 padding + 2 个汉字）+ 标签间距 70
- * + 「设置」标签约 92 + 间距 20 + 状态徽标约 151（圆点 + 「服务器运行中」+ 「· 智能」）
- * ≈ **1050dp**，故本行在窄于 1050dp 时必然装不下。
+ * 非紧凑态整行按当前字号 / 内边距**估算**（中间的 `Spacer(weight)` 在空间不足时会压到 0，不计入）：
+ * 行内边距 80 + 品牌标题「传视 TransView」约 160 + 标题后间距 28
+ * + **4** 个媒体标签约 368（每个 `30.dp`×2 padding + 2 个汉字 @ `titleMedium` 16sp）
+ * + 标签间距 56（**循环内**每个标签后各一个，末个也算）
+ * + 「设置」标签约 92 + 间距 20 + 状态徽标约 150（圆点 + 「服务器运行中」+ 「· 智能」）
+ * ≈ **950dp**。
  *
- * 阈值刻意取 **960**（而非 1050）：
- * - 960dp 是 1080p 电视 / 盒子的**标准最小宽度**；取「严格小于」可保证标准电视**逐像素不变**；
- * - 一旦宽度 < 960dp，就说明一定装不下，此时收窄（隐藏品牌标题、标签改用紧凑样式、徽标只留圆点
- *   → 整行降到约 470dp）严格优于「右侧被裁掉」。
+ * 收窄态（隐藏品牌标题 + 标签改紧凑样式 + 徽标只留圆点）≈ **400dp**，尚不足非紧凑态的一半。
  *
- * 为什么必须有这条判据：Android 16（API 36）起，**最小宽度 >= 600dp 的屏幕会忽略
- * `screenOrientation`** —— 本应用三个 Activity 都锁了 landscape，但平板竖屏 / 桌面窄窗口下
- * 仍可能真的变竖屏，届时本行会被挤出屏幕（右侧「设置」标签与状态徽标直接丢失）。
- * Manifest 里的 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` 只是 API 36 的临时安全网，
- * **API 37 会失效**，所以宽度自适应必须真正具备。
+ * ## 阈值为何取 960
+ * 960dp 是 1080p Android TV 的**常见宽度**（标准配置 960×540dp，密度 2.0）；取「严格小于」⇒
+ * 该类电视**不收窄、逐像素不变**（本项目硬要求）。**但余量很薄**：估算需求 ≈950dp 与阈值只差
+ * 约 10dp，字体度量与 `letterSpacing` 的累积误差都可能吃掉它 —— 需在真机 1080p 电视上实测右端
+ * 徽标有无裁切，再决定是否上调（或改为不依赖阈值的可压缩布局，见 ARCHITECTURE §3.27.5）。
+ *
+ * ## 为什么必须有这条判据
+ * Android 16（API 36）起，**最小宽度（smallestWidth）>= 600dp 的屏幕会忽略 `screenOrientation`
+ * 与尺寸 / 宽高比限制**。手机（sw 360~450dp）与 1080p 电视（sw **540**dp）都低于 600dp、落在
+ * 官方例外清单（*Displays smaller than sw600dp*）内，**不受影响**；只有**平板 / 大折叠内屏 /
+ * 桌面窗口**会真的变竖屏或窄窗口 —— 届时本行会被挤出屏幕，右侧「设置」标签与状态徽标直接丢失。
+ *
+ * Manifest 里的 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` 只是 API 36 的临时安全网：
+ * ① **API 37 会移除该 opt-out**；② 官方另有一句需注意的表述 —— *If your app targets Android 16
+ * (API level 36) or higher, this property doesn't lock the display orientation or prevent screen
+ * rotation on large displays*，即对本工程（targetSdk 36）它**未必真能锁住大屏方向**。
+ * 因此宽度自适应是**必需的**，不是锦上添花。
  */
 const val TOP_BAR_FULL_WIDTH_DP = 960
 

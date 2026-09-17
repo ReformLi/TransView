@@ -9,6 +9,8 @@ import android.os.Environment
 import android.os.storage.StorageManager
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import coil.Coil
+import coil.annotation.ExperimentalCoilApi
 import com.hpu.transview.model.Category
 import com.hpu.transview.model.FileEntry
 import com.hpu.transview.model.MediaRef
@@ -959,16 +961,46 @@ object FileUtils {
     /**
      * 清空应用缓存目录，返回实际释放的字节数。
      *
-     * 只删 [Context.getCacheDir] 的**子项**，目录本身保留（系统与 Coil 都需要它继续存在）；
+     * ## 为什么必须先走 Coil 自己的 `clear()`（**不要**直接删 `image_cache` 目录）
+     * 缓存目录里目前只有 Coil 的图片 / 视频首帧磁盘缓存（`cacheDir/image_cache`，见 [cacheSizeBytes]）。
+     * Coil 2.7 未显式配置 `diskCache` 时由 `coil.util.SingletonDiskCache` 创建它 —— 那是**进程级单例**，
+     * 底层 `DiskLruCache.initialize()` 带 `initialized` 标志、**只执行一次**（反编译确认），
+     * 且 `coil.disk.RealDiskCache` 自身**没有任何异常兜底**。
+     *
+     * 因此**不能把该目录直接删掉**：目录消失后 Coil 不会重建它，而它内存里的记账
+     * （`lruEntries` / `size`）与已打开的 `journal` 句柄仍指向旧状态 —— 两者就此脱节，
+     * 之后写缓存会因父目录不存在抛 `FileNotFoundException`。
+     * 正确入口是先调 `DiskCache.clear()`（其内部即 `DiskLruCache.evictAll()`：同步清空记账、
+     * 删除条目文件、写回日志），再扫掉 cacheDir 里**其余**子项。
+     *
      * 全程 `runCatching` —— 正在被占用的缓存文件删不掉也不影响其余项，更不抛异常。
      *
      * **与上传临时目录无关**：上传残留放在 `files/upload_tmp/`（不属 cacheDir），
      * 因此本方法**不会**打断任何在途上传（见 [com.hpu.transview.server.TransHttpServer.purgeOrphanUploadTemps]）。
+     *
+     * `@OptIn(ExperimentalCoilApi::class)`：`coil.disk.DiskCache` 在 Coil 2.7 上是实验性 API ——
+     * 这是 Coil 官方给出的**唯一**清缓存入口，故就地 opt-in（不外泄该类型，调用方无需处理）。
      */
+    @OptIn(ExperimentalCoilApi::class)
     fun clearAppCache(context: Context): Long {
         val dir = context.cacheDir ?: return 0L
         val before = cacheSizeBytes(context)
-        runCatching { dir.listFiles()?.forEach { it.deleteRecursively() } }
+        // ① 让 Coil 自己清（唯一正确入口，理由见上）
+        runCatching { Coil.imageLoader(context).diskCache?.clear() }
+        // ② 再扫其余子项兜底（覆盖将来可能新增的非 Coil 缓存）。
+        //    **跳过 Coil 的缓存目录**：它已被 ① 清空，再删目录本身反而会让 Coil 的磁盘缓存失效
+        //    （目录不会被重建）。名字取自 Coil 的默认目录名常量（反编译确认）。
+        runCatching {
+            dir.listFiles()?.forEach { child ->
+                if (child.name != COIL_DISK_CACHE_DIR) child.deleteRecursively()
+            }
+        }
         return (before - cacheSizeBytes(context)).coerceAtLeast(0L)
     }
+
+    /**
+     * Coil 磁盘缓存的默认目录名（`cacheDir/image_cache`，见 `coil.util.SingletonDiskCache` 的字节码常量）。
+     * 仅用于**跳过**该目录，不用于直接删除 —— 清理必须经 Coil 的 `DiskCache.clear()`（见 [clearAppCache]）。
+     */
+    private const val COIL_DISK_CACHE_DIR = "image_cache"
 }

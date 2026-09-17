@@ -107,10 +107,11 @@ fun MainScreen() {
     val rootView = LocalView.current
     // 顶部导航栏是否收窄（判据集中在 rememberTopBarTight，与内容区缩放相互独立）：
     //  ① 手机横屏（矮屏，高度 < 480dp）—— 否则顶部栏要占去半屏；
-    //  ② 平板竖屏 / 桌面窄窗口（宽度 < 960dp）—— 非紧凑态整行约需 1050dp，不收窄会把右侧
-    //     「设置」标签与状态徽标挤出屏幕（Android 16 起最小宽度 >= 600dp 的屏幕忽略
-    //     screenOrientation，详见该 helper 注释）。
-    // 判据门槛「严格小于电视标准最小宽度 960dp」，故标准电视 / 盒子上逐像素不变。
+    //  ② 非矮屏但宽度不足（宽度 < 960dp）—— 非紧凑态整行约需 950dp，不收窄会把右侧
+    //     「设置」标签与状态徽标挤出屏幕（Android 16 起**最小宽度 >= 600dp** 的屏幕忽略
+    //     screenOrientation：平板竖屏 / 桌面窄窗口可达；手机 sw 360~450dp 与 1080p 电视
+    //     sw 540dp 都 < 600dp，落在官方例外清单内、不受影响 —— 详见该 helper 的注释与 §3.27.5）。
+    // 门槛取「严格小于 1080p 电视常见宽度 960dp」，故该类电视 / 盒子上逐像素不变。
     val topBarTight = rememberTopBarTight()
     LaunchedEffect(touchAnchorTick) {
         if (touchAnchorTick == 0) return@LaunchedEffect

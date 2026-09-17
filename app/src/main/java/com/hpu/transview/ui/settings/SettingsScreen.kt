@@ -1149,6 +1149,14 @@ fun SettingsScreen(
                                 bottomEdge = true
                             ) {
                                 scope.launch {
+                                    // 卷列表为空 ⇒ 存储状态尚未就绪，此时「不可达」无法判定（见
+                                    // MediaRepository.orphanIndexPaths 的空集守卫），直接提示、不弹确认框
+                                    if (!mediaRepo.storageReady()) {
+                                        Toast.makeText(
+                                            context, "存储状态尚未就绪，请稍后再试", Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@launch
+                                    }
                                     val n = mediaRepo.countOrphanIndexes()
                                     if (n <= 0) {
                                         Toast.makeText(

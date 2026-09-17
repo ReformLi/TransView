@@ -48,12 +48,16 @@
         android:theme="@style/Theme.TransView">
 
         <!-- ⚠️ 临时「安全网」，有保质期（API 37 失效），不是长久方案 ——
-             Android 16（API 36）起，最小宽度 >= 600dp 的屏幕（平板 / 大折叠内屏 / 桌面窗口模式）
-             会**忽略** screenOrientation：本应用三个 Activity 都锁了 landscape，届时会被强制
-             允许竖屏 / 任意尺寸窗口，顶部导航栏（非紧凑态约需 1050dp）会被挤出屏幕。
+             Android 16（API 36）起，**最小宽度（smallestWidth）>= 600dp** 的屏幕会**忽略**
+             screenOrientation：本应用三个 Activity 都锁了 landscape，在平板 / 大折叠内屏 /
+             桌面窗口模式下会被强制允许竖屏 / 任意尺寸窗口，顶部导航栏（非紧凑态约需 950dp）
+             会被挤出屏幕。
+             （手机 sw 360~450dp 与 1080p 电视 sw 540dp 均低于 600dp，属官方例外清单
+              *Displays smaller than sw600dp*，不受影响。）
              本属性让系统在 API 36 上继续尊重旧的横竖屏 / 尺寸限制。
              为什么不能只靠它：① API 37 会移除本 opt-out；② 官方明确「桌面窗口模式下屏幕方向
-             限制即便 opt-out 也会被覆盖」。因此代码侧已同步做宽度自适应 + configChanges 兜底
+             限制即便 opt-out 也会被覆盖」，且 *targetSdk >= 36 时本属性并不锁定大屏方向*。
+             因此代码侧已同步做宽度自适应 + configChanges 兜底
              （见 MainScreen 的 topBarTight 与 MainActivity 的 configChanges）。 -->
         <property
             android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"

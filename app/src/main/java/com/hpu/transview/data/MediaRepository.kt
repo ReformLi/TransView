@@ -135,6 +135,13 @@ class MediaRepository(context: Context) {
      */
     suspend fun orphanIndexPaths(): List<String> = withContext(Dispatchers.IO) {
         val roots = FileLocations.storageState.value.volumes.map { it.root.absolutePath }
+        // ⚠️ 空集必须直接返回空 —— `volumes` 是**可能为空**的：`FileLocations.refresh()` 在
+        // appContext 尚未初始化时 `devices` 是空列表（`getWritableDevices` 才会无条件塞内部存储），
+        // 而 `volumes` 只在「首选盘不在位 **且** 首选 ≠ 内部存储」时才补一个占位项。
+        // 一旦 roots 为空，下面的 `none {}` 恒为 true，会把**全表索引**都判成孤儿 ——
+        // 用户点一次「清理不可达索引」就删光整个媒体库索引，且外键级联**连播放历史一起删**。
+        // 索引能靠重新对账扫回来，播放进度**不能**，所以这里宁可什么都不做。
+        if (roots.isEmpty()) return@withContext emptyList()
         dao.getAllPaths().filter { path ->
             roots.none { root -> path == root || path.startsWith("$root${File.separator}") }
         }
@@ -142,6 +149,15 @@ class MediaRepository(context: Context) {
 
     /** 不可达索引的条数（设置页展示用） */
     suspend fun countOrphanIndexes(): Int = orphanIndexPaths().size
+
+    /**
+     * 存储状态是否已就绪（当前卷列表非空）。
+     *
+     * 设置页在弹「清理不可达索引」确认框**之前**必须先问这一句：卷列表为空时
+     * [orphanIndexPaths] 恒返回空集（见其空集守卫），此时既不能按条数判断，也绝不能给出「清 N 条」
+     * 的破坏性确认框。
+     */
+    fun storageReady(): Boolean = FileLocations.storageState.value.volumes.isNotEmpty()
 
     /**
      * 删除全部不可达索引（播放历史经外键级联删除）。@return 实际删除的条数

@@ -10,12 +10,16 @@
 > ② **权限冗余**：删 `ACCESS_WIFI_STATE`（唯一使用者 `NetUtils.wifiManager()` 是死代码，且新系统无定位权限时
 > SSID 恒为空占位值）与重复声明的 `ACCESS_NETWORK_STATE`（media3 已声明且 Coil 的 `RealNetworkObserver` 依赖它，
 > 删本工程那行 APK 里照样存在，只是不再重复声明）；
-> ③ **适配·高危：Android 16 在大屏忽略 `screenOrientation`** —— 官方行为变更：最小宽度 ≥ 600dp 的屏幕忽略
-> screen orientation / aspect ratio / resizability 限制，且 **API 37 将移除 opt-out**。三个 Activity 均锁 `landscape`，
-> 而顶部导航栏是**不换行** `Row`、非紧凑态整行约需 **1050dp** ⇒ 平板竖屏 / 桌面窄窗口下右侧「设置」标签与
-> 状态徽标被**挤出屏幕**。修法**双管齐下**：(a) 清单声明 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY`
-> 恢复旧行为（**有保质期的安全网**）；(b) 新增 `TOP_BAR_FULL_WIDTH_DP = 960` + `rememberTopBarTight()`，
-> 宽度不足时真正收窄顶部栏（→ 约 470dp）。阈值**严格小于电视标准最小宽度 960dp** ⇒ 标准电视逐像素不变；
+> ③ **适配·高危：Android 16 在大屏忽略 `screenOrientation`** —— 官方行为变更：**最小宽度（smallestWidth）≥ 600dp** 的
+> 屏幕忽略 screen orientation / aspect ratio / resizability 限制，且 **API 37 将移除 opt-out**。三个 Activity 均锁 `landscape`，
+> 而顶部导航栏是**不换行** `Row`、非紧凑态整行约需 **950dp** ⇒ 平板竖屏 / 桌面窄窗口下右侧「设置」标签与
+> 状态徽标被**挤出屏幕**。（**手机 sw 360~450dp 与 1080p 电视 sw 540dp 都 < 600dp**，落在官方例外清单
+> *Displays smaller than sw600dp* 内，**不受影响**；真正受影响的是平板 / 大折叠内屏 / 桌面窗口模式。
+> 注意判据是 smallestWidth 而非屏幕宽度 —— 960dp 是电视的**宽度**，不是它的最小宽度。）修法**双管齐下**：
+> (a) 清单声明 `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` 恢复兼容模式（**有保质期的安全网** —— API 37
+> 移除，且官方明确 *targetSdk ≥ 36 时该属性并不锁定大屏方向*）；(b) 新增 `TOP_BAR_FULL_WIDTH_DP = 960` +
+> `rememberTopBarTight()`，宽度不足时真正收窄顶部栏（→ 约 400dp）。阈值取「严格小于 1080p 电视常见宽度
+> 960dp」⇒ 该类电视逐像素不变，**但估算需求 ≈950dp 余量仅约 10dp，待真机实测**；
 > 内容区缩放仍由 `CompactContentDensity` 按高度独立负责，两者判据互不影响；
 > ④ **`MainActivity` 补 `configChanges`**（另两个 Activity 早有）—— 方向锁失效后旋转 / 改窗口尺寸会重建
 > Activity，`showSettings` 等普通 `remember` 状态会被丢掉（`selected` 有 `rememberSaveable` 所以能活）；
@@ -478,7 +482,7 @@ DAO 全部 suspend 协程函数（无 RxJava）；仓储是 UI/服务器层访�
 **入口与形态**：原 `ServerModeDialog`（保活模式三选一小弹框）已删除。设置改为**独立子页面**，由 `MainScreen` 的内容区承载（顶部导航栏不变）；导航栏右侧「设置」入口与媒体标签以弹性间距分隔，**聚焦即打开**（`onFocusChanged` 中置 `showSettings = true`，焦点保持在标签上），按 ↓ 经 `settingsFocusTicket` 票据进入内容（与媒体页 `contentFocusTicket` 同一机制）。
 
 **布局**：左侧分组列表（`SettingGroup`：服务器与网络 / 播放设置 / 界面设置 / 存储与数据 / 关于）+ 右侧详情面板（`SettingRow` 行：标签 + 当前值 + ▸）。居中布局，聚焦样式复用 `tvFocus()`。
-**两栏各自可滚动（v1.20）**：左栏 `fillMaxHeight().verticalScroll(…)`、右栏 `weight(1f).fillMaxHeight().verticalScroll(…)`——矮屏上两栏内容都可能高于一屏（左栏 5 个分组 + 标题、右栏「存储与数据」7 行）。内容装得下时内层 Column 的 `minHeight` 由 `fillMaxHeight` 撑满、`Arrangement.Center` 照旧居中（**逐像素与改造前一致**），装不下才滚动；右栏滚动状态随 `selectedGroupIndex` 重建，切换分组回到顶部。详见 §3.21。
+**两栏各自可滚动（v1.20）**：左栏 `fillMaxHeight().verticalScroll(…)`、右栏 `weight(1f).fillMaxHeight().verticalScroll(…)`——矮屏上两栏内容都可能高于一屏（左栏 5 个分组 + 标题、右栏「存储与数据」9 行，v1.20 当时为 7 行）。内容装得下时内层 Column 的 `minHeight` 由 `fillMaxHeight` 撑满、`Arrangement.Center` 照旧居中（**逐像素与改造前一致**），装不下才滚动；右栏滚动状态随 `selectedGroupIndex` 重建，切换分组回到顶部。详见 §3.21。
 设置项**已全部接通**（v1.4），因此 `SettingRow` 的灰色「待实现」徽标（原 `pending` 参数）已随最后两项接线一并移除。
 
 **焦点规范（v1.4 落地）**：
@@ -1137,6 +1141,7 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 | 场景 | 曾把 U 盘设为存储位置并入库，之后该盘被**永久移除 / 换盘**（或用户改选内部存储后再也不插回） |
 | 为什么以前清不掉 | 对账的「同步外部删除」走 [FileLocations.existsForPath]，判据是「读不到 ≠ 被删」——路径**不属于任何已知卷**时也恒返回 `true`；媒体库展示又按活动沙盒过滤 → 这些记录**既看不到、也永不清理** |
 | 修法 | `MediaRepository` 新增 `orphanIndexPaths()`：判据换成「路径连**所属卷都不在** `storageState.volumes` 里」——比「卷在位但 `available=false`（首选盘已拔出）」**更严格**，后者插回即可复活，**不在清理范围**。设置页「存储与数据」新增「**清理不可达索引**」：点开先 `countOrphanIndexes()` 报条数（0 条直接 Toast 提示），确认弹框（`destructive = true`）写明风险后 `purgeOrphanIndexes()` 删除（经外键 CASCADE 连带播放历史） |
+| **空集守卫**（v1.30 回归自查补） | `volumes` **可能为空**（`FileLocations.refresh()` 在 `appContext == null` 时退化成空列表并写回状态流）⇒ `roots = []` 会让 `none{}` **恒真**、**全表被判成孤儿**：用户点一次确认框就删掉整个索引，并经 CASCADE **清空全部播放历史**（索引可重扫回来，播放进度不可恢复）。故 `orphanIndexPaths()` 开头 `if (roots.isEmpty()) return emptyList()`，另新增 `storageReady()`（= 卷列表非空）；设置页在**弹确认框之前**先问它，未就绪只 Toast「存储状态尚未就绪，请稍后再试」、**不给破坏性确认框**。两道防线叠加后，退化路径下 `purgeOrphanIndexes()` 只会删 0 条 |
 
 > 设计取舍：**没有**做成自动清理。因为「盘只是临时拔出」与「盘已永久移除」在系统层面无法区分，
 > 自动删会直接违反本项目的核心不变式。故只提供**用户显式触发 + 二次确认**的出口。
@@ -1147,8 +1152,24 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 `ImageLoader$Builder.build$lambda$34` → `coil.util.SingletonDiskCache.get(context)`，
 目录名常量 `DIRECTORY = "image_cache"`（即 `cacheDir/image_cache`，LRU 有上限）。
 它不在媒体沙盒里、「存储空间占用」统计不到、前端无入口 → 新增 `FileUtils.cacheSizeBytes(context)` /
-`clearAppCache(context)`（只删 `cacheDir` 的**子项**，目录本身保留），设置页新增「**清理缓存**」行
-（显示当前占用，确认后清理并在同一批里顺带清上传残留）。
+`clearAppCache(context)`，设置页新增「**清理缓存**」行（显示当前占用，确认后清理并在同一批里顺带清上传残留）。
+
+**v1.30 回归自查修正（重要）**：初版的 `clearAppCache` 是 `listFiles()?.forEach { it.deleteRecursively() }` ——
+这会把 Coil 的 `image_cache` 连同 journal **直接删掉**。而 Coil 的 `DiskCache` 是**进程级单例**
+（`SingletonDiskCache`），其 `DiskLruCache` 的 `initialized` 标志**只执行一次**、目录被外部删除后**不会重建**，
+`RealDiskCache` 自身也**没有任何 try/catch** ⇒ 内存记账（`lruEntries`/`size`）与磁盘脱节、`journalWriter`
+指向已 unlink 的 inode，之后写缓存会抛 `FileNotFoundException`。现改为**先走 Coil 自己的入口**：
+
+```kotlin
+// ① 先让 Coil 自己清：内部即 DiskLruCache.evictAll()，会同步清内存记账 + 删条目 + 写 journal
+runCatching { Coil.imageLoader(context).diskCache?.clear() }
+// ② 再扫 cacheDir 其余子项兜底，但**跳过** image_cache 目录本身（只清它的内容，不删目录）
+if (child.name != COIL_DISK_CACHE_DIR) child.deleteRecursively()
+```
+
+`COIL_DISK_CACHE_DIR = "image_cache"` 仅用于**跳过**，**绝不**用于直接删除。
+> 泛化教训：清理**第三方库**的缓存目录**必须**走它自己暴露的 `clear()`；直接删目录会打坏该库的内存状态
+> （本项目的「清理缓存」入口只清 `cacheDir` 一处，但同样的坑适用于任何库自管目录）。
 
 #### 3.26.4 上传记录表留下「看不见也删不掉」的尾巴
 
@@ -1252,38 +1273,50 @@ v1.26 的排序改动让用户第一次盯着顶部看实时上传才暴露。
 #### 3.27.5 【高危】Android 16 在大屏忽略 `screenOrientation`
 
 官方行为变更原文：*Android 16 (API level 36) ignores screen orientation, aspect ratio, and app
-resizability restrictions* —— 适用于**最小宽度 ≥ 600dp** 的屏幕（平板、大折叠内屏、桌面窗口模式），
-且 **opt-out 将在 API 37 被移除**。本项目三个 Activity 全部写死 `android:screenOrientation="landscape"`。
+resizability restrictions* —— **判据是 `smallestWidth ≥ 600dp`**，且 **opt-out 将在 API 37 被移除**。
+官方同时给出了**例外清单**，明确排除 *Displays smaller than sw600dp*、游戏（`android:appCategory`）
+与用户在系统里主动选择应用默认行为者。本项目三个 Activity 全部写死
+`android:screenOrientation="landscape"`。
 
 影响分级（关键：**不是所有设备都受影响**）：
 
-| 设备 | 最小宽度 | 是否受影响 |
+| 设备 | 最小宽度 smallestWidth | 是否受影响 |
 | --- | --- | --- |
-| 手机（含本项目的「矮屏」形态） | 360~450dp | **不受影响** —— 矮屏机制照旧有效 |
-| 电视 / 盒子 | 常见 960dp | 命中，但**电视天然不旋转**，实际无感 |
-| 平板 / 大折叠 / 桌面窗口 | ≥ 600dp | **真的会变竖屏 / 任意尺寸窗口** |
+| 手机（含本项目的「矮屏」形态） | 360~450dp | **不受影响** —— sw < 600dp，落在官方例外清单内，且矮屏机制照旧有效 |
+| 电视 / 盒子（1080p，标准配置 960×540dp） | **540dp** | **不受影响** —— sw < 600dp，同属官方例外清单。且电视天然不旋转，无论命中与否都无感 |
+| 平板 / 大折叠内屏 / 桌面窗口 | ≥ 600dp | **真的会变竖屏 / 任意尺寸窗口** |
 
-具体后果（`MainScreen` 顶部导航栏）：该行是**不换行、不滚动**的 `Row`（品牌标题 + 5 个媒体标签 +
-`Spacer(weight)` + 设置标签 + 状态徽标）。按非紧凑态估算：行内边距 80 + 品牌标题约 150 + 标题后间距 28
-+ 5 个标签约 460 + 标签间距 70 + 设置标签约 92 + 间距 20 + 状态徽标约 151 ≈ **1050dp**。
+> ⚠️ **易错点（本文档 v1.30 初版写错过，勿再照抄）**：判据是 **smallestWidth**（竖屏方向的最短边），
+> **不是「屏幕宽度」**。1080p Android TV 的标准配置是 960×**540**dp（密度 2.0）—— **960dp 是它的宽度，
+> 540dp 才是它的最小宽度**。初版把 960 当作「电视的最小宽度」并据此判它「命中」，是错的；
+> 结论「电视无感」虽然仍成立，但理由必须换成「sw 不够」。
+
+具体后果（`MainScreen` 顶部导航栏）：该行是**不换行、不滚动**的 `Row`（品牌标题 + **4 个媒体标签** +
+`Spacer(weight)` + 设置标签 + 状态徽标）。按非紧凑态估算：行内边距 80 + 品牌标题约 160 + 标题后间距 28
++ **4** 个标签约 368（每个 `30.dp`×2 padding + 2 个汉字 @ 16sp）+ 标签间距 56（**循环内**每标签后各一个，
+末个也算）+ 设置标签约 92 + 间距 20 + 状态徽标约 150 ≈ **950dp**。
 平板竖屏可用宽约 800dp ⇒ **右侧「设置」标签与状态徽标被挤出屏幕**。
 
-> 为什么此前没人发现：紧凑态同一行只要约 **470dp**，手机横屏（640dp+）恰好装得下；
-> 而 lock landscape 让这一行在电视上永远是宽屏，1050dp 的需求从未被触碰。
+> 为什么此前没人发现：收窄态同一行只要约 **400dp**，手机横屏（640dp+）恰好装得下；
+> 而 lock landscape 让这一行在电视上永远是宽屏，950dp 的需求从未被触碰。
 
 修法**双管齐下**（缺一不可）：
 
 1. **清单 opt-out（安全网，有保质期）**：`<application><property
    android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY" android:value="true"/>`
-   让系统在 API 36 上继续尊重旧的横竖屏 / 尺寸限制。
+   让系统在 API 36 上把应用放回兼容模式、继续尊重旧的横竖屏 / 尺寸限制。
    **不能只靠它**：① API 37 移除该 opt-out；② 官方明确「**桌面窗口模式下即使 opt-out，屏幕方向限制
-   也会被覆盖**」，只剩可调整大小性被尊重。
+   也会被覆盖**」，只剩可调整大小性被尊重；③ 官方在 Jetpack Compose 适配指南里另有一句更要紧的表述 ——
+   *If your app targets Android 16 (API level 36) or higher, this property doesn't lock the display
+   orientation or prevent screen rotation on large displays*，即对**本工程（targetSdk 36）**而言
+   它**未必真能锁住大屏方向**。所以下面的代码侧自适应是**必需项**，不是加分项。
 2. **代码侧真正具备宽度自适应（治本）**：新增常量与判据（`ui/common/CompactUi.kt`）——
    `TOP_BAR_FULL_WIDTH_DP = 960` 与 `rememberTopBarTight()`：**高度 < 480dp（矮屏）或宽度 < 960dp**
    任一成立即收窄顶部栏。收窄内容 = 隐藏品牌标题 + 标签改紧凑字号与内边距 + 徽标只留指示圆点
-   → 整行降到约 **470dp**。
-   **阈值为何取 960 而非 1050**：960dp 是 1080p 电视 / 盒子的标准最小宽度，取「严格小于」保证
-   **标准电视逐像素不变**；而一旦宽度 < 960dp 就必然装不下，此时收窄严格优于右侧被裁掉。
+   → 整行降到约 **400dp**。
+   **阈值为何取 960**：960dp 是 1080p Android TV 的**常见宽度**（标准配置 960×540dp），取「严格小于」
+   保证**该类电视不收窄、逐像素不变**（本项目硬要求）。**但这条判据的余量很薄**：估算需求 ≈950dp 与
+   960 只差约 10dp，字体度量与 `letterSpacing` 的累积误差都可能吃掉它。
 3. **`MainActivity` 补 `configChanges`**：`PlayerActivity` / `ImageViewerActivity` 早已声明
    `orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode`，主界面漏了 ——
    方向锁失效后旋转 / 改窗口尺寸会**重建 Activity**。`selected` 用了 `rememberSaveable` 所以能活，
@@ -1292,6 +1325,12 @@ resizability restrictions* —— 适用于**最小宽度 ≥ 600dp** 的屏幕�
 **判据分层（重要，别混）**：顶部栏用 `rememberTopBarTight()`（高度 **或** 宽度），
 内容区缩放用 `CompactContentDensity`（只看高度）。两者刻意独立 —— 平板竖屏（高约 1000dp）时
 内容区仍按电视尺度排版，但顶部栏必须收窄才不会溢出。
+
+> **已知待验（v1.30 唯一未闭环项）**：`TOP_BAR_FULL_WIDTH_DP = 960` 与估算需求（≈950dp）余量仅约
+> 10dp，**尚未在真机 1080p 电视上验证右端徽标是否被裁**。当前策略是**保持 960 不动、真机实测再定**
+> —— 保持现状对现有电视零风险（不收窄 ⇒ 视觉逐像素不变）。若实测确有裁切，二选一：
+> ① 上调阈值（代价：1080p 电视也进入收窄态，改变现有电视视觉）；
+> ② 改为**不依赖阈值的自适应**（品牌标题可隐藏、徽标文字可省略，由剩余空间自行压缩）。
 
 #### 3.27.6 备份规则改为排除数据库
 
