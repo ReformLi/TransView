@@ -1,7 +1,15 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.30　日期：2026-09-17
+> 版本：v1.32　日期：2026-09-18
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.32 变更：**返回键 / 焦点消失真机 bug 修复**（详见 §3.6「焦点体系」）——
+> ① 根因：遥控器按返回键时系统**会在派发 Back 的过程中先清空焦点**，而返回键分层与媒体库焦点
+> 还原的判据此前全部建在 `hasFocus` 上 ⇒ 判据在 `BackHandler` 里恒为 false（设置页早已实测到该
+> 行为，那里的对策是 `onPreviewKeyEvent` 提前拦截，本次保留不动）；
+> ② 改为「记录最后聚焦过谁」（`MainScreen.focusedTabIndex`、`LibraryScreen.remoteFocus()`），对清空免疫；
+> ③ 送焦点统一改用 **`requestFocusVerified()`**（真实焦点状态校验 + 帧门控重试 + 失败吐票据兜底）——
+> `requestFocusNextFrame()` 的返回值几乎恒为 `true`，历史重试循环实为**死代码**，首次请求被丢弃后
+> 焦点就停在「无人持有」状态（模拟器清空时机不同，该 bug 只在真机暴露）。
 > v1.30 变更：**权限配置与适配兼容性专项审查**（详见 §3.27）——
 > ① **权限缺口**：`POST_NOTIFICATIONS` 清单早已声明却**从未运行时申请** ⇒ Android 13+ 上通知被静默丢弃，
 > 而前台服务常驻通知是用户了解服务器状态（运行中 / 已休眠 / 已暂停）的**唯一**途径。新增
@@ -428,9 +436,18 @@ com.hpu.transview
     确认后先把焦点停靠到列表头「清空所有记录」（`showFocusVisual = false` 抑制过渡高亮），再把 `pendingFocusId` 设为**下一条**记录（已是最后一条则退到上一条），由该行 `autoFocus` 在下一帧抢回；列表即将清空时没有落点，交给自然回退（页面仍是「上传」页，不会切走）。另有 `LaunchedEffect(focusParking)` 800ms 超时兜底复位。
   - 实测：删除中间一条 → 焦点落到下一条；删除最后一条 → 焦点退到上一条。
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。
+- **返回键判据绝不能建在 `hasFocus` 上（v1.32 真机修复）**：遥控器按返回键时**系统会在派发 Back 的过程中先清空焦点** —— `BackHandler` 执行那一刻读 `hasFocus` 已是 `false`（本工程最早在设置页实测到：那里的对策是在内容区 `Row` 上挂 `onPreviewKeyEvent`，抢在清空之前拦截）。
+  - 真机症状（模拟器不复现——清空时机不同）：焦点在视频 / 图片 / 其他内容区时按返回，**焦点消失**（既不在标签栏也不在内容区）；再按一次返回或按上键焦点才回到标签栏，而且按上键会「平移标签栏」落到相邻标签上（那已是框架在「无人持有焦点」时的兜底几何搜索，落到哪个标签不由我们决定）。媒体库内按返回则不再把焦点还原到刚离开的那个文件夹。
+  - 修法一：**记录「最后聚焦过谁」**。`MainScreen.focusedTabIndex`（`NO_TAB_FOCUSED = -1` 表示不在标签栏；媒体标签占 `0..3`；「设置」占 `SETTINGS_TAB_INDEX = 4`，即 `MainTab.entries.size`）—— 每个标签只在 `isFocused == true` 时写自己的槽位，**焦点被清空时刻意不写**，因此对清空免疫；焦点进入内容区（含设置页 / 媒体网格 / 上传列表）时由内容区在 `hasFocus == true` 时写回 `-1`，于是该记录恒等于「焦点最后落在哪一侧」。顶部栏那行 `Row.onFocusChanged { topBarFocused = it.hasFocus }` **已删除**；「离开标签栏即取消未完成的双击退出确认」也改由内容区获得焦点时重置 —— 注意**不能在失焦(`hasFocus == false`)时重置**，那正是清空触发的回调，会让「再按一次返回退出」同样失效。
+  - 修法二：**送焦点必须校验真实落焦**（`requestFocusVerified`，见下一节），且用记录型判据校验时**必须先清空记录再请求**，否则「旧值恰好等于目标」会让第一次尝试就误判成功。
+- **媒体库的「遥控器路径」判据（v1.32 修复同一根因）**：`LibraryScreen.remoteFocus() = !isTouchMode || gridHasFocus`，取代原先的 `val hadFocus = gridHasFocus`。原写法本身合理（先捕获，因为 `parkFocusSafe()` 会同步把 `gridHasFocus` 写成 `false`），**但按返回键那条路径上它早已被系统清空** → `goUp()` 里 `if (hadFocus) pendingFocusPath = leaving` 恒不成立 → 「返回上一级后焦点还原到刚离开的文件夹」失效（即用户反馈的「返回后没达到想要的效果」；`openEntry` / `performDelete` 用同一个 guard，是同一颗定时炸弹）。改用与焦点状态无关的「输入来源」判断后对清空免疫：非触摸模式即遥控器/键盘路径，或触摸模式下网格确实持有焦点（触屏设备上刚用过方向键）仍需接住焦点。
 - **标签焦点回调里「退出设置页」必须无条件执行**：媒体标签早期写法是 `if (isFocused && tab != selected) { selected = tab; showSettings = false }`——把 `showSettings = false` 和「切换标签」绑进了同一个条件。当 `selected` 恰好就是目标标签时条件不成立（典型路径：「其他」页 → 聚焦「设置」→ 按 ← 回「其他」，`selected` 一直是 `OTHER`、根本没变），于是 `showSettings` 停在 `true`，**内容区继续显示设置页，只有标签选中态变了**（用户实测反馈）。修法：焦点落到任一媒体标签即先无条件 `showSettings = false`，再按需更新 `selected`。
 - 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；
   请求焦点统一走 `requestFocusNextFrame()`（`withFrameNanos {}` 让出一帧再 `requestFocus()`）——LazyGrid 项刚组合、尚未完成布局时 `requestFocus()` 会抛 `IllegalStateException` 被 `runCatching` 静默吞掉，表现为「焦点还原没反应」。
+- **`requestFocusNextFrame()` 的返回值不是「是否聚焦成功」（v1.32 定论，别再据此判成败）**：`FocusRequester.requestFocus()` 只在请求器未附着到焦点节点时抛异常，**被焦点系统静默丢弃时既不抛也不返回 `false`**，故其 `runCatching { }.isSuccess` 几乎恒为 `true`。历史写法 `repeat(10) { if (requestFocusNextFrame()) return@launch }`（主界面三个 `focus*` 函数）因此在**第一次**尝试后就返回 —— 那 10 次重试是死代码，一旦首次请求被丢弃，焦点就停在「无人持有」状态（真机「按返回键后焦点消失」的另一半原因）。
+  - 需要「确保真的落焦」时一律改用 **`requestFocusVerified(attempts, isFocused)`**（`ui/common/TvComponents.kt`）：帧门控重试 + **用真实焦点状态校验**，只有确认落焦才返回 `true`；每次尝试都先在帧回调内发起请求，相邻尝试间隔 16ms。
+  - 校验判据必须是**真实焦点状态**（节点的 `isFocused` / `hasFocus`，或 `focusedTabIndex` 这类「最后聚焦过谁」的记录），但**不能拿 `hasFocus` 当「刚才在哪」的判据**（Back 会清空它）。
+  - **失败必须兜底**：主界面三个送焦点函数在返回 `false` 时把「聚焦首行」票据（`contentFocusTicket` / `settingsFocusTicket`）投给内容区，保证焦点绝不无人持有 —— 焦点无人持有正是「按方向键落到相邻标签 / 页面被误切」的入口。`MediaCard` / `UpCard` / 设置页 `rowFocused` 用的是「循环 + 读真实状态判定」，本就是正确写法。
 - 播放器/查看器根节点 `focusable()` 常驻焦点，浮层隐藏后 `FocusRequester` 归位（控制栏显示 → 落到播放/暂停按钮；隐藏 → 回根节点），遥控器永不失焦。
 
 ### 3.7 服务器智能保活（ServerController 状态机）

@@ -228,6 +228,23 @@ fun LibraryScreen(
     var focusParking by remember { mutableStateOf(false) }
     // 网格（含卡片）当前是否持有焦点，见网格 modifier 注释
     var gridHasFocus by remember { mutableStateOf(false) }
+    // ——— 「遥控器 / 键盘路径」判据 ———
+    // 决定「切换目录 / 返回上级 / 删除前是否要停靠焦点（parkFocusSafe）并还原焦点」。
+    //
+    // 以前用的是 `val hadFocus = gridHasFocus`（先捕获，因为 park 会同步把它写成 false）。
+    // 判据本身没错，但**按返回键的那条路径上 gridHasFocus 早已被系统清成 false**：
+    // 遥控器按 Back 时系统会先清空焦点，等 goUp() 执行时读到的就是 false，于是
+    // 「返回上一级后把焦点还原到刚离开的那个文件夹」被 `if (hadFocus)` 挡掉 ——
+    // 真机症状正是「返回上一级成功、但焦点停在没有人的地方」；模拟器上清空时机不同，
+    // 恰好不复现（本工程在设置页早已实测过这个清空行为，见 SettingsScreen 的
+    // onPreviewKeyEvent 注释）。同一根因也影响 openEntry / performDelete 的焦点还原。
+    //
+    // 改用「输入来源」判断：它与焦点状态无关、对清空免疫。
+    //  ① 非触摸模式 → 遥控器 / 键盘交互，需要停靠 + 还原（正常路径）；
+    //  ② 触摸模式但网格确实持有焦点（触屏设备上刚才用过方向键 / 键盘）→ 仍需把焦点接住。
+    // 注：`LocalIsTouchMode.current` 只能在组合中读，故在此处取好、由下面的 lambda 捕获。
+    val isTouchMode = LocalIsTouchMode.current
+    val remoteFocus: () -> Boolean = { !isTouchMode || gridHasFocus }
     // 待聚焦目标路径（文件绝对路径 或 FOCUS_UP）；聚焦完成后置空
     var pendingFocusPath by remember(category) { mutableStateOf<String?>(null) }
     // 打开图片查看器 / 视频播放器：返回时带回「最后浏览/播放的文件路径」，
@@ -363,8 +380,11 @@ fun LibraryScreen(
     // 即使抢回失败，焦点也仍留在本页。停靠期间用 focusParking 抑制「排序」的聚焦高亮
     // （否则过渡帧里排序会高亮一闪再跳走，用户实测感官跳动）。
     val parkFocusSafe: () -> Unit = {
-        // touch 点按路径网格没有焦点，无需停靠
-        if (gridHasFocus) {
+        // 遥控器路径才停靠（判据见 remoteFocus —— 不能再用 gridHasFocus：按返回键时它已被系统
+        // 清空，会让「返回上级 / 删除」路径漏掉安全港，焦点在目录切变的过渡帧里无人持有，
+        // 一旦此刻有人触发焦点搜索就会命中顶部「上传」标签、页面被切走）。
+        // touch 点按路径网格本来没有焦点，无需停靠。
+        if (remoteFocus()) {
             focusParking = true
             runCatching { toolbarFocus.requestFocus() }
         }
@@ -402,9 +422,9 @@ fun LibraryScreen(
     val openEntry: (FileEntry) -> Unit = { entry ->
         when {
             entry.isDirectory -> {
-                // 先捕获：parkFocusSafe 会同步移动焦点，网格的 onFocusChanged 随即把
-                // gridHasFocus 写成 false，之后再读就丢失了（实测踩过）
-                val hadFocus = gridHasFocus
+                // 判据用 remoteFocus（**不要再用 gridHasFocus**：按返回键时它已被系统清空，
+                // 详见其声明注释）。只在遥控器路径停靠 + 还原焦点。
+                val hadFocus = remoteFocus()
                 parkFocusSafe()
                 currentDir = entry.path
                 // 操作轨迹（V，仅详细日志）：进入文件夹
@@ -438,14 +458,18 @@ fun LibraryScreen(
 
     val goUp: () -> Unit = {
         if (!atRoot) {
-            // 先捕获（原因同 openEntry：park 会同步移动焦点使 gridHasFocus 变 false）
-            val hadFocus = gridHasFocus
+            // 判据用 remoteFocus —— **这正是用户反馈的那个 bug 的根因**：
+            // 按返回键时 gridHasFocus 已被系统清空，`if (hadFocus)` 恒为 false，
+            // 于是「返回上一级」成功、但焦点没有还原到刚离开的那个文件夹，而是停在没有人的地方。
+            // 详见 remoteFocus 的声明注释。
+            val hadFocus = remoteFocus()
             parkFocusSafe()
             val leaving = currentDir
             currentDir = storage.parentNode(leaving) ?: rootPath
             // 操作轨迹（V，仅详细日志）：返回上一级
             AppLogger.v(TAG, "返回上一级：$leaving")
-            // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过
+            // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过。
+            // 效果与「聚焦「返回上级」卡片并按确定」完全等价：都回上一级 + 焦点落到对应文件夹。
             if (hadFocus) pendingFocusPath = leaving
         }
     }
@@ -468,8 +492,9 @@ fun LibraryScreen(
             }
             if (physicalOk) {
                 // 先离开这张即将消失的卡片，避免焦点回退到顶部「上传」标签把页面切走。
-                // hadFocus 先捕获（原因同 openEntry：park 会同步移动焦点使 gridHasFocus 变 false）
-                val hadFocus = gridHasFocus
+                // 判据用 remoteFocus（原因同 goUp：删除若由返回键相关路径触发，gridHasFocus 已不
+                // 可信；详见其声明注释），遥控器路径才停靠 + 把焦点移到下一个卡片。
+                val hadFocus = remoteFocus()
                 parkFocusSafe()
                 mediaRepo.deleteByPath(entry.path)
                 // touch 路径跳过焦点还原（见 openEntry 注释）

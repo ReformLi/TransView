@@ -57,7 +57,7 @@ import com.hpu.transview.server.ServerBus
 import com.hpu.transview.server.ServerController
 import com.hpu.transview.ui.common.CompactContentDensity
 import com.hpu.transview.ui.common.rememberTopBarTight
-import com.hpu.transview.ui.common.requestFocusNextFrame
+import com.hpu.transview.ui.common.requestFocusVerified
 import com.hpu.transview.ui.common.LocalIsTouchMode
 import com.hpu.transview.ui.library.LibraryScreen
 import com.hpu.transview.ui.settings.SettingsScreen
@@ -68,11 +68,19 @@ import com.hpu.transview.ui.upload.UploadScreen
 import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileLocations.StorageEvent
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** 本页日志标签（AppLogger 落盘用） */
 private const val TAG = "MainScreen"
+
+/**
+ * `focusedTabIndex` 的哨兵值：焦点不在标签栏（在内容区 / 当前无人持有）。
+ * 媒体标签占用 `0..MainTab.entries.size-1`，见 [SETTINGS_TAB_INDEX]。
+ */
+private const val NO_TAB_FOCUSED = -1
+
+/** 「设置」标签在 `focusedTabIndex` 里的槽位：紧跟在 4 个媒体标签之后（= `MainTab.entries.size`）。 */
+private val SETTINGS_TAB_INDEX = MainTab.entries.size
 
 /** 主界面：顶部四标签导航 + 内容区 */
 @Composable
@@ -94,7 +102,20 @@ fun MainScreen() {
     // ——— 返回键退出：焦点在非「上传」标签时返回先回「上传」（默认最左标签，作为退出前的"家"位置）；
     // ——— 焦点在「上传」标签上按返回弹提示，2 秒内再按才真正退出（对齐手机端双击返回习惯）———
     val context = LocalContext.current
-    var topBarFocused by remember { mutableStateOf(false) }
+    // 「最后聚焦过哪个标签」的记录（[NO_TAB_FOCUSED] = 焦点不在标签栏）。
+    // **只在 isFocused == true 时写入，焦点被清空时刻意不写** —— 这是本处判据的关键。
+    //
+    // 此前用的是 `Row.onFocusChanged { topBarFocused = it.hasFocus }`，真机上直接失效：
+    // 遥控器按返回键时**系统会先清空焦点**（BackHandler 执行那一刻 hasFocus 已翻转，本工程在
+    // 设置页早已实测留下结论，见 SettingsScreen 的 onPreviewKeyEvent 注释）。于是按返回键的瞬间
+    // 判据就被清成 false，返回键分层恒走 else 分支。真机症状：焦点在视频内容区时按返回，
+    // 焦点消失（既不在标签栏也不在内容区）；再按一次返回或上键才回到标签栏，而且上键会
+    // 「平移标签栏」落到相邻标签上 —— 那已经是框架在「无人持有焦点」时的兜底几何搜索了。
+    // 模拟器上清空时机不同，恰好不复现，所以只在真机上暴露。
+    //
+    // 记录型判据对清空免疫（清空不写），因此恒等于「焦点最后落在哪一侧」：
+    // 各标签在 isFocused 时写自己的槽位；内容区（含设置页）在 hasFocus 时写回 [NO_TAB_FOCUSED]。
+    var focusedTabIndex by remember { mutableIntStateOf(NO_TAB_FOCUSED) }
     var lastBackTime by remember { mutableLongStateOf(0L) }
 
     // 触摸锚定计数：内容区被点按一次自增一次（见内容区 Box 的 focusable/pointerInput 注释）。
@@ -182,37 +203,47 @@ fun MainScreen() {
 
     // 把焦点送回顶部导航栏「当前选中的标签」：返回键、以及内容区工具条按上键时都用它。
     // 用 remember(selected) 捕获当前标签，避免闭包一直停在初始值。
-    // 帧门控重试：单次 requestFocus 可能静默失败（焦点停在内容区 / 左侧分组），
-    // 失败则 16ms 后再试，最多 10 次（与设置页弹框关闭的聚焦重试同一模式）。
+    //
+    // 送焦点必须「**校验真实落焦** + 跨帧重试 + 失败兜底」，不能只看 requestFocus 有没有抛异常：
+    // 该调用被焦点系统丢弃时是**静默**的（详见 requestFocusVerified 的注释），历史写法
+    // `repeat(10) { if (requestFocusNextFrame()) return@launch }` 会在第一次就返回、重试形同虚设，
+    // 于是「按返回键后焦点无人持有」在真机上长期存在。
+    // 校验判据用 focusedTabIndex，且**先清空再请求** —— 必须由「真的重新聚焦」把它写成目标值
+    // 才算成功（不清空的话，Back 清空焦点后记录里仍留着旧值，第一次尝试就会误判成功）。
+    // 兜底：确实送不到标签栏（窗口瞬时失焦 / 焦点系统拒绝）就把「聚焦首行」票据投给内容区 ——
+    // 焦点宁可落在内容区第一个元素上，也绝不能无人持有（无人持有时方向键会触发框架的
+    // 兜底几何搜索，落到相邻标签上，就是用户看到的「平移标签栏」）。
     val focusSelectedTab: () -> Unit = remember(selected) {
         {
             scope.launch {
-                val target = tabFocusRequesters[selected.ordinal]
-                repeat(10) {
-                    if (target.requestFocusNextFrame()) return@launch
-                    delay(16)
-                }
+                focusedTabIndex = NO_TAB_FOCUSED
+                val ok = tabFocusRequesters[selected.ordinal]
+                    .requestFocusVerified { focusedTabIndex == selected.ordinal }
+                if (!ok) contentFocusTicket++
             }
         }
     }
 
-    // 把焦点送回顶部「设置」标签（设置页内容区按上键时触发），同样带帧门控重试。
+    // 把焦点送回顶部「设置」标签（设置页内容区按上键时触发），校验 + 重试 + 兜底同上。
     val focusSettingsTab: () -> Unit = {
         scope.launch {
-            repeat(10) {
-                if (settingsFocusRequester.requestFocusNextFrame()) return@launch
-                delay(16)
+            focusedTabIndex = NO_TAB_FOCUSED
+            val ok = settingsFocusRequester.requestFocusVerified {
+                focusedTabIndex == SETTINGS_TAB_INDEX
             }
+            // 送不到标签栏就把票据投给设置内容区（落到首个分组），避免焦点无人持有
+            if (!ok) settingsFocusTicket++
         }
     }
 
-    // 返回键把焦点送回「上传」标签（选中态由标签 onFocusChanged 自动跟随），带帧门控重试。
+    // 返回键把焦点送回「上传」标签（选中态由标签 onFocusChanged 自动跟随），校验 + 重试同上。
     val focusUploadTab: () -> Unit = {
         scope.launch {
-            repeat(10) {
-                if (tabFocusRequesters[MainTab.UPLOAD.ordinal].requestFocusNextFrame()) return@launch
-                delay(16)
+            focusedTabIndex = NO_TAB_FOCUSED
+            val ok = tabFocusRequesters[MainTab.UPLOAD.ordinal].requestFocusVerified {
+                focusedTabIndex == MainTab.UPLOAD.ordinal
             }
+            if (!ok) contentFocusTicket++
         }
     }
 
@@ -220,22 +251,28 @@ fun MainScreen() {
     // ② 焦点在顶部标签栏：非「上传」标签先回「上传」（退出前的"家"位置）；
     //    在「上传」标签上按返回弹提示，2 秒内再按才真正退出（只关界面，服务器服务照常运行）；
     // ③ 焦点在内容区根目录 → 回当前选中标签。
+    // 判据一律用 focusedTabIndex（「最后聚焦过谁」的记录），**不要用 hasFocus** ——
+    // 按返回键时系统会先把焦点清空，hasFocus 判据在 BackHandler 里恒为 false（见其声明注释）。
     // 必须用 BackHandler 而非 Modifier.onKeyEvent —— onKeyEvent 只在焦点路径上才收得到事件，
     // 从播放页返回后内容区焦点为空时会漏掉返回键，Activity 被系统直接 finish（表现为「返回键退出 App」）。
     BackHandler {
+        val tab = focusedTabIndex
         when {
-            // 焦点在媒体标签（非「上传」）→ 先回「上传」
-            topBarFocused && !showSettings && selected != MainTab.UPLOAD -> focusUploadTab()
             // 焦点在「上传」标签 → 双击返回退出（2 秒窗口，离开上传标签即取消确认）
-            topBarFocused && !showSettings && selected == MainTab.UPLOAD -> {
+            !showSettings && tab == MainTab.UPLOAD.ordinal -> {
                 val now = SystemClock.uptimeMillis()
                 if (now - lastBackTime <= 2000L) {
                     (context.findActivity())?.finish()
                 } else {
                     lastBackTime = now
                     Toast.makeText(context, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show()
+                    // 焦点可能刚被 Back 清空：送回「上传」标签，保持焦点环可见（失败则由票据兜底）。
+                    // 注意这里**不能**重置 lastBackTime —— 焦点仍在「上传」标签，双击窗口要继续计。
+                    focusUploadTab()
                 }
             }
+            // 焦点在其它标签（三个媒体标签，以及「设置」标签的兜底）→ 先回「上传」
+            !showSettings && tab != NO_TAB_FOCUSED -> focusUploadTab()
             // 其余（焦点在内容区等）→ 回当前选中标签（原行为）
             else -> focusSelectedTab()
         }
@@ -251,14 +288,11 @@ fun MainScreen() {
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = if (topBarTight) 16.dp else 40.dp, vertical = if (topBarTight) 8.dp else 20.dp)
-                // 跟踪「焦点是否在标签栏」：返回键据此区分「标签上的返回（回上传/退出）」与
-                // 「内容区的返回（回选中标签）」。hasFocus 含子树（四个媒体标签 + 设置标签）。
-                // 焦点离开标签栏（进入内容区 / 设置页）→ 取消未完成的「再按一次退出」确认。
-                .onFocusChanged { state ->
-                    topBarFocused = state.hasFocus
-                    if (!state.hasFocus) lastBackTime = 0L
-                },
+                .padding(horizontal = if (topBarTight) 16.dp else 40.dp, vertical = if (topBarTight) 8.dp else 20.dp),
+            // 注：这里**不再**挂 `onFocusChanged { topBarFocused = it.hasFocus }`。
+            // 「焦点在不在标签栏」改由各标签自己写 focusedTabIndex（记录「最后聚焦过谁」），
+            // 因为按返回键时系统会先清空焦点，hasFocus 判据在 BackHandler 里恒为 false；
+            // 「离开标签栏即取消未完成的退出确认」也改由内容区在获得焦点时重置（见内容区 Box）。
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (!topBarTight) {
@@ -281,6 +315,11 @@ fun MainScreen() {
                     modifier = Modifier
                         .focusRequester(tabFocusRequesters[index])
                         .onFocusChanged { state ->
+                            // 记录「最后聚焦过的标签」——与 touchSuppressingTabSwitch 无关：
+                            // 那个 flag 管的是「要不要跟着切页」，焦点归属是客观事实，触摸注入的
+                            // 焦点会由内容区锚点随即写回 NO_TAB_FOCUSED（见内容区 Box）。
+                            // 只在 isFocused 时写、失去焦点不写，正是本记录能对抗「Back 清空焦点」的原因。
+                            if (state.isFocused) focusedTabIndex = index
                             // 触摸手势期间抑制「聚焦即选中」：requestFocusFromTouch() 的焦点搜索
                             // 会把焦点注入「上传」标签，不能让它误切页面（见上方 flag 注释）。
                             if (state.isFocused && !touchSuppressingTabSwitch) {
@@ -311,7 +350,13 @@ fun MainScreen() {
                 modifier = Modifier
                     .focusRequester(settingsFocusRequester)
                     .onFocusChanged {
-                        if (it.isFocused && !showSettings && !touchSuppressingTabSwitch) showSettings = true
+                        if (it.isFocused) {
+                            // 记录「最后聚焦过的标签」（理由同媒体标签）；「设置」占 SETTINGS_TAB_INDEX 槽位
+                            focusedTabIndex = SETTINGS_TAB_INDEX
+                            // 焦点离开「上传」标签 → 取消未完成的「再按一次退出」确认（与媒体标签同理）
+                            lastBackTime = 0L
+                            if (!showSettings && !touchSuppressingTabSwitch) showSettings = true
+                        }
                     }
             ) { showSettings = true }
             Spacer(Modifier.width(20.dp))
@@ -344,6 +389,19 @@ fun MainScreen() {
                 //     随后的方向键就从内容区开始搜索，自然落到本页第一个可聚焦元素
                 //     （记录首行 / 网格首项 / 设置首项）。焦点若仍被页面票据接管则更好。
                 // 遥控器按键不产生 Press 事件，因此不影响既有的遥控器焦点导航。
+                //
+                // ——— 焦点归属记录的另一半 ———
+                // 焦点进入内容区（含设置页 / 媒体网格 / 上传列表）即把 focusedTabIndex 写回
+                // NO_TAB_FOCUSED，并取消未完成的「再按一次退出」确认。
+                // **必须只在 hasFocus == true 时写**：按返回键时系统清空焦点也会触发本回调
+                // （hasFocus == false），但那不是「焦点去了内容区」，据此改写就又踩回
+                // hasFocus 判据的老坑（见 focusedTabIndex 的声明注释）。
+                .onFocusChanged {
+                    if (it.hasFocus) {
+                        focusedTabIndex = NO_TAB_FOCUSED
+                        lastBackTime = 0L
+                    }
+                }
                 .focusRequester(contentAnchor)
                 .focusable()
                 .pointerInput(Unit) {

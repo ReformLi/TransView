@@ -31,6 +31,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 
 /** 触屏模式：全局可观察，用于触屏交互时隐藏 TV 风格焦点环/描边，遥控器按键时恢复。 */
 val LocalIsTouchMode = compositionLocalOf { false }
@@ -57,10 +58,62 @@ fun ProvideTouchMode(content: @Composable () -> Unit) {
  * Lazy 列表/网格的项在组合完成的同一帧里可能还没完成布局，此时 [FocusRequester.requestFocus]
  * 会抛 IllegalStateException 被 `runCatching` 静默吞掉 —— 表现就是「焦点还原/焦点跳转没反应」。
  * 让出一帧等布局稳定后再请求，即可稳定命中。媒体库与上传页共用。
+ *
+ * ⚠️ **返回值不是「是否聚焦成功」**：`FocusRequester.requestFocus()` 只在请求器未附着到焦点节点时
+ * 抛异常，**被焦点系统静默丢弃时既不抛也不返回 false**，因此这里几乎恒为 `true`。
+ * 需要「确保真的落焦」的场景请用 [requestFocusVerified]，或照 `MediaCard` 的写法：
+ * 循环调用本函数、并用**真实焦点状态**（`focused` / `rowFocused`）判定成败。
  */
 suspend fun FocusRequester.requestFocusNextFrame(): Boolean {
     withFrameNanos { }
     return runCatching { requestFocus() }.isSuccess
+}
+
+/** [requestFocusVerified] 相邻两次尝试之间的间隔：让被丢弃的请求有跨帧生效的机会。 */
+private const val RETRY_GAP_MS = 16L
+
+/**
+ * 帧门控重试地把焦点送到 [this]，用 [isFocused] **校验真实结果**，确认落焦才返回 `true`。
+ *
+ * ## 为什么必须有「校验」这一层
+ * `FocusRequester.requestFocus()` 的失败是**静默**的：请求被焦点系统丢弃时既不抛异常、
+ * 也没有返回值可看，于是 `runCatching { requestFocus() }.isSuccess` 几乎恒为 true。
+ * 历史写法 `repeat(10) { if (requestFocusNextFrame()) return@launch }` 因此在**第一次**尝试后
+ * 就返回了 —— 那 10 次重试是死代码，一旦首次请求被丢弃，焦点就停在「无人持有」状态。
+ *
+ * ## 真机上为什么会被丢弃（本函数存在的直接原因）
+ * 遥控器按返回键时，**系统会在派发 Back 的过程中先清空焦点**（本工程在设置页实测过：
+ * `hasFocus` 在 `BackHandler` 执行那一刻已经翻转）。清空与「把焦点送回标签栏」的请求落在
+ * 同一帧前后，首次请求会被随后生效的清空覆盖掉。症状完全对得上用户反馈：
+ * 按返回键后焦点消失（既不在标签栏也不在内容区），**再按一次**返回或上键才回到标签栏、
+ * 而且可能落在错的标签上 —— 因为第二次按返回时焦点本就是空的，没有清空可覆盖，请求才生效；
+ * 而「没焦点时按上键」只能交给框架的兜底几何搜索，落到哪个标签不由我们决定。
+ * 模拟器上清空时机不同，且模拟器上这条路径恰好不复现。
+ *
+ * ## 用法约束
+ * - [isFocused] 必须读**真实焦点状态**：节点的 `isFocused` / `hasFocus` 状态，或
+ *   「最后聚焦过谁」的记录（如主界面的 `focusedTabIndex`）。
+ *   **不要用 `hasFocus` 直接当判据** —— 理由同上，Back 会把它清空。
+ * - 用「记录型」判据时，调用前必须**先清空该记录**，否则「旧值恰好等于目标」会让第一次
+ *   尝试就误判成功（这正是返回键场景最容易踩的坑）。
+ * - 请求必须在**帧回调内**发起（帧间隙调用会被静默丢弃，实测踩过），故每次尝试都先
+ *   [withFrameNanos]；相邻尝试之间再让出 [RETRY_GAP_MS]。
+ *
+ * @param attempts 最大尝试次数（每次约一帧 + [RETRY_GAP_MS]）
+ * @return 是否**确认**落焦成功。返回 `false` 时调用方必须走兜底路径（例如把「聚焦首行」
+ *         票据投给内容区），**绝不能放任「焦点无人持有」** —— 那正是本 bug 的现场。
+ */
+suspend fun FocusRequester.requestFocusVerified(
+    attempts: Int = 10,
+    isFocused: () -> Boolean
+): Boolean {
+    repeat(attempts) {
+        withFrameNanos { }
+        runCatching { requestFocus() }
+        if (isFocused()) return true
+        delay(RETRY_GAP_MS)
+    }
+    return false
 }
 
 /** 遥控器焦点效果：轻微放大 + 主色描边 + 底色变化，应用于任意可聚焦容器 */fun Modifier.tvFocus(
