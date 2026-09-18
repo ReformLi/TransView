@@ -695,6 +695,11 @@ fun SettingsScreen(
             // 焦点在「设置」标签时本 Row 不在焦点路径上 → 该事件回落到下面的 BackHandler。
             .onPreviewKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown && event.key == Key.Back) {
+                    // 取证（D）：本拦截器是设置页 Back 处理的入口，也是全工程唯一在
+                    // `onPreviewKeyEvent` 里拦 Back 的地方（它在焦点被清空之前执行，兼容性最好）。
+                    // 落一行日志便于事后区分：这条路径被命中 ⇒ Back 确实到达了 Compose 视图树；
+                    // 整段按 Back 完全没有这行、也没有 MainActivity 的 Back 日志 ⇒ 按键在更外层就被吞了。
+                    AppLogger.d(TAG, "Back 处理（设置页内容区）：焦点回「设置」标签")
                     onFocusTabs()
                     true
                 } else false

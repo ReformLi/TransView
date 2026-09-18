@@ -1,7 +1,51 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.33　日期：2026-09-18
+> 版本：v1.36　日期：2026-09-18
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.36 变更：**媒体库「文件夹消失又瞬间出现」+切目录「一卡一卡」修复**（完整根因与修法见 **§3.3.1**；焦点侧连带改动见 §3.6 修法十）——
+> ① 根因（诊断结论）：网格内容来自**两个速度差一个数量级的数据源**。**文件**来自 Room 的
+> `observeByType` 流（表已在内存），切目录**同一帧**就对；**文件夹**只能走真实磁盘 IO
+> （`listChildren` + 对**每个子文件夹**的递归校验 `FileUtils.hasValidContentIn`，DB 不索引文件夹），
+> 要晚若干帧、U 盘上可达数百毫秒。而拼装是 `dirEntries.filter { it.parentPath == currentDir }`：
+> 切目录那一帧 `dirEntries` 还装着上一个目录的列表，被新 `currentDir` **整批滤掉** ⇒ 首帧
+> 「0 个文件夹」，等扫描回来才整批出现 = 用户看到的闪烁。「返回上一级」**100% 命中**（它回到的目录
+> 刚看过却照样重扫）；「切换标签」更重 —— `when (selected)` 的三个分支是**不同调用点**，整棵子树被
+> dispose、全部 `remember` 重来，于是「转圈 → 只有文件 → 文件夹补上」**三层闪**叠加；
+> ② **A：按目录缓存文件夹列表**（`DirListCache`，模块级而非 `remember` —— 缓存必须活过切标签）：
+> 命中即**首帧即正确**，索引按 `活动存储 + 目录绝对路径`，失效走**惰性**（条目记下扫描时的「代」
+> `epoch`，访问到旧代才重扫并**原地覆盖**，绝不全局清空）；
+> ③ **C：消除数据源抖动**：`observeByCategory` / `observeAllProgress` **必须用 `remember` 固定 Flow
+> 实例** —— Room 每次调用都新建 Flow 对象，而 `collectAsState(initial)` 以**流对象本身**为 key ⇒
+> 原来**每次重组都重建订阅、重跑查询**（本页重组点很多），这是「一卡一卡」的另一半；`childCountMap`
+> 从组合期（主线程，`O(n·深度)`）移到 `produceState` + `Dispatchers.Default`；
+> ④ **「未就绪」不再当成「空」渲染**：加载态判据 `dbItems == null || !dirsReady || childCountMapOrNull == null`
+> 合并为**一次干净的过渡**，顺带修掉根目录闪 `EmptyHint`「暂无文件」的问题。
+> v1.35 变更：**返回键「一次按下被执行两遍」修复**（详见 §3.6「焦点体系」）——
+> ① 根因：真机遥控器的**一次返回可能投递两个抬起**（该遥控器的事件序列与键盘不同，OK 键上已实测：
+> 按住只送一串重复 `KeyDown` + 最后一个 `KeyUp`），而 v1.34 的补派发会让每个抬起都成为一次完整的
+> Back 处理 ⇒「**一次按下 = 两步操作**」。两条真机症状（用户 2026-09-18 反馈）：焦点在「上传」标签上按
+> **一次**返回就**直接退出应用**（先弹「再按一次返回键退出应用」、随即兑现）；文件夹里按**一次**返回
+> **连跳两级**、越过本分类根目录看到沙盒总目录里的 `Pictures`（「图片总文件夹」本不该从图片页到达）；
+> ② **源头去重**（`MainActivity.dispatchKeyEvent`）：抬起**没有配对的按下**且距上次处理 ≤ 150ms
+> （`BackKeySignal.DEDUP_MS`）⇒ 认定同一次物理按键，整条丢弃（W 级留痕，可直接作为证据）；
+> ③ **结果侧兜底**：退出确认增加**最小间隔** `EXIT_CONFIRM_MIN_MS` = 250ms —— 无论重复事件以何种形态
+> 漏过源头，都不可能「按一下就退出应用」；
+> ④ **媒体库 `goUp()` 三重加固**：判据改**实时** `currentDir`（不再用组合期的 `atRoot` —— 同一帧内它还是
+> 旧值，第二次调用就会从**新目录**再往上一级）、父目录**越界钳回分类根目录**（`IStorage.parentNode` 只钳在
+> **沙盒根**，分类根目录的父目录是合法返回值 ⇒ 必须自己拦）、150ms 内重复调用直接忽略。
+> v1.34 变更：**返回键「第一次按下完全无副作用」修复**（详见 §3.6「焦点体系」）——
+> ① 根因是**系统 Back 派发链本身可能断裂**，而非判据写错：旧语义下 `ACTION_DOWN` 必须走到
+> `Activity.onKeyDown` 才会 `startTracking()`，抬起时 `onKeyUp` 才凭 `isTracking()` 调
+> `onBackPressed()`；**DOWN 一旦被吞**（触摸模式退出按键被框架消费 / 焦点树消费 / 窗口焦点切换
+> 重置 tracking），整条链断掉、`BackHandler` 永不执行，而模拟器不产生这种切换故不复现；
+> ② `MainActivity.dispatchKeyEvent` 增加**最小侵入补派发**（仅当 `!isTracking || isCanceled`，
+> 即「系统一定不会派发」时才自己调一次并消费该 UP）。
+> ⚠️ 该结论在 **v1.35 被修正**：两个分支互斥只保证「同一个抬起不会被处理两次」，**不保证
+> 「一次物理按下只会产生一个抬起」** —— 后者才是真机上「一次按下 = 两步操作」的来源，已由
+> v1.35 的去重闸补上；
+> ③ 新增 `BackKeySignal` + 主界面**焦点兜底复检**：按完返回键 200ms 后若「标签栏无焦点且内容区
+> 无焦点、或焦点只停在隐形锚点上」，显式把焦点送回当前标签 —— 消除「↑ 恒定落到「图片」标签、
+> ← → ↓ 全无反应」这一框架几何搜索兜底的症状。
 > v1.33 变更：**返回键「退出不了应用」死循环修复**（详见 §3.6「焦点体系」）——
 > ① 根因是**代码级**的（不是机型特性）：标签聚焦记录只在 `isFocused == true` 时写，而目标
 > **本来就已经聚焦**时 `requestFocus()` 不产生任何焦点变化事件 ⇒ 记录永远等不到写入 ⇒
@@ -304,6 +348,7 @@ com.hpu.transview
 **列表来源与刷新**
 - 按需列目录（进入文件夹才 listFiles），千级文件无全量扫描压力；上传完成后经 `UploadBus` 事件自动刷新当前列表（新文件已由服务器层直接入库索引）。
 - 文件列表走 `MediaRepository.observeByCategory`（Room Flow 实时刷新）；抽屉/文件夹列表来自文件系统（DB 不索引文件夹）。
+- ⚠️ **这两个来源的速度差一个数量级**（v1.36 诊断出的全部闪烁根因）：文件来自**已在内存**的表，切目录**同一帧**就能给对；文件夹只能走**真实磁盘 IO**（`listChildren` + 对每个子文件夹的递归校验），要晚若干帧。任何「把两者拼进同一个列表」的写法都必须处理这个时间差，详见 §3.3.1。
 
 **布局：`LazyVerticalGrid(GridCells.Fixed(5))`，不提供单列列表**（`ViewMode` 枚举已删除）
 - 卡片统一 16:9 缩略图区 + 名称 + 副标题：文件夹=文件夹图标+「N 个文件」；视频=首帧+「时长·大小」；图片=首帧；其他=通用图标+大小。
@@ -325,12 +370,74 @@ com.hpu.transview
   - **长按确定的实现（v1.4 定稿，自计时 + 确认窗口，实测坑 ×3）**：① `combinedClickable` 的 `onLongClick` 对遥控器确定键长按**不生效**（foundation 未处理 FLAG_LONG_PRESS 按键事件，模拟器实测无反应；触摸长按仍有效）。② 不能在**按住期间**（收到 FLAG_LONG_PRESS KeyDown 时）就弹菜单——Dialog 弹出会抢走焦点，手一松的 KeyUp 落到菜单主按钮上直接误触「进入/播放」（真机实测踩过）；菜单必须在**松开瞬间**弹出。③ **不得信任事件时间戳**：真机遥控按住 OK 键只会送来一串重复 KeyDown + 最后一个 KeyUp（`downTime` 保持首次按下时间，`eventTime - downTime` 可靠）；而**键盘（经模拟器）的 auto-repeat 会被输入通路拆成一串独立「按下+抬起」对**，每对时间戳独立，`eventTime - downTime` 恒 ≈0ms——长按被误判为短按，且每次抬起都触发一次点击（=「长按变多次确定」，实测复现）。
     **最终方案**（`MediaCard` / `UpCard` 统一）：`onPreviewKeyEvent` **完全接管**确定键（`DirectionCenter / Enter / NumPadEnter / Spacebar`，置于 `combinedClickable` 之前，触摸路径仍走后者）——DOWN 全部吃掉（阻止 `combinedClickable` 逐对触发点击）并**自行用 `SystemClock.uptimeMillis()` 记录按下起点**（后续 auto-repeat 的 DOWN 只取消待触发的短按、不重置起点）；UP 时按压 ≥ `ViewConfiguration.getLongPressTimeout()` → 弹菜单；短按启动 `CONFIRM_GRACE_MS = 200ms` 确认窗口协程（窗口内无后续按下 = 用户真松手，排除 auto-repeat 中间抬起）才触发打开。焦点离开时（`onFocusChanged !isFocused`）置 `pressing = false` 并取消待触发协程，防悬挂状态。`UpCard` 同款处理防止按住连跳多级目录。
 - **进入子目录焦点直接落第一个条目（v1.3，`FOCUS_FIRST`）**：曾设计为落「返回上级」卡片（`FOCUS_UP`），但 UpCard 抢焦点与网格首项渲染存在时序竞争，用户实测看到「第一个文件先亮一下再跳回上级」的可见两段跳，多轮修复（帧门控重试、`hadFocus` 先捕获）仍无法根治；最终按用户意见改为**进入后直接聚焦第一个条目**（`pendingFocusPath = FOCUS_FIRST`，只命中 `index == 0` 的 MediaCard），仅一次落点、无竞争。空目录（网格只剩 UpCard）时由 `LaunchedEffect` 兜底改投 `FOCUS_UP`。「返回上级」卡片仍可经 ← 键到达，行为不变。
-- **目录列表异步加载的陈旧过滤（实测踩过）**：`dirEntries` 经 `LaunchedEffect + Dispatchers.IO` 异步加载，切目录后的**第一帧**里它还是旧目录的子文件夹列表；组合时按 `it.file.parentFile == currentDir` **同步过滤**掉陈旧项，否则网格会闪一帧旧目录内容，且 `FOCUS_FIRST` 会错误命中即将被移出组合的旧卡片（焦点随之失控回退）。配套用 `dirEntriesStamp` 记录列表归属目录：`LaunchedEffect` 的 key 是 `entries`（List 的 equals 是**结构比较**，内容不变不重跑），目录列表加载完成必须靠 stamp 变化触发重跑，否则 `FOCUS_FIRST` 的空目录判断会卡死。
+- ~~目录列表异步加载的陈旧过滤~~ **（v1.36 已移除，见 §3.3.1）**：原写法是 `dirEntries.filter { it.file.parentFile == currentDir }` + `dirEntriesStamp`。过滤本身没错，但它把「还没来得及换掉的上一个目录的列表」整批滤掉 ⇒ 切目录后的**首帧必然 0 个文件夹** —— 这正是用户反馈的「文件夹消失又瞬间出现」。现在 `dirEntries` 改为**按目录取出**的缓存内容（一定属于 `currentDir`），过滤与 stamp 都不再需要；「未就绪」改由 `dirsReady` 表达，并统一走加载态。
 - 从文件夹返回上级：`pendingFocusPath` 记录即将离开的文件夹路径 → `gridState.scrollToItem` 滚动定位 → 卡片自身 `FocusRequester` 请求焦点，实现「返回后焦点还原到刚才进入的卡片」。
 - **从播放器/查看器返回定位到最后浏览项（v1.3）**：打开图片/视频改走 `rememberLauncherForActivityResult(StartActivityForResult)`；两个 Activity 在**切图/切集的瞬间**（`switchImage`/`selectImage`/`skipTo`）`setResult` 当前文件路径。**坑**：不能拖到 `onPause` 再 `setResult`——系统在 `finish()` 执行时就按当时的 result 封装返回值，`onPause` 里设置会拿到 null（实测踩过）。返回后媒体库把 `pendingFocusPath` 指向该路径，复用既有滚动+聚焦机制。覆盖图片查看器内切图、视频连播自动下一集两种场景。
 - 网格内按返回键先「返回上一级」（`BackHandler(enabled = !atRoot)`）；到分类根目录时不拦截，交由 MainScreen 回到顶部导航栏。
 - **确定键动过焦点就必须在 KeyUp 执行**（实测踩过）：`UpCard` 曾在 KeyDown 里执行 `onUp()`，而 `goUp()` 经「焦点安全港」把焦点**同步**移到工具条「排序」——同一按压的 KeyUp 是独立事件、派发给当时已聚焦的「排序」，Compose `clickable` 在 KeyUp 激活点击 → 莫名弹出排序弹框（视频/图片/其他三页同组件同现象）。改为 KeyUp 执行后，按压已结束、无后续事件，焦点移动安全。
-- 切换文件夹/上传完成时 `dirRefreshKey++` 驱动文件夹列表重列。
+- 切换文件夹/上传完成时 `DirListCache.epoch++` 驱动文件夹列表重列（缓存走惰性失效，见 §3.3.1）。
+
+#### 3.3.1 两个数据源不同步导致的闪烁与卡顿（v1.36）
+
+**现象**（用户真机反馈）：切换分类标签、以及按返回上一级时，**肉眼可见文件夹消失再瞬间出现**，整体「一卡一卡」。
+
+**根因**：网格内容 = **文件夹（磁盘 IO）** + **文件（Room 内存表）**，两者就绪时间差一个数量级。
+
+| | 来源 | 切目录后何时就绪 |
+|---|---|---|
+| 文件 | `dbItems`（`observeByType` 的 Room Flow） | **同一帧**（表已在内存，只需 `filter { parentFolder == currentDir }`）|
+| 文件夹 | `LaunchedEffect` 里 `storage.listChildren` + 逐子目录 `FileUtils.hasValidContentIn`（**递归遍历**）| **晚若干帧**（U 盘上可达数百 ms）|
+
+而拼装是 `entries = dirEntries.filter { it.parentPath == currentDir } + fileEntries`：`currentDir` 一变，
+**旧目录那批文件夹会被新 `currentDir` 全部滤掉** ⇒ 那一帧「0 个文件夹」，等 IO 回来才整批出现。
+
+- **「返回上级」100% 复现**：`dirEntries` 还停在子目录的列表，`parentPath` 全等于子目录 ⇒ 必然滤空。
+- **「切换标签」更重**：`MainScreen` 的 `when (selected)` 三个分支是**不同调用点** ⇒ 整棵子树被 dispose、
+  全部 `remember` 重来：`dbItems` 回到 `null`（整块网格换成转圈）→ 网格出但**只有文件** → 文件夹再补上
+  = **三层闪**叠加。`dirEntries` 同时回到空。
+- **窗口长度由递归扫描决定**：`hasValidContentIn` 对**每个**子文件夹都要走子树（命中第一个合法文件才提前
+  返回；全是不合法文件的目录要走完整棵子树），且**零缓存** —— 同一个目录刚看过也要重扫。
+
+**「一卡一卡」的另一半（与闪烁独立）**：
+1. `mediaRepo.observeByCategory(category)` / `playbackRepo.observeAllProgress()` **直接写在组合体里**调用
+   ⇒ 每次重组都新建 Flow 实例，而 `collectAsState(initial)` 内部是 `produceState(initial, this)`，
+   `this` 就是**流对象本身** ⇒ 每次重组都撤销并重建 Room 订阅、重跑查询。本页重组点很多
+   （网格焦点进出 / 停靠标记 / 扫描提示 / 待聚焦路径…）。它表现为**持续卡顿而非闪烁**：
+   `produceState` 内部的 `remember { mutableStateOf(...) }` 无 key，旧值一直被保住，界面不会清空。
+2. `childCountMap` 的 `O(n·深度)` 统计**跑在组合期（主线程）**，`dbItems` 每次发射都要重算一遍。
+3. `atRoot` 翻转会增删 `UpCard` ⇒ 网格首位多/少一张卡片，后面所有卡片索引位移 ±1，叠加
+   `pendingFocusPath` 的 `scrollToItem` 就是一次可见的「跳一下」。
+
+**修法（A + C）**：
+
+- **A · 按目录缓存文件夹列表**（`LibraryScreen.kt` 文件级 `private object DirListCache`）
+  - 键 = `活动存储 + '\u0000' + 目录绝对路径`；值 = `DirListing(dirs, epoch)`。
+  - **必须放模块级，不能 `remember` 进本页组合**：本页在三个分类之间是三个不同调用点，切标签会 dispose
+    整棵子树 —— 缓存挂在组合里就照样要重扫根目录，而「切标签闪烁」正是要修的另一半症状。
+  - **失效走惰性**：条目记下扫描时的「代」`epoch`（进程级 `mutableIntStateOf`），访问到旧代条目才重扫并
+    **原地覆盖**（不先清空 ⇒ 扫描期间旧内容继续顶着渲染，页面不塌陷）。**绝不做全局清空** ——
+    那等于把要修的问题换个地方复现。
+  - `epoch` 必须是**进程级**而非本页 `remember`：缓存跨标签共享，代数若按页各自计数，
+    在 A 标签删完文件切到 B 标签时 B 的计数器从 0 开始，会把 A 那边「刚扫过」的条目误判成新的
+    （代数恰好相同）⇒ 删除后不重扫 ⇒ 列表里留着已经不存在的文件夹。
+  - 触发点（原 `dirRefreshKey++` 的三处）→ `DirListCache.epoch++`：上传完成 / 删除 / 手动对账。
+    - 删除那条要留意：删除会把变空的父目录**连带删掉**（`deleteNode` → `cleanEmptyAncestors`），
+      所以**祖先目录**的旧代条目也必须在下次访问时重扫 —— 靠 epoch 不匹配天然覆盖，不会露出已消失的文件夹。
+  - 容量：只存子文件夹卡片（单目录几十项），超过 300 个目录粗粒度淘汰，不做 LRU。
+- **C · 消除数据源抖动**
+  - 两条 Flow 各用 `remember(mediaRepo, category)` / `remember(playbackRepo)` **固定实例**，
+    并挂 `.distinctUntilChanged()`（两个实体都是 data class，`List.equals` 是逐项结构比较，过滤安全）——
+    `media_items` 任何一行变动都会让查询重新发射，但内容可能完全没变（进度流还 JOIN 了
+    `playback_history`，耦合失效面更大），过滤掉省下下游一整轮重算。
+  - `childCountMap` 从组合期移到 `produceState` + `Dispatchers.Default`（`buildChildCounts`）。
+    `produceState` 只在**赋值**时才改 `value`，重算期间沿用上次结果 ⇒ 不会「先归零再涨回来」。
+- **「未就绪」绝不当作「空」渲染**：加载态判据合并为
+  `dbItems == null || !dirsReady || childCountMapOrNull == null` ⇒ 一次干净的过渡，
+  顺带修掉根目录（没有文件时）闪 `EmptyHint`「暂无文件」的问题。
+  - 后两个判据正常使用中只会短暂为假：`dirsReady` 只在**本页第一次进入某目录**时为假（命中缓存即首帧为真）；
+    `childCountMapOrNull` 的 `null` 只在首次计算完成前出现，之后一直沿用旧值，不会反复回到 `null`。
+- **焦点侧的连带改动**：`FOCUS_FIRST` 的等待判据由 `dirEntriesStamp != currentDir` 改为 `!dirsReady`
+  （`LaunchedEffect(pendingFocusPath, entries, dirsReady)`）—— 语义完全对应，但不再依赖「戳」与内容是否同步。
 
 **「上传」页职责（v1.1 重构，v1.3 改左右分栏）**
 - 顶部 `Row` 左右分栏（按占比自适应）：**左侧固定区**（宽屏 `weight 0.9f : 2f` ≈ 31%；**矮屏紧凑模式 `0.85f : 1f` ≈ 46%**，v1.18，不滚动）= 二维码 + 地址 + 复制按钮 + 服务器状态/唤醒入口；**右侧记录区**（`weight 2f` / 紧凑 `1f`，`LazyColumn` 可滚动）= **纯上传记录列表**（数据库驱动）。
@@ -453,8 +560,23 @@ com.hpu.transview
     - 改为**各标签的真实聚焦状态**：`MainScreen.tabFocusStates`（每个媒体标签一个 `MutableState<Boolean>`，下标 = `MainTab.ordinal`）+ `settingsTabFocused`，在各自 `onFocusChanged` 里 **true / false 都写**（如实记录），再由 `focusLocus(tabFocused, settingsFocused)` 实时推导「焦点此刻在哪个标签上」（无标签聚焦时返回 `NO_TAB_FOCUSED`）。目标已聚焦 ⇒ 第一次尝试即判成功，不存在「等不到写入」；焦点进内容区时无需任何人改写记录，各标签自发写成 `false` 即可。
     - 因此校验判据**不再需要任何「先清空」**：`requestFocusVerified { tabFocusStates[index].value }` / `{ settingsTabFocused }`。
   - 修法二：**送焦点必须校验真实落焦**（`requestFocusVerified`，见下一节），且「已经聚焦」必须**算成功**；用记录型判据时**绝不要先清空记录**（理由见上一条）。
-  - 修法三（v1.33）：**退出确认不能绑在焦点位置上**。`MainScreen.BackHandler` 现按此顺序判定：① `lastBackTime > 0L` 且距上次按下 ≤ `EXIT_CONFIRM_WINDOW_MS`（2s）→ **直接 `finish()`，完全不看焦点在谁身上**（第一次按下后焦点可能已被兜底票据推进内容区；若仍要求「焦点必须还在上传标签」，退出确认就永远无法兑现）；② 焦点在「上传」标签 → 弹提示 + 记时间戳 + 把焦点送回上传标签；③ 焦点在其它标签 → 回「上传」；④ 其余（内容区）→ 回当前选中标签。`lastBackTime > 0L` 不可省：`SystemClock.uptimeMillis()` 在开机后 2 秒内也小于窗口值，少了它会在「刚开机就按返回」时直接退出应用。
+  - 修法三（v1.33，v1.35 补下界）：**退出确认不能绑在焦点位置上**。`MainScreen.BackHandler` 现按此顺序判定：① `lastBackTime > 0L` 且距上次按下落在 `EXIT_CONFIRM_MIN_MS`（250ms）~ `EXIT_CONFIRM_WINDOW_MS`（2s）区间 → **直接 `finish()`，完全不看焦点在谁身上**（第一次按下后焦点可能已被兜底票据推进内容区；若仍要求「焦点必须还在上传标签」，退出确认就永远无法兑现）；② 焦点在「上传」标签 → 弹提示 + 记时间戳 + 把焦点送回上传标签；③ 焦点在其它标签 → 回「上传」；④ 其余（内容区）→ 回当前选中标签。`lastBackTime > 0L` 不可省：`SystemClock.uptimeMillis()` 在开机后 2 秒内也小于窗口值，少了它会在「刚开机就按返回」时直接退出应用。**下界同样不可省（v1.35）**：只判上界时，「同一次物理按键被投递两遍」会让第二遍正好落在窗口内 ⇒「按一下返回就退出应用」（真机实测，详见修法七 / 修法八）。
   - 修法四（v1.33）：**退出确认要留「余波宽限期」**。内容区获得焦点时会取消未完成的退出确认（「用户自己走开了」理应重新确认），但 Back 按下后系统 / 兜底路径都可能把焦点挪进内容区，那属于**本次按键的余波**；故引入 `EXIT_CONFIRM_GRACE_MS`（500ms）—— 距上次 Back 超过 500ms 才清零 `lastBackTime`，否则保留。少了这条，一次焦点漂移就能作废确认窗口，用户照样退不出去。
+  - 修法五（v1.34）：**Back 的「派发链」本身可能断裂，必须由 `MainActivity` 兜底补派发**。API 33 以前的旧语义是 `ACTION_DOWN → Activity.onKeyDown(KEYCODE_BACK) → event.startTracking()`，抬起时 `Activity.onKeyUp` 凭 `event.isTracking() && !isCanceled` 调 `onBackPressed()` → `OnBackPressedDispatcher` → 应用注册的 `BackHandler`。**只要 DOWN 没走到 `onKeyDown`，`startTracking()` 就不会被调用**，抬起时 `isTracking()` 恒为 `false`、`onKeyUp` **静默丢弃** —— 整条链断掉、`BackHandler` 永不执行。真机上 DOWN 确实可能被吞（触摸模式退出按键被框架层消费 / 焦点树消费 / 窗口焦点切换重置 tracking 状态），模拟器不产生这种切换故不复现。
+    - 症状因此是「**第一次**按返回键完全无副作用（连媒体库目录都不变）、**第二次**才生效」—— 第一次按键让设备退出了触摸模式，第二次的 DOWN 才能走完整条链。
+    - 兜底（`MainActivity.dispatchKeyEvent`）：仅当抬起时 `!isTracking || isCanceled`（即**系统一定不会**派发）才自行调用一次 `onBackPressedDispatcher.onBackPressed()` 并消费该事件；`isTracking && !isCanceled` 时原样放行、本方法不介入。两分支互斥 ⇒ 同一个抬起不会被处理两次。⚠️ **但「互斥」只保证「同一个抬起不被处理两次」，不保证「一次物理按下只产生一个抬起」** —— v1.34 上线后真机实测到「一次按下 = 两步操作」，根因正是后者，由 v1.35 的去重闸补上（见修法七）。
+    - ⚠️ 不要再往「内容区用 `onPreviewKeyEvent` 拦 `Key.Back`」加固（设置页那处是历史遗留）：拦 DOWN 会**主动促成**上面这条链断裂（DOWN 被应用消费 ⇒ `isTracking()` 为 false），且 Android 16 起系统已不支持拦截 `KeyEvent.KEYCODE_BACK`。设置页那处建议后续评估并入统一分层，**本次未动**。
+  - 修法六（v1.34）：**「焦点无人持有」必须由我们兜底，绝不留给框架的几何搜索**。`ui/common/BackKeySignal` 由 `MainActivity.dispatchKeyEvent` 在 Back 抬起时 `fire()`（它是全工程唯一**无条件**能看到 Back 的地方 —— `BackHandler` 在「链断裂」那一次恰恰不执行，当不了触发点）；主界面把它当 `LaunchedEffect` 的 key，200ms 后复检：若「标签栏无焦点 **且** 内容区无焦点」，或**焦点只停在内容区那个隐形锚点自身上（遥控器路径）**，就显式把焦点送回当前分类标签（设置页则送「设置」标签）。
+    - 这条要解决的正是「**↑ 恒定落到标签行中间那个标签（「图片」）、← → ↓ 全无反应**」：参考框横跨整宽且贴底时，方向搜索在其余三个方向都找不到候选，只有向上能命中「离参考框中心最近」的标签 —— 落点与当前分类无关，是框架兜底的特征，不是我们的送焦点代码所为。据此也可反推：用户看到的「焦点消失」多半是**焦点停在了没有任何视觉反馈的隐形锚点上**。
+    - 复检的两个事实取自内容区 `Box` 的 `onFocusChanged`：`contentHasFocus`（含子树）与 `contentAnchorFocused`（锚点**自身**）。窗口失焦（播放器 / 查看器在前台、正在退出应用）时不抢焦点。
+    - 触发点**刻意不用 `BackHandler`**：链断裂的那一次它不执行，而那一次最需要兜底。同理该兜底只挂在 Back 之后 —— 平时允许「暂时无人持有焦点」的中间态存在，否则会与页面自己的焦点还原（如从播放器返回的 `pendingFocusPath`）抢焦点。
+  - 修法七（v1.35）：**同一次物理按键必须在源头去重**。真机遥控器的一次返回**可能投递两个抬起**（该遥控器事件序列与键盘不同 —— OK 键上已实测「按住只送一串重复 `KeyDown` + 最后一个 `KeyUp`」），而修法五的补派发让每个抬起都成为一次完整的 Back 处理 ⇒「一次按下 = 两步操作」。真机症状两条（用户 2026-09-18 反馈）：焦点在「上传」标签上按**一次**返回 → 先弹「再按一次返回键退出应用」、随即**直接退出应用**；文件夹里按**一次**返回 → **连跳两级**、越过本分类根目录看到沙盒总目录里的 `Pictures`。
+    - 判据（`MainActivity.dispatchKeyEvent`，两条**同时**成立才丢弃）：① 本次抬起**没有配对的 `ACTION_DOWN`**（一次完整的按下-抬起周期必然先收到 DOWN）；② 距上一次**通过去重闸**的事件 ≤ `BackKeySignal.DEDUP_MS`（150ms）。满足则整条丢弃并留 **W 级**日志（那行日志本身就是「一次按下被投递两遍」的直接证据）。
+    - 第 ① 条不能省：个别电视输入栈会把所有事件的 `eventTime` 冻结成同一个值（那时间隔恒为 0），只看间隔会把**合法的第二次按下**误丢 —— 那会让返回键时灵时不灵。
+    - `BackKeySignal.fire()`（驱动修法六的复检）**也只对通过去重闸的按键发出**，否则复检同样被触发两次。150ms 远低于人类「松开再按下同一个键」的极限，故不影响「连按两次返回退出」。
+  - 修法八（v1.35）：**退出确认加最小间隔，从结果侧封死「一次按下就退出」**。`EXIT_CONFIRM_MIN_MS` = 250ms：距上次按下**不足** 250ms 时不退出，而是重新弹提示并重置窗口。这是修法七的兜底 —— 即使重复事件换了形态绕过源头（例如两条相距 100~250ms 的完整按键周期），也不可能「按一下就退出应用」。250ms 仍低于人类刻意双击的间隔，正常退出操作不受影响。
+  - 修法九（v1.35）：**媒体库 `goUp()` 三重加固**（`LibraryScreen`）。① 判据改**实时** `currentDir`（不再用组合期的 `atRoot` —— 它是组合作用域里算出的值，同一帧内被调用两次时还停在旧值 `false`，第二次会从**新目录**再往上一级）；② 父目录**越界钳回分类根目录**（父目录必须满足 `== rootPath` 或以 `"$rootPath/"` 开头）—— `IStorage.parentNode` 的钳位只到**沙盒根** `TransView/`，**分类根目录的父目录是合法返回值**（`relativeOf` → `"Pictures"` → 父相对路径 `""` → 沙盒根），不自己拦就会露出 `Movies` / `Pictures` / `Downloads`；③ 150ms 内重复调用直接忽略（W 级留痕）。
+  - 修法十（v1.36）：**「未就绪」不得当作「空」渲染 —— 它同时是焦点事故的源头**。媒体库的加载态判据从单纯的 `dbItems == null` 扩为 `dbItems == null || !dirsReady || childCountMapOrNull == null`。与焦点相关的一点：`FOCUS_FIRST` 的等待条件原来是 `dirEntriesStamp != currentDir`（靠一个和 `entries` 内容是否同步的「戳」），现改为 `!dirsReady` —— 语义一一对应，但不再依赖戳的时序。⚠️ 旧写法会让**切目录的首帧渲染出「0 个文件夹」**，`FOCUS_FIRST` 可能据此误判「空目录」而改投 `FOCUS_UP`，用户看到的就是「刚进文件夹焦点却回到了返回上级」。完整根因与修法（每条数据源的取数速度、目录缓存、Flow 实例固定）见 §3.3.1。
 - **媒体库的「遥控器路径」判据（v1.32 修复同一根因）**：`LibraryScreen.remoteFocus() = !isTouchMode || gridHasFocus`，取代原先的 `val hadFocus = gridHasFocus`。原写法本身合理（先捕获，因为 `parkFocusSafe()` 会同步把 `gridHasFocus` 写成 `false`），**但按返回键那条路径上它早已被系统清空** → `goUp()` 里 `if (hadFocus) pendingFocusPath = leaving` 恒不成立 → 「返回上一级后焦点还原到刚离开的文件夹」失效（即用户反馈的「返回后没达到想要的效果」；`openEntry` / `performDelete` 用同一个 guard，是同一颗定时炸弹）。改用与焦点状态无关的「输入来源」判断后对清空免疫：非触摸模式即遥控器/键盘路径，或触摸模式下网格确实持有焦点（触屏设备上刚用过方向键）仍需接住焦点。
 - **标签焦点回调里「退出设置页」必须无条件执行**：媒体标签早期写法是 `if (isFocused && tab != selected) { selected = tab; showSettings = false }`——把 `showSettings = false` 和「切换标签」绑进了同一个条件。当 `selected` 恰好就是目标标签时条件不成立（典型路径：「其他」页 → 聚焦「设置」→ 按 ← 回「其他」，`selected` 一直是 `OTHER`、根本没变），于是 `showSettings` 停在 `true`，**内容区继续显示设置页，只有标签选中态变了**（用户实测反馈）。修法：焦点落到任一媒体标签即先无条件 `showSettings = false`，再按需更新 `selected`。
 - 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；

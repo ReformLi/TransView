@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,6 +26,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.hpu.transview.service.ServerService
 import com.hpu.transview.ui.MainScreen
 import com.hpu.transview.ui.permission.PermissionScreen
+import com.hpu.transview.ui.common.BackKeySignal
 import com.hpu.transview.ui.common.ProvideTouchMode
 import com.hpu.transview.ui.settings.SettingsStore
 import com.hpu.transview.ui.theme.TransViewTheme
@@ -37,6 +39,104 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         private const val TAG = "MainActivity"
+    }
+
+    /** 本次 Back 手势是否已收到配对的 `ACTION_DOWN`（收到才认为这是一个「新的按键」）。 */
+    private var backDownArmed = false
+
+    /** 上一次**通过去重闸**的 Back 抬起的事件时间戳（与 `uptimeMillis()` 同基准，用于量重复投递的间隔）。 */
+    private var lastBackEventTime = 0L
+
+    /**
+     * Back 键「派发链断裂」的兜底（真机电视专项，2026-09-18）。
+     *
+     * ## 系统原有的 Back 派发链（API 33 以下的旧语义，本项目真机是 Android 10~12）
+     * ```
+     * ACTION_DOWN → Activity.onKeyDown(KEYCODE_BACK) → event.startTracking()
+     * ACTION_UP   → Activity.onKeyUp  且 event.isTracking() && !isCanceled()
+     *             → onBackPressed() → OnBackPressedDispatcher → 我们的 BackHandler
+     * ```
+     * **关键**：只要 `ACTION_DOWN` 没走到 `onKeyDown`，`startTracking()` 就不会被调用，
+     * 于是抬起时 `isTracking()` 恒为 false、`onKeyUp` **静默丢弃** —— 整条链断掉，
+     * `BackHandler` 永远不执行。而 DOWN 被吞掉的情形在真机上确实存在（触摸模式退出按键被框架
+     * 消费、焦点树消费、窗口焦点切换导致 tracking 状态被重置等）；模拟器不产生这种切换，故不复现。
+     *
+     * ## 症状完全对得上
+     * 「**第一次**按返回键完全无副作用（连媒体库的目录都不变），**第二次**才生效」——
+     * 第一次按键让设备退出了触摸模式，第二次的 DOWN 才能正常走完整条链。
+     * 同一现象在工程里早有旁证：本工程设置页实测到「Back 一按下内容区 `hasFocus` 立刻翻转」，
+     * 因而不得不改用 `onPreviewKeyEvent` 提前拦截（`SettingsScreen` 的那段注释）。
+     *
+     * ## 兜底策略
+     * 只在「系统确实不会替我们调 `onBackPressed()`」时才自己调一次并消费该 UP：
+     * * `isTracking && !isCanceled` ⇒ 旧路径会正常派发 ⇒ 原样放行，本方法不介入；
+     * * 否则 ⇒ 旧路径一定不会派发 ⇒ 由我们补一次，避免这次按键「凭空消失」。
+     * 两个分支互斥，正常情况下 `BackHandler` 只会被执行一次 —— 但**前提是这次按键只投递一个抬起**，
+     * 见下面的去重闸。
+     *
+     * ## 去重闸（与兜底配套，缺一不可）
+     * 真机遥控器的一次按下**可能投递两个抬起**（该遥控器事件序列与键盘不同 —— OK 键上已实测
+     * 「按住只送一串重复 `KeyDown` + 最后一个 `KeyUp`」）。补派发会让每个抬起都变成一次完整的
+     * Back 处理，于是出现「**一次按下 = 两步操作**」，这正是 2026-09-18 真机反馈的两条症状：
+     * * 焦点在「上传」标签上按**一次**返回 → 先弹「再按一次返回键退出应用」、随即**直接退出应用**；
+     * * 文件夹里按**一次**返回 → **连跳两级**、越过本分类根目录，看到沙盒总目录下的 `Pictures`
+     *   （「图片总文件夹」本不该从图片页到达；实现侧另有 `LibraryScreen.goUp` 的越界钳位兜底）。
+     * 判据（两条**同时**成立才丢弃，见 `dup` 的定义）：
+     *  ① 本次抬起**没有配对的按下** —— 一次完整的按下-抬起周期必然先收到 `ACTION_DOWN`；
+     *  ② 距上一次处理过的事件 ≤ [BackKeySignal.DEDUP_MS]（150ms）。
+     * 第 ① 条不能省：个别电视输入栈会把事件的 `eventTime` 冻结成同一个值（那时间隔恒为 0），
+     * 只看间隔会误丢合法的按键。人类也无法在 150ms 内松开再按下返回键，故不误伤「连按两次退出」。
+     *
+     * 另外这里向 [BackKeySignal] 发一次信号：`BackHandler` 本次可能根本没被执行，
+     * 而「按完返回键焦点无人持有」的兜底复检需要一个**无条件**能看到 Back 的触发点，
+     * 本方法正是全工程唯一满足该条件的地方。**该信号只对通过去重闸的按键发出**，
+     * 否则复检也会被同一次按键触发两次。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    // 记录「本次按键确实收到了按下」：没有配对的按下却收到抬起，即为重复投递
+                    // （见去重闸判据②；该判据另外要求「距上次处理很近」，故只影响重复投递）。
+                    backDownArmed = true
+                    AppLogger.d(TAG, "Back 按下（tracking=${event.isTracking}）")
+                }
+                KeyEvent.ACTION_UP -> {
+                    val hadDown = backDownArmed
+                    backDownArmed = false
+                    // 判据（两条**同时**成立才丢弃）：本次抬起**没有配对的按下**，且距上次处理 ≤ DEDUP_MS。
+                    // 「没有配对按下」这一条不能省：个别电视输入栈会把所有事件的 eventTime 冻结成同一个
+                    // 值（那时间隔恒为 0），若只看间隔，合法的第二次按下会被误丢 —— 那会让返回键时灵时不灵。
+                    val dup = !hadDown &&
+                        lastBackEventTime > 0L &&
+                        event.eventTime - lastBackEventTime <= BackKeySignal.DEDUP_MS
+                    if (dup) {
+                        // W 级（无需开启详细日志即落盘）：这一行就是「一次按键被投递两遍」的直接证据。
+                        AppLogger.w(
+                            TAG,
+                            "Back 抬起：同一次按键的重复投递（无配对按下，间隔 " +
+                                "${event.eventTime - lastBackEventTime}ms）→ 已丢弃"
+                        )
+                        return true
+                    }
+                    lastBackEventTime = event.eventTime
+                    BackKeySignal.fire()
+                    if (event.isTracking && !event.isCanceled) {
+                        // 旧路径会自行派发，放行即可（本方法对该事件不做任何处理）
+                        AppLogger.d(TAG, "Back 抬起：走系统旧路径（tracking=true）")
+                    } else {
+                        AppLogger.i(
+                            TAG,
+                            "Back 抬起：系统不会派发（tracking=${event.isTracking} " +
+                                "canceled=${event.isCanceled}）→ 自行补派发一次"
+                        )
+                        onBackPressedDispatcher.onBackPressed()
+                        return true
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

@@ -65,9 +65,11 @@ import com.hpu.transview.ui.theme.OnDarkDim
 import com.hpu.transview.ui.theme.SuccessGreen
 import com.hpu.transview.ui.theme.DangerRed
 import com.hpu.transview.ui.upload.UploadScreen
+import com.hpu.transview.ui.common.BackKeySignal
 import com.hpu.transview.util.AppLogger
 import com.hpu.transview.util.FileLocations
 import com.hpu.transview.util.FileLocations.StorageEvent
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** 本页日志标签（AppLogger 落盘用） */
@@ -84,6 +86,19 @@ private val SETTINGS_TAB_INDEX = MainTab.entries.size
 
 /** 「再按一次返回键退出应用」的确认窗口（毫秒）：窗口内再按一次 Back 即退出。 */
 private const val EXIT_CONFIRM_WINDOW_MS = 2000L
+
+/**
+ * 退出确认要求两次按下之间的**最小间隔**（毫秒）。
+ *
+ * 确认窗口原本只看「窗口内是否又按了一次」，于是**同一次物理按键被投递两遍**时会自我兑现：
+ * 第一遍弹提示并记时间，第二遍落在窗口内 → 立刻退出应用。真机遥控器确实会这样（一次按下投递
+ * 两个抬起，详见 `BackKeySignal.DEDUP_MS`），用户看到的就是「焦点在上传标签，按一次返回就退出应用」。
+ *
+ * 两道闸分工：[BackKeySignal.DEDUP_MS] 在 `MainActivity.dispatchKeyEvent` 拦重复事件（源头），
+ * 这里的 250ms 是**结果侧**的兜底 —— 即使重复事件换了形态绕过源头（例如两条相距 100~250ms 的完整
+ * 按键周期），也不可能「按一下就退出」。250ms 仍远低于人类刻意双击的间隔，不影响正常退出操作。
+ */
+private const val EXIT_CONFIRM_MIN_MS = 250L
 
 /**
  * 退出确认的「余波宽限期」（毫秒）。
@@ -159,6 +174,17 @@ fun MainScreen() {
     // 抑制标签的聚焦选中，仅保留「点按标签」这一直接交互来切页；手势结束后恢复。
     var touchSuppressingTabSwitch by remember { mutableStateOf(false) }
     val contentAnchor = remember { FocusRequester() }
+    // ——— 「焦点是否有人持有且看得见」的两个事实（Back 之后的兜底复检要用）———
+    // ① contentHasFocus：内容区（含设置页 / 媒体网格 / 上传列表）整体是否有人持有焦点；
+    // ② contentAnchorFocused：焦点是否**只停在内容区那个隐形焦点锚点自身上**（而非它的子元素）。
+    // 真机症状「↑ 恒定落到标签行中间的「图片」、← → ↓ 全无反应」就是 ② 的特征 —— 参考框
+    // 横跨整宽且贴底，方向搜索在其它三个方向都找不到候选，只有向上能命中「离参考框中心最近」的标签。
+    // 也就是用户看到的「失去焦点」其实多半是**焦点停在了一个没有任何视觉反馈的节点上**。
+    var contentHasFocus by remember { mutableStateOf(false) }
+    var contentAnchorFocused by remember { mutableStateOf(false) }
+    // 「遥控器 / 键盘路径」判据（与 LibraryScreen.remoteFocus 同义）：触摸模式下锚点持有焦点是
+    // **预期行为**（手指点按内容区后锚定，随后由页面票据送到首个元素），不算失控。
+    val isTouchMode = LocalIsTouchMode.current
     val windowInfo = LocalWindowInfo.current
     val rootView = LocalView.current
     // 顶部导航栏是否收窄（判据集中在 rememberTopBarTight，与内容区缩放相互独立）：
@@ -248,7 +274,12 @@ fun MainScreen() {
                 val ok = tabFocusRequesters[index].requestFocusVerified {
                     tabFocusStates[index].value
                 }
-                if (!ok) contentFocusTicket++
+                if (!ok) {
+                    // 送不到标签栏（窗口瞬时失焦 / 焦点系统拒绝）→ 吐票据让内容区接住焦点。
+                    // 留痕为 W：这属于兜底路径，真机上出现即说明主路径又被否决了（排查依据）
+                    AppLogger.w(TAG, "送焦点到「${selected.title}」标签失败，改由内容区接管")
+                    contentFocusTicket++
+                }
             }
         }
     }
@@ -258,7 +289,10 @@ fun MainScreen() {
         scope.launch {
             val ok = settingsFocusRequester.requestFocusVerified { settingsTabFocused }
             // 送不到标签栏就把票据投给设置内容区（落到首个分组），避免焦点无人持有
-            if (!ok) settingsFocusTicket++
+            if (!ok) {
+                AppLogger.w(TAG, "送焦点到「设置」标签失败，改由设置内容区接管")
+                settingsFocusTicket++
+            }
         }
     }
 
@@ -267,7 +301,37 @@ fun MainScreen() {
         scope.launch {
             val index = MainTab.UPLOAD.ordinal
             val ok = tabFocusRequesters[index].requestFocusVerified { tabFocusStates[index].value }
-            if (!ok) contentFocusTicket++
+            if (!ok) {
+                AppLogger.w(TAG, "送焦点到「上传」标签失败，改由内容区接管")
+                contentFocusTicket++
+            }
+        }
+    }
+
+    // ——— Back 之后的「焦点无人持有」兜底复检 ———
+    // 触发点是 MainActivity.dispatchKeyEvent 发出的 BackKeySignal（**不是** BackHandler）：
+    // 真机上第一次按返回键时 BackHandler 根本没被执行（旧派发链断裂，见 dispatchKeyEvent 的注释），
+    // 而那一次恰恰最需要兜底，所以这里改由「无条件能看到 Back」的信号来驱动。
+    // 用该信号当 LaunchedEffect 的 key：key 变化时 effect 以**当前组合里的新闭包**重启，
+    // 因此下面读到的 selected / showSettings / focusSelectedTab 永远是最新的（不会捕获过期值）。
+    val backTick = BackKeySignal.tick.intValue
+    LaunchedEffect(backTick) {
+        if (backTick == 0) return@LaunchedEffect
+        // 复检延迟：够本次按键的送焦点（约 1 帧）或页面自己的焦点还原（1~2 帧）跑完
+        delay(200L)
+        // 播放器 / 图片查看器打开、或正在退出应用时本窗口失焦，此时不抢焦点
+        if (!windowInfo.isWindowFocused) return@LaunchedEffect
+        val locus = focusLocus(tabFocusStates.map { it.value }, settingsTabFocused)
+        // 隐形锚点自聚焦不算「有人持有」：遥控器路径下它没有任何视觉反馈，
+        // 用户看到的就是「焦点丢失」（详见 contentAnchorFocused 的注释）
+        val anchorOnly = contentAnchorFocused && !isTouchMode
+        if (locus == NO_TAB_FOCUSED && (!contentHasFocus || anchorOnly)) {
+            AppLogger.i(
+                TAG,
+                "Back 后焦点无人持有（标签槽=$locus 内容区=$contentHasFocus " +
+                    "锚点=$contentAnchorFocused 触摸=$isTouchMode）→ 强制送回当前标签"
+            )
+            if (showSettings) focusSettingsTab() else focusSelectedTab()
         }
     }
 
@@ -283,13 +347,27 @@ fun MainScreen() {
     BackHandler {
         val now = SystemClock.uptimeMillis()
         val tab = focusLocus(tabFocusStates.map { it.value }, settingsTabFocused)
+        // 取证（D）：真机没有 logcat，这一行是判断「Back 究竟走到哪个分支」的唯一依据。
+        // 与 MainActivity.dispatchKeyEvent 的 Back 日志配合使用：
+        //   · 只有 dispatch 日志、**没有**这一行 ⇒ 系统没派发 onBackPressed()（旧链断裂），
+        //     正是「第一次按返回完全无副作用」的现场；
+        //   · 两者都有、但焦点仍没落到位 ⇒ 问题在送焦点被否决（会有对应的 W 级日志）。
+        val tabLabel = when {
+            tab == NO_TAB_FOCUSED -> "内容区/无"
+            tab == SETTINGS_TAB_INDEX -> "设置标签"
+            else -> "${MainTab.entries[tab].title}标签"
+        }
+        AppLogger.d(TAG, "Back 处理：焦点=$tabLabel 设置页=$showSettings 退出确认中=${lastBackTime > 0L}")
         when {
             // ① 已在退出确认中（窗口内第二次按下）→ 退出。
             //    `lastBackTime > 0L` 不可省：uptimeMillis() 在开机后 2 秒内也小于窗口值，
             //    少了它会在「刚开机就按返回」时直接退出应用。
             //    这里刻意**不看焦点位置** —— 第一次按下后焦点可能被兜底票据推进内容区，
             //    若仍要求「焦点必须还在上传标签」，退出确认就永远无法兑现（用户实测的循环）。
-            lastBackTime > 0L && now - lastBackTime <= EXIT_CONFIRM_WINDOW_MS -> {
+            //    下界 [EXIT_CONFIRM_MIN_MS] 也不可省：同一次物理按键被投递两遍时，第二遍会落在
+            //    窗口内 → 「按一次返回就退出应用」（真机实测症状，详见该常量的注释）。
+            lastBackTime > 0L &&
+                now - lastBackTime in EXIT_CONFIRM_MIN_MS..EXIT_CONFIRM_WINDOW_MS -> {
                 lastBackTime = 0L
                 (context.findActivity())?.finish()
             }
@@ -432,6 +510,11 @@ fun MainScreen() {
                 // **只在 hasFocus == true 时写**：按返回键清空焦点也会回调（hasFocus == false），
                 // 那不代表「焦点去了内容区」。
                 .onFocusChanged {
+                    // 兜底复检要用的两个事实（见 BackKeySignal 驱动的复检块）：
+                    //  · contentHasFocus = 内容区（含子树）是否有人持有焦点；
+                    //  · contentAnchorFocused = 焦点是否只停在这个**隐形**锚点自身上。
+                    contentHasFocus = it.hasFocus
+                    contentAnchorFocused = it.isFocused
                     if (it.hasFocus &&
                         SystemClock.uptimeMillis() - lastBackTime > EXIT_CONFIRM_GRACE_MS
                     ) {

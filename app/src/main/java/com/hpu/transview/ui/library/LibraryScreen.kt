@@ -9,6 +9,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
+import com.hpu.transview.ui.common.BackKeySignal
 import com.hpu.transview.ui.common.LocalIsTouchMode
 import com.hpu.transview.ui.common.rememberContentWidthDp
 import androidx.compose.foundation.clickable
@@ -41,7 +42,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -99,6 +102,7 @@ import com.hpu.transview.util.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -113,6 +117,84 @@ private const val TAG = "LibraryScreen"
 private const val FOCUS_UP = "__up__"
 /** 进入子目录后聚焦第一个条目（用户反馈：先闪 UpCard 再跳会有可见的两段跳，直接一次落点） */
 private const val FOCUS_FIRST = "__first__"
+
+/** 某个目录已扫出的文件夹卡片 + 它是「第几代」扫出来的（代 = [DirListCache.epoch]） */
+private data class DirListing(val dirs: List<FileEntry>, val epoch: Int)
+
+/**
+ * 文件夹列表缓存（v1.36「修法十 / 方案 A」）。
+ *
+ * ## 为什么需要它
+ * 网格里的东西来自**两个速度差一个数量级的数据源**：
+ * - **文件**来自 Room 的 `observeByType` 流（表已在内存）—— 切目录**同一帧**就能给对；
+ * - **文件夹**只能走真实磁盘 IO（`listChildren` + 每个子文件夹的递归校验，DB 不索引文件夹）
+ *   —— 要晚若干帧，U 盘 / 大目录上可达数百毫秒。
+ *
+ * 改缓存之前，`dirEntries` 每次切目录都被整体覆盖，于是切目录后的第一帧里它装的还是
+ * **上一个目录**的子文件夹，被 `filter { it.parentPath == currentDir }` 全部滤掉
+ * ⇒ 那一帧「0 个文件夹」，等扫描回来才整批出现。用户看到的就是
+ * **「文件夹消失又瞬间出现」**，而「返回上一级」100% 命中（它回到的目录刚看过，却照样重扫）。
+ *
+ * ## 为什么放在**模块级**而不是 `remember` 进本页组合
+ * `MainScreen` 用 `when (selected) { VIDEO -> LibraryScreen(...); IMAGE -> LibraryScreen(...) }`
+ * ——三个分类是**三个不同调用点**，切标签会把整棵子树 dispose。缓存若挂在组合里，
+ * 切标签回来照样要重扫根目录，而「切标签闪烁」正是用户报的另一半症状。
+ * 放模块级后，只要本次进程内看过这个目录，再进来就是**首帧即正确**。
+ *
+ * ## 内容与失效
+ * 只存**子文件夹卡片**（文件永远来自 DB Flow），单目录通常几十项，故只做粗粒度容量上限。
+ * 失效走**惰性**：条目里记下扫描时的代数 [epoch]，访问到旧代条目才重扫并**原地覆盖**；
+ * 绝不做全局清空 —— 那样任何一次刷新都会让当前页面先空一下，等于把要修的问题换个地方复现。
+ */
+private object DirListCache {
+    /** 缓存目录数上限（内容很轻，300 个目录足够；超了粗粒度淘汰，不做 LRU） */
+    private const val MAX_DIRS = 300
+
+    /** 键 = `活动存储 + '\u0000' + 目录绝对路径`。含存储维度：换卷后旧卷的条目永不被命中 */
+    val dirs = mutableStateMapOf<String, DirListing>()
+
+    /**
+     * 目录内容的「代」。任何可能改变目录结构的事件（上传完成 / 删除 / 手动对账）都 +1。
+     *
+     * 必须是**进程级**而不是本页的 `remember`：缓存是跨标签共享的，若代数按页面各自计数，
+     * 在 A 标签删完文件切到 B 标签，B 的计数器从 0 开始，会把 A 那边「刚扫过」的条目
+     * 误判成新的（代数恰好相同）⇒ 删除后不重扫 ⇒ 列表里留着已经不存在的文件夹。
+     */
+    var epoch by mutableIntStateOf(0)
+
+    fun key(activeKey: String, dir: String): String = "$activeKey\u0000$dir"
+
+    /** 写入条目，必要时先淘汰一批旧键（保留刚写入的这个，避免当前页面闪一下） */
+    fun put(key: String, listing: DirListing) {
+        if (dirs.size >= MAX_DIRS) {
+            val drop = dirs.size - MAX_DIRS + 1
+            dirs.keys.toList().asSequence().filter { it != key }.take(drop)
+                .forEach { dirs.remove(it) }
+        }
+        dirs[key] = listing
+    }
+}
+
+/**
+ * 统计每个文件夹（含其所有层级祖先）下的文件条数，键 = 文件夹绝对路径。
+ *
+ * v1.36「修法十二」：这段以前写在 `remember(dbItems)` 里 —— 也就是**组合期、主线程**。
+ * 现在由调用处的 `produceState` 放到 `Dispatchers.Default` 执行，签名独立成函数只是为了让
+ * 「跑在哪个线程」这件事在调用处一眼可见。
+ */
+private fun buildChildCounts(items: List<MediaItemEntity>): Map<String, Int> {
+    val counts = mutableMapOf<String, Int>()
+    for (item in items) {
+        var p = item.parentFolder
+        while (p.isNotEmpty()) {
+            counts[p] = (counts[p] ?: 0) + 1
+            val idx = p.lastIndexOf('/')
+            if (idx <= 0) break
+            p = p.substring(0, idx)
+        }
+    }
+    return counts
+}
 
 /**
  * 长文件名跑马灯（仅在卡片获得焦点时挂上，见 MediaCard）。
@@ -263,26 +345,66 @@ fun LibraryScreen(
     val atRoot = currentDir == rootPath
 
     // ——— 文件夹列表来自活动存储（DB 不索引文件夹） ———
-    var dirRefreshKey by remember { mutableStateOf(0) }
-    var dirEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
-    // 目录列表的「归属戳」：记录 dirEntries 是为哪个目录加载的。切目录后的第一帧里
-    // dirEntries 还是旧目录的数据，据此判断加载是否完成（避免 FOCUS_FIRST 误判空目录）。
-    var dirEntriesStamp by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(currentDir, dirRefreshKey, storageState.activeKey) {
-        dirEntries = withContext(Dispatchers.IO) {
+    // 刷新键已上移到模块级的 DirListCache.epoch（见其注释：缓存跨标签共享，代数必须进程级），
+    // 触发点仍是三处「上传完成 / 删除 / 手动对账」。
+    val dirKey = DirListCache.key(storageState.activeKey, currentDir)
+    // 当前目录的文件夹卡片。`null` = **还没加载**，与「真的没有子文件夹」（空列表）严格区分：
+    // 前者要走加载态，后者才是「空目录」这个事实。
+    val dirListing = DirListCache.dirs[dirKey]
+    val dirEntries: List<FileEntry> = dirListing?.dirs ?: emptyList()
+    val dirsReady = dirListing != null
+    LaunchedEffect(currentDir, DirListCache.epoch, storageState.activeKey) {
+        val cached = DirListCache.dirs[dirKey]
+        if (cached != null && cached.epoch == DirListCache.epoch) {
+            // 命中就是「首帧即正确」：无需任何 IO。返回上级 / 切回本标签都走这条路。
+            // 留痕为 V（仅详细日志）：目录切换是高频动作，不值得默认落盘。
+            AppLogger.v(
+                TAG,
+                "文件夹列表命中缓存：$currentDir（${cached.dirs.size} 项，跳过重扫）"
+            )
+            return@LaunchedEffect
+        }
+        val loaded = withContext(Dispatchers.IO) {
             storage.listChildren(currentDir)
                 .filter { it.isDirectory && !it.name.startsWith(".") }
-                // 方案 A：文件夹内（递归）没有任何本分类合法文件时不出卡片
-                // —— 如 Movies/某某/ 里全是 .txt。物理文件夹保留不删，只是没东西可展示。
+                // 文件夹内（递归）没有任何本分类合法文件时不出卡片 —— 如 Movies/某某/ 里全是 .txt。
+                // 物理文件夹保留不删，只是没东西可展示。
+                // ⚠️ 这一步是「慢」的主因（每个子文件夹都要走一遍子树），也是缓存的核心价值：
+                // 同一个目录只付一次这个代价。
                 .filter { runCatching { FileUtils.hasValidContentIn(File(it.path), category) }.getOrDefault(true) }
                 .map { it.toFileEntry() }
         }
-        dirEntriesStamp = currentDir
+        // 原地覆盖（不先清空）：旧条目在扫描期间继续顶着渲染，页面不会塌陷成空白
+        DirListCache.put(dirKey, DirListing(loaded, DirListCache.epoch))
+        AppLogger.v(
+            TAG,
+            "文件夹列表已加载：$currentDir（${loaded.size} 项，" +
+                "${if (cached != null) "重扫覆盖" else "首次加载"}）"
+        )
     }
 
     // ——— 文件列表来自数据库（Room Flow 实时刷新） ———
     val mediaRepo = remember { MediaRepository(context) }
-    val dbItems by mediaRepo.observeByCategory(category).collectAsState(initial = null)
+    // ⚠️ v1.36「修法十一 / 方案 C」：Flow 实例必须**只用 remember 建一次**，绝不要直接把
+    // `mediaRepo.observeByCategory(category)` 写在组合体里。
+    //
+    // 因为 `observeByCategory` → Room 生成的 `observeByType` 实现**每次调用都会新建一个 Flow
+    // 对象**，而 `Flow.collectAsState(initial)` 内部是 `produceState(initial, this)` ——
+    // `this` 这个 key 就是**流对象本身**，所以每次重组 key 都变 ⇒ 撤销并重建 Room 订阅、
+    // 重跑一遍 SQL。本页重组频率很高（网格焦点进出 / 停靠标记 / 扫描提示 / 待聚焦路径…），
+    // 这条抖动就是「一卡一卡」的一半来源。
+    //
+    // 它表现为**持续卡顿而不是闪烁**：`produceState` 内部是 `remember { mutableStateOf(...) }`
+    // （无 key），旧值会一直被保住，所以界面不会清空 —— 只是白跑了很多次查询。
+    //
+    // `distinctUntilChanged()`：media_items 任何一行动了都会让查询重新发射，但内容可能完全没变
+    //（进度流还 JOIN 了 playback_history，耦合的失效面更大），过滤掉逐项相同的列表可以省下
+    // 下游一整轮重算（`fileEntries` / `childCountMap` / 折叠排序）。两个实体都是 data class，
+    // `List.equals` 是逐项结构比较，所以这个过滤是安全的。
+    val dbFlow = remember(mediaRepo, category) {
+        mediaRepo.observeByCategory(category).distinctUntilChanged()
+    }
+    val dbItems by dbFlow.collectAsState(initial = null)
     val fileEntries = remember(dbItems, currentDir) {
         val items = dbItems ?: return@remember emptyList()
         items.filter { it.parentFolder == currentDir }
@@ -291,7 +413,11 @@ fun LibraryScreen(
 
     // ——— 播放进度（视频卡片底部细进度条） ———
     val playbackRepo = remember { PlaybackRepository(context) }
-    val progressList by playbackRepo.observeAllProgress().collectAsState(initial = emptyList())
+    // 同上：Flow 实例固定，别再每次重组都新建一遍
+    val progressFlow = remember(playbackRepo) {
+        playbackRepo.observeAllProgress().distinctUntilChanged()
+    }
+    val progressList by progressFlow.collectAsState(initial = emptyList())
     val progressMap = remember(progressList) {
         progressList.associate { p ->
             p.filePath to if (p.duration > 0) p.position.toFloat() / p.duration else 0f
@@ -307,7 +433,8 @@ fun LibraryScreen(
         val latestDone = uploadRecords.firstOrNull { it.state == UploadState.DONE }?.id ?: 0L
         if (latestDone > lastSyncedUploadId) {
             lastSyncedUploadId = latestDone
-            dirRefreshKey++
+            // 上传可能新建了目录 ⇒ 目录内容换代（旧代条目会在被访问时惰性重扫）
+            DirListCache.epoch++
         }
     }
 
@@ -318,44 +445,50 @@ fun LibraryScreen(
         SortOrder.TIME_DESC -> compareByDescending { it.lastModified }
         SortOrder.TIME_ASC -> compareBy { it.lastModified }
     }
-    // dirEntries 是异步加载的：切目录后的第一帧里它还是旧目录的子文件夹列表，
-    // 必须按 parent 同步过滤掉，否则网格会先闪一帧旧目录内容，且 FOCUS_FIRST
-    // 会错误命中旧卡片（该卡片下一帧即被移出组合，焦点会失控回退）。
-    val entries = remember(dirEntries, fileEntries, sortOrder, currentDir) {
-        dirEntries.filter { it.parentPath == currentDir }.sortedWith(cmp) +
-            fileEntries.sortedWith(cmp)
+    // ——— 网格内容 = 本目录的子文件夹 + 本目录的文件 ———
+    // v1.36：`dirEntries` 现在是**按目录取出**的缓存内容（见 DirListCache），它一定属于
+    // currentDir —— 所以原先那句「按 parentPath 同步过滤掉旧目录数据」已经不需要了。
+    // 那句话正是「切目录首帧 0 个文件夹」的直接原因：它把还没换掉的上一个目录的列表整批滤掉，
+    // 于是首帧必然空；去掉之后，缓存命中时首帧就是正确答案。
+    // 未就绪（`dirsReady == false`）时走的是下面的加载态分支，不会渲染到这里，
+    // 所以这里也不必再区分「空」与「未就绪」—— 空目录得到的就是空列表，语义正确。
+    val entries = remember(dirEntries, fileEntries, sortOrder) {
+        dirEntries.sortedWith(cmp) + fileEntries.sortedWith(cmp)
     }
 
     // ——— 文件夹内文件总数（含子层级） ———
-    // 一次性预计算成 map：dbItems 变化时 O(n·深度) 算好每个文件夹的子孙文件数，
-    // 避免滚动时每个目录卡入场都全表扫一遍 dbItems（原 countInFolder 是 O(目录数×全表行数)，
-    // 文件多时每滑入一张目录卡都卡一下）。map 键为文件夹绝对路径。
-    val childCountMap = remember(dbItems) {
-        val counts = mutableMapOf<String, Int>()
-        dbItems?.forEach { item ->
-            var p = item.parentFolder
-            while (p.isNotEmpty()) {
-                counts[p] = (counts[p] ?: 0) + 1
-                val idx = p.lastIndexOf('/')
-                if (idx <= 0) break
-                p = p.substring(0, idx)
-            }
-        }
-        counts
+    // 预计算成 map：避免滚动时每张目录卡入场都全表扫一遍 dbItems（原 countInFolder 是
+    // O(目录数 × 全表行数)，文件多时每滑入一张目录卡都卡一下）。map 键为文件夹绝对路径。
+    //
+    // ⚠️ v1.36「修法十二 / 方案 C」：这段计算**不能留在组合期（主线程）**。
+    // 方案 C 的前半（固定 Flow 实例）已经把它从「每次重组都跑」收敛到「dbItems 真的变了才跑」，
+    // 但它本身仍是 O(n·深度)：上万条记录 × 每条 4~6 层路径 = 数万次 map 读写，
+    // 落在组合帧里就是一次掉帧。改为在 `Dispatchers.Default` 上算。
+    //
+    // `produceState` 只在**赋值**时才改 `value`，重算期间一直沿用上一次的结果 ⇒
+    // 不会出现「先归零再涨回来」的视觉跳变。
+    // `null` = 一次都还没算出来（只在本页**首次**组合可能出现），网格据此多等一帧加载态，
+    // 目的是避免刚进页面时所有文件夹先显示「0 个文件」再跳成真实数字。
+    // 它不会卡住：`dbItems` 首次发射之后没有反复取消它的来源（key 只在数据真变时才动）。
+    val childCountMapOrNull by produceState<Map<String, Int>?>(null, dbItems) {
+        val items = dbItems
+        value = if (items == null) null
+        else withContext(Dispatchers.Default) { buildChildCounts(items) }
     }
+    val childCountMap: Map<String, Int> = childCountMapOrNull ?: emptyMap()
 
     // ——— 焦点定位：先滚动到目标项，再由卡片自身请求焦点 ———
-    // 键含 dirEntriesStamp：entries 结构相等时 LaunchedEffect 不会重跑（List.equals 是
-    // 结构比较），目录列表异步加载完成必须靠 stamp 变化触发重跑，否则 FOCUS_FIRST 会卡住。
-    LaunchedEffect(pendingFocusPath, entries, dirEntriesStamp) {
+    // 键含 dirsReady：`entries` 结构相等时 LaunchedEffect 不会重跑（List.equals 是结构比较），
+    // 目录列表异步加载完成必须靠 `dirsReady` 由 false 翻成 true 触发重跑，否则 FOCUS_FIRST 会卡住。
+    LaunchedEffect(pendingFocusPath, entries, dirsReady) {
         val target = pendingFocusPath ?: return@LaunchedEffect
         if (target == FOCUS_UP) {
             if (!atRoot) runCatching { gridState.scrollToItem(0) }
             return@LaunchedEffect
         }
         if (target == FOCUS_FIRST) {
-            // 目录列表还没加载完（异步 IO）：等 stamp 变化触发本 effect 重跑再判断
-            if (dirEntriesStamp != currentDir) return@LaunchedEffect
+            // 目录列表还没加载完（异步 IO / 缓存未命中）：等 dirsReady 翻转触发本 effect 重跑再判断
+            if (!dirsReady) return@LaunchedEffect
             // 空目录（无子文件夹也无文件）网格里只剩「返回上级」，改聚焦它
             if (entries.isEmpty()) {
                 pendingFocusPath = FOCUS_UP
@@ -456,18 +589,49 @@ fun LibraryScreen(
         }
     }
 
+    // 上一次「返回上一级」的时刻（`SystemClock.uptimeMillis()` 基准）：同一次物理按键的重复投递保护。
+    var lastUpAtMs by remember { mutableStateOf(0L) }
+
+    /**
+     * 返回上一级。
+     *
+     * ⚠️ **判据必须实时读 `currentDir`，不能用组合期的 `atRoot`**：`atRoot` 是组合作用域里算出的值，
+     * 目录刚变（同一帧内被调用两次）时它还停在旧值 `false`，于是第二次调用会从**新目录**再往上一级，
+     * 直接越过本分类根目录 —— 真机症状：图片页从 `windows` 返回后看到 `TransView/` 总目录里的
+     * `Pictures`（`Pictures` 这个「图片总文件夹」本不该从图片页到达）。用户 2026-09-18 真机反馈。
+     *
+     * 三重保护，缺一不可：
+     *  ① 同一次物理按键只允许跳一级（[BackKeySignal.DEDUP_MS] 窗口内的重复调用直接忽略）；
+     *  ② 从**实时**的 `currentDir` 求父目录；
+     *  ③ 父目录越界（比本分类根目录还浅）时夹回根目录 —— `IStorage.parentNode` 的钳位在**沙盒根**
+     *    （`TransView/`），不是分类根目录，所以「分类根目录的父目录」是合法返回值，必须自己拦。
+     */
     val goUp: () -> Unit = {
-        if (!atRoot) {
-            // 判据用 remoteFocus —— **这正是用户反馈的那个 bug 的根因**：
+        val now = SystemClock.uptimeMillis()
+        if (now - lastUpAtMs <= BackKeySignal.DEDUP_MS) {
+            // W 级：这条就是「一次按下被处理两遍」的直接证据（目录不会因此多跳一级）
+            AppLogger.w(
+                TAG,
+                "忽略重复的「返回上一级」（距上次 ${now - lastUpAtMs}ms）：$currentDir"
+            )
+        } else if (currentDir != rootPath) {
+            // 判据用 remoteFocus —— **这正是用户反馈的「返回后焦点没落回文件夹」的根因**：
             // 按返回键时 gridHasFocus 已被系统清空，`if (hadFocus)` 恒为 false，
-            // 于是「返回上一级」成功、但焦点没有还原到刚离开的那个文件夹，而是停在没有人的地方。
+            // 于是「返回上一级」成功、但焦点没有还原到刚离开的那个文件夹。
             // 详见 remoteFocus 的声明注释。
             val hadFocus = remoteFocus()
             parkFocusSafe()
+            lastUpAtMs = now
             val leaving = currentDir
-            currentDir = storage.parentNode(leaving) ?: rootPath
+            val parent = storage.parentNode(leaving)
+            // ③ 越界钳位：父目录必须仍在**本分类根目录**之内（同根或以 `根/` 开头），否则回根目录。
+            // 缺了这一步，分类根目录再往上一级就是沙盒总目录 `TransView/`，会露出 Movies/Pictures/
+            // Downloads 这些不该在分类页出现的目录。
+            currentDir = if (parent != null &&
+                (parent == rootPath || parent.startsWith("$rootPath/"))
+            ) parent else rootPath
             // 操作轨迹（V，仅详细日志）：返回上一级
-            AppLogger.v(TAG, "返回上一级：$leaving")
+            AppLogger.v(TAG, "返回上一级：$leaving → $currentDir")
             // 焦点还原到刚才进入（即将离开）的那个文件夹卡片；touch 路径焦点为空，跳过。
             // 效果与「聚焦「返回上级」卡片并按确定」完全等价：都回上一级 + 焦点落到对应文件夹。
             if (hadFocus) pendingFocusPath = leaving
@@ -499,7 +663,10 @@ fun LibraryScreen(
                 mediaRepo.deleteByPath(entry.path)
                 // touch 路径跳过焦点还原（见 openEntry 注释）
                 if (hadFocus) pendingFocusPath = nextPath
-                dirRefreshKey++ // 父目录可能被连带清空
+                // 删除可能把变空的父目录连带删掉（deleteNode → cleanEmptyAncestors）⇒ 目录换代。
+                // 当前位置由上面的目录 effect 原地重扫覆盖（不清缓存，所以不会闪）；
+                // 祖先目录的旧代条目会在下次被访问时惰性重扫，不会留着已消失的文件夹。
+                DirListCache.epoch++
                 // 破坏性操作留痕（I）：删除最不可逆，是事后排查「文件怎么没了」的唯一线索
                 AppLogger.i(TAG, "删除成功：${entry.path}")
                 Toast.makeText(context, "已删除「${entry.name}」", Toast.LENGTH_SHORT).show()
@@ -518,7 +685,8 @@ fun LibraryScreen(
             AppLogger.d(TAG, "手动触发对账：${category.name}")
             runCatching {
                 val result = SyncManager.getInstance(context).sync()
-                dirRefreshKey++
+                // 对账可能新增 / 清理了目录与空文件夹 ⇒ 目录换代（旧代条目惰性重扫）
+                DirListCache.epoch++
                 if (result.changed) {
                     Toast.makeText(
                         context,
@@ -539,7 +707,13 @@ fun LibraryScreen(
     val totalGridItems = entries.size + if (atRoot) 0 else 1
     // 网格内按返回键先「返回上一级」；到根目录时不启用，交由 MainScreen 回到顶部导航栏。
     // 用 BackHandler 而非 onPreviewKeyEvent：后者只在焦点路径上才收到事件，焦点为空时会漏掉返回键。
-    BackHandler(enabled = !atRoot) { goUp() }
+    BackHandler(enabled = !atRoot) {
+        // 取证（D）：真机没有 logcat，这一行用来区分「本页 BackHandler 接管（返回上一级）」与
+        // 「被 MainScreen 的 BackHandler 接管（只送焦点、目录不变）」—— 后者正是真机上
+        // 「第一次按返回目录完全没变」的现场判定依据。
+        AppLogger.d(TAG, "Back 处理（媒体库·子目录）：返回上一级")
+        goUp()
+    }
 
     Column(
         Modifier
@@ -577,9 +751,22 @@ fun LibraryScreen(
         )
 
         when {
-            dbItems == null -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
-            }
+            // 加载态：文件流未就绪（dbItems == null）/ 当前目录的文件夹列表未就绪
+            //（dirsReady == false，缓存未命中）/ 文件夹文件数还没算出来（childCountMapOrNull == null）。
+            //
+            // ⚠️ v1.36：这三个「未就绪」**必须走加载态，绝不能当成「空」渲染** —— 旧写法只判
+            // `dbItems == null`，于是切目录后先渲染出一屏「0 个文件夹 + 暂无文件」，等磁盘扫描
+            // 回来才整批填上；根目录（没有文件）时更会闪一下 EmptyHint 的「暂无文件」。
+            // 合并成一个连续的加载态后，用户的观感从「三层闪」变成「一次干净的过渡」。
+            //
+            // 后两个判据在正常使用中只会短暂为假：
+            //  · dirsReady 只在「本页第一次进入某目录」为假（命中缓存即首帧为真）；
+            //  · childCountMapOrNull 的 `null` 只在 produceState 首次计算完成前出现，
+            //    之后它一直沿用上一次的结果（见该处注释），不会反复回到 null。
+            dbItems == null || !dirsReady || childCountMapOrNull == null ->
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
             entries.isEmpty() && atRoot -> EmptyHint()
             else -> LazyVerticalGrid(
                 columns = GridCells.Fixed(effectiveColumns),
