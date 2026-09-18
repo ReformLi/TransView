@@ -1,12 +1,22 @@
 # TransView 传视 — 架构与实现说明
 
-> 版本：v1.32　日期：2026-09-18
+> 版本：v1.33　日期：2026-09-18
 > 对应需求：README.md（局域网媒体中心与传输工具）
+> v1.33 变更：**返回键「退出不了应用」死循环修复**（详见 §3.6「焦点体系」）——
+> ① 根因是**代码级**的（不是机型特性）：标签聚焦记录只在 `isFocused == true` 时写，而目标
+> **本来就已经聚焦**时 `requestFocus()` 不产生任何焦点变化事件 ⇒ 记录永远等不到写入 ⇒
+> `requestFocusVerified` 恒判失败 ⇒ 兜底票据把焦点推进内容区；内容区一拿到焦点又清掉
+> `lastBackTime` ⇒「再按一次返回键退出应用」的确认窗口被永远作废 ⇒ 焦点在「上传」标签上按返回
+> 变成「焦点跑进上传内容 ↔ 再按又回标签」的无限循环（用户 2026-09-18 真机反馈）；
+> ② 判据改为**各标签的真实聚焦状态**（`onFocusChanged` 里 true / false **都写**，由 `focusLocus()` 推导）；
+> ③ 退出确认改为**窗口内直接退出、与焦点此刻落在哪无关**（`EXIT_CONFIRM_WINDOW_MS`），
+> 并新增 `EXIT_CONFIRM_GRACE_MS` 余波宽限期，避免「Back 的余波把焦点挪进内容区」作废确认。
 > v1.32 变更：**返回键 / 焦点消失真机 bug 修复**（详见 §3.6「焦点体系」）——
 > ① 根因：遥控器按返回键时系统**会在派发 Back 的过程中先清空焦点**，而返回键分层与媒体库焦点
 > 还原的判据此前全部建在 `hasFocus` 上 ⇒ 判据在 `BackHandler` 里恒为 false（设置页早已实测到该
 > 行为，那里的对策是 `onPreviewKeyEvent` 提前拦截，本次保留不动）；
-> ② 改为「记录最后聚焦过谁」（`MainScreen.focusedTabIndex`、`LibraryScreen.remoteFocus()`），对清空免疫；
+> ② 改为「记录最后聚焦过谁」（`MainScreen.focusedTabIndex`、`LibraryScreen.remoteFocus()`），对清空免疫
+> —— 其中 `focusedTabIndex` 已在 v1.33 被「各标签真实聚焦状态」取代（原因见上）；
 > ③ 送焦点统一改用 **`requestFocusVerified()`**（真实焦点状态校验 + 帧门控重试 + 失败吐票据兜底）——
 > `requestFocusNextFrame()` 的返回值几乎恒为 `true`，历史重试循环实为**死代码**，首次请求被丢弃后
 > 焦点就停在「无人持有」状态（模拟器清空时机不同，该 bug 只在真机暴露）。
@@ -438,15 +448,20 @@ com.hpu.transview
 - 顶部标签聚焦即选中（左右键切换）；内容区按返回键 → 焦点回导航栏；再按返回才退出。媒体库内层另有 `BackHandler`：非根目录时先返回上一级。
 - **返回键判据绝不能建在 `hasFocus` 上（v1.32 真机修复）**：遥控器按返回键时**系统会在派发 Back 的过程中先清空焦点** —— `BackHandler` 执行那一刻读 `hasFocus` 已是 `false`（本工程最早在设置页实测到：那里的对策是在内容区 `Row` 上挂 `onPreviewKeyEvent`，抢在清空之前拦截）。
   - 真机症状（模拟器不复现——清空时机不同）：焦点在视频 / 图片 / 其他内容区时按返回，**焦点消失**（既不在标签栏也不在内容区）；再按一次返回或按上键焦点才回到标签栏，而且按上键会「平移标签栏」落到相邻标签上（那已是框架在「无人持有焦点」时的兜底几何搜索，落到哪个标签不由我们决定）。媒体库内按返回则不再把焦点还原到刚离开的那个文件夹。
-  - 修法一：**记录「最后聚焦过谁」**。`MainScreen.focusedTabIndex`（`NO_TAB_FOCUSED = -1` 表示不在标签栏；媒体标签占 `0..3`；「设置」占 `SETTINGS_TAB_INDEX = 4`，即 `MainTab.entries.size`）—— 每个标签只在 `isFocused == true` 时写自己的槽位，**焦点被清空时刻意不写**，因此对清空免疫；焦点进入内容区（含设置页 / 媒体网格 / 上传列表）时由内容区在 `hasFocus == true` 时写回 `-1`，于是该记录恒等于「焦点最后落在哪一侧」。顶部栏那行 `Row.onFocusChanged { topBarFocused = it.hasFocus }` **已删除**；「离开标签栏即取消未完成的双击退出确认」也改由内容区获得焦点时重置 —— 注意**不能在失焦(`hasFocus == false`)时重置**，那正是清空触发的回调，会让「再按一次返回退出」同样失效。
-  - 修法二：**送焦点必须校验真实落焦**（`requestFocusVerified`，见下一节），且用记录型判据校验时**必须先清空记录再请求**，否则「旧值恰好等于目标」会让第一次尝试就误判成功。
+  - 修法一（v1.32）：**记录「最后聚焦过谁」** —— 顶部栏那行 `Row.onFocusChanged { topBarFocused = it.hasFocus }` 改为一个单值槽位 `MainScreen.focusedTabIndex`（`NO_TAB_FOCUSED = -1` 表示不在标签栏；媒体标签占 `0..3`；「设置」占 `SETTINGS_TAB_INDEX = 4`，即 `MainTab.entries.size`）。⚠️ **该单值槽位已在 v1.33 被取代** —— 它自己引入了一个更隐蔽的死循环，见下一条。
+  - ⚠️ **v1.33 定论：单值「记录」+「先清空再校验」会把用户困死在应用里**。`focusedTabIndex` 只在 `isFocused == true` 时写，而「目标**本来就已经聚焦**」时 `requestFocus()` **不产生任何焦点变化事件** —— 于是「先把记录清空、再要求焦点把它写回来」的校验永远等不到写入（`requestFocusVerified` 拿到 `false`）⇒ 兜底票据把焦点推进内容区。真机症状（用户 2026-09-18 反馈，模拟器不复现）：焦点在「上传」标签上按返回 → 焦点跑到上传内容上 + 弹出「再按一次返回键退出应用」；**再按一次又回到上传标签**，如此往复、**永远退不出应用**。
+    - 改为**各标签的真实聚焦状态**：`MainScreen.tabFocusStates`（每个媒体标签一个 `MutableState<Boolean>`，下标 = `MainTab.ordinal`）+ `settingsTabFocused`，在各自 `onFocusChanged` 里 **true / false 都写**（如实记录），再由 `focusLocus(tabFocused, settingsFocused)` 实时推导「焦点此刻在哪个标签上」（无标签聚焦时返回 `NO_TAB_FOCUSED`）。目标已聚焦 ⇒ 第一次尝试即判成功，不存在「等不到写入」；焦点进内容区时无需任何人改写记录，各标签自发写成 `false` 即可。
+    - 因此校验判据**不再需要任何「先清空」**：`requestFocusVerified { tabFocusStates[index].value }` / `{ settingsTabFocused }`。
+  - 修法二：**送焦点必须校验真实落焦**（`requestFocusVerified`，见下一节），且「已经聚焦」必须**算成功**；用记录型判据时**绝不要先清空记录**（理由见上一条）。
+  - 修法三（v1.33）：**退出确认不能绑在焦点位置上**。`MainScreen.BackHandler` 现按此顺序判定：① `lastBackTime > 0L` 且距上次按下 ≤ `EXIT_CONFIRM_WINDOW_MS`（2s）→ **直接 `finish()`，完全不看焦点在谁身上**（第一次按下后焦点可能已被兜底票据推进内容区；若仍要求「焦点必须还在上传标签」，退出确认就永远无法兑现）；② 焦点在「上传」标签 → 弹提示 + 记时间戳 + 把焦点送回上传标签；③ 焦点在其它标签 → 回「上传」；④ 其余（内容区）→ 回当前选中标签。`lastBackTime > 0L` 不可省：`SystemClock.uptimeMillis()` 在开机后 2 秒内也小于窗口值，少了它会在「刚开机就按返回」时直接退出应用。
+  - 修法四（v1.33）：**退出确认要留「余波宽限期」**。内容区获得焦点时会取消未完成的退出确认（「用户自己走开了」理应重新确认），但 Back 按下后系统 / 兜底路径都可能把焦点挪进内容区，那属于**本次按键的余波**；故引入 `EXIT_CONFIRM_GRACE_MS`（500ms）—— 距上次 Back 超过 500ms 才清零 `lastBackTime`，否则保留。少了这条，一次焦点漂移就能作废确认窗口，用户照样退不出去。
 - **媒体库的「遥控器路径」判据（v1.32 修复同一根因）**：`LibraryScreen.remoteFocus() = !isTouchMode || gridHasFocus`，取代原先的 `val hadFocus = gridHasFocus`。原写法本身合理（先捕获，因为 `parkFocusSafe()` 会同步把 `gridHasFocus` 写成 `false`），**但按返回键那条路径上它早已被系统清空** → `goUp()` 里 `if (hadFocus) pendingFocusPath = leaving` 恒不成立 → 「返回上一级后焦点还原到刚离开的文件夹」失效（即用户反馈的「返回后没达到想要的效果」；`openEntry` / `performDelete` 用同一个 guard，是同一颗定时炸弹）。改用与焦点状态无关的「输入来源」判断后对清空免疫：非触摸模式即遥控器/键盘路径，或触摸模式下网格确实持有焦点（触屏设备上刚用过方向键）仍需接住焦点。
 - **标签焦点回调里「退出设置页」必须无条件执行**：媒体标签早期写法是 `if (isFocused && tab != selected) { selected = tab; showSettings = false }`——把 `showSettings = false` 和「切换标签」绑进了同一个条件。当 `selected` 恰好就是目标标签时条件不成立（典型路径：「其他」页 → 聚焦「设置」→ 按 ← 回「其他」，`selected` 一直是 `OTHER`、根本没变），于是 `showSettings` 停在 `true`，**内容区继续显示设置页，只有标签选中态变了**（用户实测反馈）。修法：焦点落到任一媒体标签即先无条件 `showSettings = false`，再按需更新 `selected`。
 - 媒体库「返回上级」焦点还原：`pendingFocusPath` + `gridState.scrollToItem` + 卡片 `FocusRequester` 三段式协作；
   请求焦点统一走 `requestFocusNextFrame()`（`withFrameNanos {}` 让出一帧再 `requestFocus()`）——LazyGrid 项刚组合、尚未完成布局时 `requestFocus()` 会抛 `IllegalStateException` 被 `runCatching` 静默吞掉，表现为「焦点还原没反应」。
 - **`requestFocusNextFrame()` 的返回值不是「是否聚焦成功」（v1.32 定论，别再据此判成败）**：`FocusRequester.requestFocus()` 只在请求器未附着到焦点节点时抛异常，**被焦点系统静默丢弃时既不抛也不返回 `false`**，故其 `runCatching { }.isSuccess` 几乎恒为 `true`。历史写法 `repeat(10) { if (requestFocusNextFrame()) return@launch }`（主界面三个 `focus*` 函数）因此在**第一次**尝试后就返回 —— 那 10 次重试是死代码，一旦首次请求被丢弃，焦点就停在「无人持有」状态（真机「按返回键后焦点消失」的另一半原因）。
   - 需要「确保真的落焦」时一律改用 **`requestFocusVerified(attempts, isFocused)`**（`ui/common/TvComponents.kt`）：帧门控重试 + **用真实焦点状态校验**，只有确认落焦才返回 `true`；每次尝试都先在帧回调内发起请求，相邻尝试间隔 16ms。
-  - 校验判据必须是**真实焦点状态**（节点的 `isFocused` / `hasFocus`，或 `focusedTabIndex` 这类「最后聚焦过谁」的记录），但**不能拿 `hasFocus` 当「刚才在哪」的判据**（Back 会清空它）。
+  - 校验判据必须是**目标节点自己的真实焦点状态**（`onFocusChanged` 里 true / false **都写**的状态，如 `MainScreen.tabFocusStates`、`MediaCard` 里的 `focused`），但**不能拿 `hasFocus` 当「刚才在哪」的判据**（Back 可能清空它）；也**不要用「只在 `isFocused` 时写」的单值记录**（理由见 v1.33 那条：目标已聚焦时不发事件 ⇒ 校验恒失败 ⇒ 兜底票据把焦点推错地方）。
   - **失败必须兜底**：主界面三个送焦点函数在返回 `false` 时把「聚焦首行」票据（`contentFocusTicket` / `settingsFocusTicket`）投给内容区，保证焦点绝不无人持有 —— 焦点无人持有正是「按方向键落到相邻标签 / 页面被误切」的入口。`MediaCard` / `UpCard` / 设置页 `rowFocused` 用的是「循环 + 读真实状态判定」，本就是正确写法。
 - 播放器/查看器根节点 `focusable()` 常驻焦点，浮层隐藏后 `FocusRequester` 归位（控制栏显示 → 落到播放/暂停按钮；隐藏 → 回根节点），遥控器永不失焦。
 
